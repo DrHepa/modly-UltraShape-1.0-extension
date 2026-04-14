@@ -1,0 +1,79 @@
+{
+  "id": "modly.ultrashape-refiner-process",
+  "name": "UltraShape Refiner Process",
+  "type": "process",
+  "version": "0.1.0",
+  "node": {
+    "id": "ultrashape-refiner",
+    "kind": "process",
+    "inputs": [
+      {
+        "id": "reference_image",
+        "kind": "image",
+        "required": true
+      },
+      {
+        "id": "coarse_mesh",
+        "kind": "mesh",
+        "required": true
+      }
+    ],
+    "outputs": [
+      {
+        "id": "refined_mesh",
+        "kind": "mesh",
+        "required": true
+      }
+    ]
+  },
+  "params": {
+    "checkpoint": {
+      "type": "string",
+      "nullable": true,
+      "default": null
+    },
+    "backend": {
+      "type": "string",
+      "default": "auto"
+    },
+    "steps": {
+      "type": "number",
+      "default": 30
+    },
+    "guidance_scale": {
+      "type": "number",
+      "default": 5.5
+    },
+    "seed": {
+      "type": "number",
+      "nullable": true,
+      "default": null
+    },
+    "preserve_scale": {
+      "type": "boolean",
+      "default": true
+    },
+    "output_format": {
+      "type": "string",
+      "default": "glb"
+    }
+  },
+  "testing_fallback_only": {
+    "status": "temporary_non_native",
+    "temporary": true,
+    "non_native": true,
+    "description": "Temporary structured request-bundle seam until Modly core supports native multi-input process ports.",
+    "semantic_contract": "reference_image + coarse_mesh -> refined_mesh",
+    "bundle_schema": {
+      "reference_image": "path",
+      "coarse_mesh": "path",
+      "output_dir": "path",
+      "checkpoint": "path|null",
+      "params": "object"
+    },
+    "draft_manifest_seam": {
+      "reason": "Current Modly manifest schema may not yet express the ideal multi-input process contract directly.",
+      "forward_compatible_intent": "Preserve final semantic ids and ports now so native core support can adopt them without renaming the contract."
+    }
+  }
+}

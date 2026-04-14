@@ -1,0 +1,14 @@
+{
+  "reference_image": "./assets/reference-image.png",
+  "coarse_mesh": "./assets/coarse-mesh.glb",
+  "output_dir": "./expected/output",
+  "checkpoint": null,
+  "params": {
+    "backend": "remote",
+    "steps": 30,
+    "guidance_scale": 5.5,
+    "seed": null,
+    "preserve_scale": true,
+    "output_format": "glb"
+  }
+}

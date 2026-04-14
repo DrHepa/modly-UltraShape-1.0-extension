@@ -1,0 +1,8 @@
+node_modules/
+.atl/
+.vite/
+.vitest/
+coverage/
+dist/
+*.log
+*.tsbuildinfo

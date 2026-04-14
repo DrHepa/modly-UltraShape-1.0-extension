@@ -1,0 +1,14 @@
+{
+  "name": "modly-ultrashape-1.0-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  }
+}
