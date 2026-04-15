@@ -1,12 +1,15 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 import { normalizeRefinerRequest } from '../../src/processes/ultrashape-refiner/normalize.js';
 import { preflightRefinerExecution } from '../../src/processes/ultrashape-refiner/preflight.js';
 import { validateRefinerRequest } from '../../src/processes/ultrashape-refiner/validate.js';
+
+const processorPath = resolve(process.cwd(), 'processor.py');
 
 function createFixtureWorkspace() {
   const root = mkdtempSync(join(tmpdir(), 'ultrashape-refiner-'));
@@ -29,6 +32,69 @@ function createFixtureWorkspace() {
 }
 
 describe('UltraShape request contract', () => {
+  it('reads exactly one JSON object line from stdin and ignores trailing lines', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      const outcome = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input:
+          `${JSON.stringify({
+            input: { filePath: fixture.referenceImage },
+            params: { coarse_mesh: fixture.coarseMesh },
+            workspaceDir: fixture.outputDir,
+          })}\n${JSON.stringify({ should_be_ignored: true })}\n`,
+      });
+
+      const events = outcome.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+      expect(outcome.status).toBe(0);
+      expect(events.at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('BACKEND_UNAVAILABLE'),
+        code: 'BACKEND_UNAVAILABLE',
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('fails fast when fallback payload omits params.coarse_mesh', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      const outcome = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input: `${JSON.stringify({
+          input: { filePath: fixture.referenceImage },
+          params: {},
+          workspaceDir: fixture.outputDir,
+        })}\n`,
+      });
+
+      const events = outcome.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+      expect(outcome.status).toBe(0);
+      expect(events.at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('coarse_mesh'),
+        code: 'MISSING_INPUT',
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it('rejects missing assets with field-specific errors', () => {
     const fixture = createFixtureWorkspace();
 

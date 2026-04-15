@@ -3,80 +3,63 @@
   "name": "UltraShape Refiner Process",
   "type": "process",
   "version": "0.1.0",
-  "entry": "processor.js",
+  "entry": "processor.py",
   "nodes": [
     {
       "id": "ultrashape-refiner",
       "name": "UltraShape Refiner Process",
-      "type": "process",
       "input": "image",
       "output": "mesh",
-      "inputs": [
+      "params_schema": [
         {
-          "id": "reference_image",
-          "name": "Reference Image",
-          "type": "image",
-          "required": true
+          "name": "checkpoint",
+          "type": "file",
+          "required": false
         },
         {
-          "id": "coarse_mesh",
-          "name": "Coarse Mesh",
-          "type": "mesh",
-          "required": true
-        }
-      ],
-      "outputs": [
+          "name": "coarse_mesh",
+          "type": "file",
+          "required": false
+        },
         {
-          "id": "refined_mesh",
-          "name": "Refined Mesh",
-          "type": "mesh",
-          "required": true
+          "name": "backend",
+          "type": "select",
+          "default": "auto",
+          "options": ["auto", "local", "remote", "hybrid"]
+        },
+        {
+          "name": "steps",
+          "type": "number",
+          "default": 30
+        },
+        {
+          "name": "guidance_scale",
+          "type": "number",
+          "default": 5.5
+        },
+        {
+          "name": "seed",
+          "type": "number",
+          "required": false
+        },
+        {
+          "name": "preserve_scale",
+          "type": "boolean",
+          "default": true
+        },
+        {
+          "name": "output_format",
+          "type": "select",
+          "default": "glb",
+          "options": ["glb", "obj", "fbx", "ply"]
         }
-      ],
-      "params_schema": {
-        "type": "object",
-        "properties": {
-          "checkpoint": {
-            "type": ["string", "null"],
-            "default": null
-          },
-          "backend": {
-            "type": "string",
-            "enum": ["auto", "local", "remote", "hybrid"],
-            "default": "auto"
-          },
-          "steps": {
-            "type": "integer",
-            "minimum": 1,
-            "default": 30
-          },
-          "guidance_scale": {
-            "type": "number",
-            "exclusiveMinimum": 0,
-            "default": 5.5
-          },
-          "seed": {
-            "type": ["integer", "null"],
-            "default": null
-          },
-          "preserve_scale": {
-            "type": "boolean",
-            "default": true
-          },
-          "output_format": {
-            "type": "string",
-            "enum": ["glb", "obj", "fbx", "ply"],
-            "default": "glb"
-          }
-        }
-      }
+      ]
     }
   ],
   "testing_fallback_only": {
     "status": "temporary_non_native",
     "temporary": true,
     "non_native": true,
-    "description": "Temporary structured request-bundle seam until Modly core supports native multi-input process ports.",
     "semantic_contract": "reference_image + coarse_mesh -> refined_mesh",
     "bundle_schema": {
       "reference_image": "path",

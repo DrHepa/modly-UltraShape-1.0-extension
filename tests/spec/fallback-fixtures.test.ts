@@ -32,9 +32,12 @@ describe('UltraShape fallback fixtures and docs', () => {
 
   it('documents the semantic contract, temporary fallback, and deferred future seam', () => {
     expect(readme).toContain(manifest.testing_fallback_only.semantic_contract);
-    expect(readme).toContain('temporary testing-only bundle');
+    expect(readme).toContain('temporary `params.coarse_mesh` seam');
+    expect(readme).toContain('root `manifest.json` + `setup.py` + `processor.py`');
     expect(readme).toContain('Hunyuan is the recommended and currently validated upstream source, but it is NOT required');
     expect(readme).toContain('## Future Modly seam');
+    expect(readme).not.toContain('processor.js');
+    expect(readme).not.toContain('runtime/modly/**');
 
     for (const fieldName of Object.keys(manifest.testing_fallback_only.bundle_schema)) {
       expect(readme).toContain(`\`${fieldName}\``);

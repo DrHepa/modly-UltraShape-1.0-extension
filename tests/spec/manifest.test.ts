@@ -10,15 +10,9 @@ const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
   nodes: Array<{
     id: string;
     name: string;
-    type: string;
     input: string;
     output: string;
-    inputs: Array<{ id: string; name: string; type: string; required: boolean }>;
-    outputs: Array<{ id: string; name: string; type: string; required: boolean }>;
-    params_schema: {
-      type: string;
-      properties: Record<string, Record<string, unknown>>;
-    };
+    params_schema: Array<Record<string, unknown>>;
   }>;
   type: string;
   testing_fallback_only: {
@@ -35,10 +29,10 @@ const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
 };
 
 describe('UltraShape refiner manifest', () => {
-  it('matches the installable Modly process contract and semantic ports', () => {
+  it('matches the Python installable Modly process contract without CommonJS-only node fields', () => {
     expect(manifest.id).toBe('modly.ultrashape-refiner-process');
     expect(manifest.type).toBe('process');
-    expect(manifest.entry).toBe('processor.js');
+    expect(manifest.entry).toBe('processor.py');
     expect(manifest.nodes).toHaveLength(1);
 
     const [node] = manifest.nodes;
@@ -46,55 +40,68 @@ describe('UltraShape refiner manifest', () => {
     expect(node).toMatchObject({
       id: 'ultrashape-refiner',
       name: 'UltraShape Refiner Process',
-      type: 'process',
       input: 'image',
       output: 'mesh',
     });
-    expect(node.inputs).toEqual([
-      { id: 'reference_image', name: 'Reference Image', type: 'image', required: true },
-      { id: 'coarse_mesh', name: 'Coarse Mesh', type: 'mesh', required: true },
-    ]);
-    expect(node.outputs).toEqual([
-      { id: 'refined_mesh', name: 'Refined Mesh', type: 'mesh', required: true },
-    ]);
+    expect(node).not.toHaveProperty('type');
+    expect(node).not.toHaveProperty('inputs');
+    expect(node).not.toHaveProperty('outputs');
   });
 
-  it('preserves params_schema defaults and install-time validation constraints from the spec', () => {
-    const properties = manifest.nodes[0].params_schema.properties;
+  it('uses the proven descriptor-array params_schema with current defaults', () => {
+    const descriptors = manifest.nodes[0].params_schema;
 
-    expect(manifest.nodes[0].params_schema.type).toBe('object');
-    expect(properties.checkpoint).toMatchObject({
-      type: ['string', 'null'],
-      default: null,
-    });
-    expect(properties.backend).toMatchObject({
-      type: 'string',
-      enum: ['auto', 'local', 'remote', 'hybrid'],
-      default: 'auto',
-    });
-    expect(properties.steps).toMatchObject({
-      type: 'integer',
-      minimum: 1,
-      default: 30,
-    });
-    expect(properties.guidance_scale).toMatchObject({
-      type: 'number',
-      exclusiveMinimum: 0,
-      default: 5.5,
-    });
-    expect(properties.seed).toMatchObject({
-      type: ['integer', 'null'],
-      default: null,
-    });
-    expect(properties.preserve_scale).toMatchObject({
-      type: 'boolean',
-      default: true,
-    });
-    expect(properties.output_format).toMatchObject({
-      type: 'string',
-      enum: ['glb', 'obj', 'fbx', 'ply'],
-      default: 'glb',
-    });
+    expect(Array.isArray(descriptors)).toBe(true);
+    expect(descriptors).toEqual([
+      expect.objectContaining({
+        name: 'checkpoint',
+        type: 'file',
+        required: false,
+      }),
+      expect.objectContaining({
+        name: 'coarse_mesh',
+        type: 'file',
+        required: false,
+      }),
+      expect.objectContaining({
+        name: 'backend',
+        type: 'select',
+        default: 'auto',
+        options: ['auto', 'local', 'remote', 'hybrid'],
+      }),
+      expect.objectContaining({
+        name: 'steps',
+        type: 'number',
+        default: 30,
+      }),
+      expect.objectContaining({
+        name: 'guidance_scale',
+        type: 'number',
+        default: 5.5,
+      }),
+      expect.objectContaining({
+        name: 'seed',
+        type: 'number',
+        required: false,
+      }),
+      expect.objectContaining({
+        name: 'preserve_scale',
+        type: 'boolean',
+        default: true,
+      }),
+      expect.objectContaining({
+        name: 'output_format',
+        type: 'select',
+        default: 'glb',
+        options: ['glb', 'obj', 'fbx', 'ply'],
+      }),
+    ]);
+    expect(descriptors).not.toContainEqual(
+      expect.objectContaining({
+        name: 'checkpoint',
+        default: null,
+      }),
+    );
   });
 
   it('labels the testing fallback as temporary and non-native', () => {
