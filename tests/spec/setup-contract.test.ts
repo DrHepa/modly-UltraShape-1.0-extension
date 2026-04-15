@@ -22,8 +22,8 @@ describe('UltraShape setup.py contract', () => {
     const firstRun = runSetup({
       python_exe: 'python3',
       ext_dir: installDir,
-      gpu_sm: '90',
-      cuda_version: '12.4',
+        gpu_sm: 90,
+        cuda_version: 12.8,
     });
 
     try {
@@ -37,7 +37,7 @@ describe('UltraShape setup.py contract', () => {
       const secondRun = runSetup({
         python_exe: 'python3',
         ext_dir: installDir,
-        gpu_sm: '90',
+        gpu_sm: 90,
       });
 
       expect(secondRun.status).toBe(0);
@@ -51,10 +51,34 @@ describe('UltraShape setup.py contract', () => {
   it('fails fast when ext_dir is missing from the Modly setup payload', () => {
     const outcome = runSetup({
       python_exe: 'python3',
-      gpu_sm: '90',
+      gpu_sm: 90,
     });
 
     expect(outcome.status).not.toBe(0);
     expect(`${outcome.stderr}${outcome.stdout}`).toContain('ext_dir');
+  });
+
+  it('accepts the numeric gpu_sm/cuda_version values that Modly sends at install time', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-numeric-'));
+    const installDir = join(root, 'extension-root');
+
+    try {
+      const outcome = runSetup({
+        python_exe: 'python3',
+        ext_dir: installDir,
+        gpu_sm: 86,
+        cuda_version: 128,
+      });
+
+      expect(outcome.status).toBe(0);
+      const summary = JSON.parse(readFileSync(join(installDir, '.setup-summary.json'), 'utf8')) as {
+        gpu_sm: string;
+        cuda_version: string;
+      };
+      expect(summary.gpu_sm).toBe('86');
+      expect(summary.cuda_version).toBe('128');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

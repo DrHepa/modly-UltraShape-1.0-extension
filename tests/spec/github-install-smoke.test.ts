@@ -48,7 +48,8 @@ describe('UltraShape GitHub install smoke', () => {
       const setup = spawnSync('python3', ['setup.py', JSON.stringify({
         python_exe: 'python3',
         ext_dir: simulation.installDir,
-        gpu_sm: '90',
+        gpu_sm: 90,
+        cuda_version: 128,
       })], {
         cwd: simulation.installDir,
         encoding: 'utf8',

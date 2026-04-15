@@ -5,7 +5,7 @@ from pathlib import Path
 from venv import EnvBuilder
 
 
-REQUIRED_KEYS = ('python_exe', 'ext_dir', 'gpu_sm')
+REQUIRED_STRING_KEYS = ('python_exe', 'ext_dir')
 
 
 def parse_args(argv: list[str]) -> dict[str, object]:
@@ -30,11 +30,32 @@ def require_string(payload: dict[str, object], key: str) -> str:
     return value.strip()
 
 
+def require_scalar(payload: dict[str, object], key: str) -> str:
+    value = payload.get(key)
+
+    if isinstance(value, bool):
+        raise SystemExit(f'{key} is required in the Modly setup payload.')
+
+    if isinstance(value, (int, float)):
+        return str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    raise SystemExit(f'{key} is required in the Modly setup payload.')
+
+
 def resolve_install_context(payload: dict[str, object]) -> dict[str, str]:
-    context = {key: require_string(payload, key) for key in REQUIRED_KEYS}
+    context = {key: require_string(payload, key) for key in REQUIRED_STRING_KEYS}
+    context['gpu_sm'] = require_scalar(payload, 'gpu_sm')
 
     cuda_version = payload.get('cuda_version')
-    if isinstance(cuda_version, str) and cuda_version.strip():
+    if isinstance(cuda_version, bool):
+        raise SystemExit('cuda_version must be a string or number when provided in the Modly setup payload.')
+
+    if isinstance(cuda_version, (int, float)):
+        context['cuda_version'] = str(int(cuda_version)) if isinstance(cuda_version, float) and cuda_version.is_integer() else str(cuda_version)
+    elif isinstance(cuda_version, str) and cuda_version.strip():
         context['cuda_version'] = cuda_version.strip()
 
     return context
