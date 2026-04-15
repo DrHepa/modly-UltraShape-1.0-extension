@@ -66,13 +66,13 @@ describe('UltraShape processor.py protocol', () => {
   it('treats named reference_image and coarse_mesh inputs as the primary manifest contract and only uses params.coarse_mesh as fallback metadata', () => {
     expect(manifest.nodes[0]?.inputs).toEqual([
       {
-        id: 'reference_image',
+        name: 'reference_image',
         label: 'Reference Image',
         type: 'image',
         required: true,
       },
       {
-        id: 'coarse_mesh',
+        name: 'coarse_mesh',
         label: 'Coarse Mesh',
         type: 'mesh',
         required: true,

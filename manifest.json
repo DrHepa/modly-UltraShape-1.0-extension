@@ -13,13 +13,13 @@
       "output": "mesh",
       "inputs": [
         {
-          "id": "reference_image",
+          "name": "reference_image",
           "label": "Reference Image",
           "type": "image",
           "required": true
         },
         {
-          "id": "coarse_mesh",
+          "name": "coarse_mesh",
           "label": "Coarse Mesh",
           "type": "mesh",
           "required": true
@@ -31,32 +31,42 @@
           "label": "Backend",
           "type": "select",
           "default": "auto",
-          "options": ["auto", "local", "remote", "hybrid"]
+          "options": [
+            { "value": "auto", "label": "auto" },
+            { "value": "local", "label": "local" },
+            { "value": "remote", "label": "remote" },
+            { "value": "hybrid", "label": "hybrid" }
+          ]
         },
         {
           "id": "steps",
           "label": "Steps",
-          "type": "number",
+          "type": "int",
           "default": 30
         },
         {
           "id": "guidance_scale",
           "label": "Guidance Scale",
-          "type": "number",
+          "type": "float",
           "default": 5.5
         },
         {
           "id": "seed",
           "label": "Seed",
-          "type": "number",
-          "default": null
+          "type": "int",
+          "default": -1
         },
         {
           "id": "output_format",
           "label": "Output Format",
           "type": "select",
           "default": "glb",
-          "options": ["glb", "obj", "fbx", "ply"]
+          "options": [
+            { "value": "glb", "label": "glb" },
+            { "value": "obj", "label": "obj" },
+            { "value": "fbx", "label": "fbx" },
+            { "value": "ply", "label": "ply" }
+          ]
         }
       ]
     }
