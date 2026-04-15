@@ -7,6 +7,13 @@ import { describe, expect, it } from 'vitest';
 
 const repoRoot = process.cwd();
 const processorPath = resolve(repoRoot, 'processor.py');
+const manifestPath = resolve(repoRoot, 'manifest.json');
+const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+  nodes: Array<{
+    id: string;
+    inputs?: Array<Record<string, unknown>>;
+  }>;
+};
 
 function createFixtureWorkspace() {
   const root = mkdtempSync(join(tmpdir(), 'ultrashape-processor-'));
@@ -56,7 +63,22 @@ function runProcessor(payload: Record<string, unknown>, env: NodeJS.ProcessEnv =
 }
 
 describe('UltraShape processor.py protocol', () => {
-  it('prefers named inputs over the temporary params.coarse_mesh seam and emits done for the packaged result', () => {
+  it('treats named reference_image and coarse_mesh inputs as the primary manifest contract and only uses params.coarse_mesh as fallback metadata', () => {
+    expect(manifest.nodes[0]?.inputs).toEqual([
+      {
+        id: 'reference_image',
+        label: 'Reference Image',
+        type: 'image',
+        required: true,
+      },
+      {
+        id: 'coarse_mesh',
+        label: 'Coarse Mesh',
+        type: 'mesh',
+        required: true,
+      },
+    ]);
+
     const fixture = createFixtureWorkspace();
 
     try {
@@ -115,7 +137,7 @@ describe('UltraShape processor.py protocol', () => {
     }
   });
 
-  it('uses input.filePath plus params.coarse_mesh as the temporary fallback seam', () => {
+  it('uses input.filePath plus params.coarse_mesh only as a secondary fallback seam when named inputs are absent', () => {
     const fixture = createFixtureWorkspace();
 
     try {

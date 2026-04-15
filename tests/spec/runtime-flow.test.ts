@@ -50,17 +50,23 @@ function runProcessor(payload: Record<string, unknown>, env: NodeJS.ProcessEnv =
 }
 
 describe('UltraShape runtime flow', () => {
-  it('runs the repo-root Python boundary and packages refined.<format> without any JS install artifact', () => {
+  it('runs the repo-root Python boundary from the named-input contract and packages refined.<format> without any JS install artifact', () => {
     const fixture = createFixtureWorkspace();
 
     try {
       const events = runProcessor(
         {
           input: {
-            filePath: fixture.referenceImage,
+            inputs: {
+              reference_image: {
+                filePath: fixture.referenceImage,
+              },
+              coarse_mesh: {
+                filePath: fixture.coarseMesh,
+              },
+            },
           },
           params: {
-            coarse_mesh: fixture.coarseMesh,
             output_format: 'glb',
           },
           workspaceDir: fixture.outputDir,
@@ -84,7 +90,7 @@ describe('UltraShape runtime flow', () => {
     }
   });
 
-  it('surfaces BACKEND_UNAVAILABLE from processor.py after discovery-compatible validation succeeds', () => {
+  it('keeps the fallback seam compatible when named inputs are absent and validation still succeeds', () => {
     const fixture = createFixtureWorkspace();
 
     try {

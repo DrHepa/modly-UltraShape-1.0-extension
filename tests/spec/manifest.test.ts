@@ -10,8 +10,10 @@ const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
   nodes: Array<{
     id: string;
     name: string;
+    type: string;
     input: string;
     output: string;
+    inputs?: Array<Record<string, unknown>>;
     params_schema: Array<Record<string, unknown>>;
   }>;
   type: string;
@@ -21,6 +23,29 @@ const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
     non_native: boolean;
     semantic_contract: string;
     bundle_schema: Record<string, string>;
+    hidden_params: {
+      checkpoint: {
+        location: string;
+        default: null;
+        reason: string;
+      };
+      preserve_scale: {
+        location: string;
+        default: boolean;
+        reason: string;
+      };
+    };
+    fallback_input_contract: {
+      primary: {
+        reference_image: string;
+        coarse_mesh: string;
+      };
+      secondary: {
+        reference_image: string;
+        coarse_mesh: string;
+      };
+      rationale: string;
+    };
     draft_manifest_seam: {
       reason: string;
       forward_compatible_intent: string;
@@ -40,68 +65,71 @@ describe('UltraShape refiner manifest', () => {
     expect(node).toMatchObject({
       id: 'ultrashape-refiner',
       name: 'UltraShape Refiner Process',
+      type: 'process',
       input: 'image',
       output: 'mesh',
     });
-    expect(node).not.toHaveProperty('type');
-    expect(node).not.toHaveProperty('inputs');
     expect(node).not.toHaveProperty('outputs');
+
+    expect(node.inputs).toEqual([
+      {
+        id: 'reference_image',
+        label: 'Reference Image',
+        type: 'image',
+        required: true,
+      },
+      {
+        id: 'coarse_mesh',
+        label: 'Coarse Mesh',
+        type: 'mesh',
+        required: true,
+      },
+    ]);
   });
 
-  it('uses the proven descriptor-array params_schema with current defaults', () => {
+  it('uses canonical visible params_schema descriptors for the UI contract', () => {
     const descriptors = manifest.nodes[0].params_schema;
 
     expect(Array.isArray(descriptors)).toBe(true);
     expect(descriptors).toEqual([
-      expect.objectContaining({
-        name: 'checkpoint',
-        type: 'file',
-        required: false,
-      }),
-      expect.objectContaining({
-        name: 'coarse_mesh',
-        type: 'file',
-        required: false,
-      }),
-      expect.objectContaining({
-        name: 'backend',
+      {
+        id: 'backend',
+        label: 'Backend',
         type: 'select',
         default: 'auto',
         options: ['auto', 'local', 'remote', 'hybrid'],
-      }),
-      expect.objectContaining({
-        name: 'steps',
+      },
+      {
+        id: 'steps',
+        label: 'Steps',
         type: 'number',
         default: 30,
-      }),
-      expect.objectContaining({
-        name: 'guidance_scale',
+      },
+      {
+        id: 'guidance_scale',
+        label: 'Guidance Scale',
         type: 'number',
         default: 5.5,
-      }),
-      expect.objectContaining({
-        name: 'seed',
+      },
+      {
+        id: 'seed',
+        label: 'Seed',
         type: 'number',
-        required: false,
-      }),
-      expect.objectContaining({
-        name: 'preserve_scale',
-        type: 'boolean',
-        default: true,
-      }),
-      expect.objectContaining({
-        name: 'output_format',
+        default: null,
+      },
+      {
+        id: 'output_format',
+        label: 'Output Format',
         type: 'select',
         default: 'glb',
         options: ['glb', 'obj', 'fbx', 'ply'],
-      }),
+      },
     ]);
-    expect(descriptors).not.toContainEqual(
-      expect.objectContaining({
-        name: 'checkpoint',
-        default: null,
-      }),
-    );
+
+    for (const hiddenParamId of ['checkpoint', 'coarse_mesh', 'preserve_scale']) {
+      expect(descriptors).not.toContainEqual(expect.objectContaining({ id: hiddenParamId }));
+      expect(descriptors).not.toContainEqual(expect.objectContaining({ name: hiddenParamId }));
+    }
   });
 
   it('labels the testing fallback as temporary and non-native', () => {
@@ -117,6 +145,30 @@ describe('UltraShape refiner manifest', () => {
       output_dir: 'path',
       checkpoint: 'path|null',
       params: 'object',
+    });
+    expect(manifest.testing_fallback_only.hidden_params).toEqual({
+      checkpoint: {
+        location: 'runtime/default metadata',
+        default: null,
+        reason: 'Deferred because checkpoint is an asset dependency better represented outside the current panel controls.',
+      },
+      preserve_scale: {
+        location: 'runtime-only default',
+        default: true,
+        reason: 'Deferred because the current UI does not faithfully support the required boolean control.',
+      },
+    });
+    expect(manifest.testing_fallback_only.fallback_input_contract).toEqual({
+      primary: {
+        reference_image: 'input.inputs.reference_image.filePath',
+        coarse_mesh: 'input.inputs.coarse_mesh.filePath',
+      },
+      secondary: {
+        reference_image: 'input.filePath',
+        coarse_mesh: 'params.coarse_mesh',
+      },
+      rationale:
+        'Temporary fallback seam only until Modly supplies native multi-input process routing for both semantic ids.',
     });
     expect(manifest.testing_fallback_only.draft_manifest_seam.reason).toContain(
       'may not yet express the ideal multi-input process contract',

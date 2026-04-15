@@ -8,47 +8,52 @@
     {
       "id": "ultrashape-refiner",
       "name": "UltraShape Refiner Process",
+      "type": "process",
       "input": "image",
       "output": "mesh",
+      "inputs": [
+        {
+          "id": "reference_image",
+          "label": "Reference Image",
+          "type": "image",
+          "required": true
+        },
+        {
+          "id": "coarse_mesh",
+          "label": "Coarse Mesh",
+          "type": "mesh",
+          "required": true
+        }
+      ],
       "params_schema": [
         {
-          "name": "checkpoint",
-          "type": "file",
-          "required": false
-        },
-        {
-          "name": "coarse_mesh",
-          "type": "file",
-          "required": false
-        },
-        {
-          "name": "backend",
+          "id": "backend",
+          "label": "Backend",
           "type": "select",
           "default": "auto",
           "options": ["auto", "local", "remote", "hybrid"]
         },
         {
-          "name": "steps",
+          "id": "steps",
+          "label": "Steps",
           "type": "number",
           "default": 30
         },
         {
-          "name": "guidance_scale",
+          "id": "guidance_scale",
+          "label": "Guidance Scale",
           "type": "number",
           "default": 5.5
         },
         {
-          "name": "seed",
+          "id": "seed",
+          "label": "Seed",
           "type": "number",
-          "required": false
+          "default": null
         },
         {
-          "name": "preserve_scale",
-          "type": "boolean",
-          "default": true
-        },
-        {
-          "name": "output_format",
+          "id": "output_format",
+          "label": "Output Format",
           "type": "select",
           "default": "glb",
           "options": ["glb", "obj", "fbx", "ply"]
@@ -67,6 +72,29 @@
       "output_dir": "path",
       "checkpoint": "path|null",
       "params": "object"
+    },
+    "hidden_params": {
+      "checkpoint": {
+        "location": "runtime/default metadata",
+        "default": null,
+        "reason": "Deferred because checkpoint is an asset dependency better represented outside the current panel controls."
+      },
+      "preserve_scale": {
+        "location": "runtime-only default",
+        "default": true,
+        "reason": "Deferred because the current UI does not faithfully support the required boolean control."
+      }
+    },
+    "fallback_input_contract": {
+      "primary": {
+        "reference_image": "input.inputs.reference_image.filePath",
+        "coarse_mesh": "input.inputs.coarse_mesh.filePath"
+      },
+      "secondary": {
+        "reference_image": "input.filePath",
+        "coarse_mesh": "params.coarse_mesh"
+      },
+      "rationale": "Temporary fallback seam only until Modly supplies native multi-input process routing for both semantic ids."
     },
     "draft_manifest_seam": {
       "reason": "Current Modly manifest schema may not yet express the ideal multi-input process contract directly.",

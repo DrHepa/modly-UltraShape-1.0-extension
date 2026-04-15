@@ -32,7 +32,7 @@ function createFixtureWorkspace() {
 }
 
 describe('UltraShape request contract', () => {
-  it('reads exactly one JSON object line from stdin and ignores trailing lines', () => {
+  it('reads exactly one JSON object line from stdin, prioritizes named inputs, and ignores trailing lines', () => {
     const fixture = createFixtureWorkspace();
 
     try {
@@ -41,8 +41,14 @@ describe('UltraShape request contract', () => {
         encoding: 'utf8',
         input:
           `${JSON.stringify({
-            input: { filePath: fixture.referenceImage },
-            params: { coarse_mesh: fixture.coarseMesh },
+            input: {
+              filePath: join(fixture.root, 'missing-reference.png'),
+              inputs: {
+                reference_image: { filePath: fixture.referenceImage },
+                coarse_mesh: { filePath: fixture.coarseMesh },
+              },
+            },
+            params: { coarse_mesh: join(fixture.root, 'missing-fallback.glb') },
             workspaceDir: fixture.outputDir,
           })}\n${JSON.stringify({ should_be_ignored: true })}\n`,
       });
@@ -64,7 +70,7 @@ describe('UltraShape request contract', () => {
     }
   });
 
-  it('fails fast when fallback payload omits params.coarse_mesh', () => {
+  it('fails fast when the secondary fallback payload omits params.coarse_mesh', () => {
     const fixture = createFixtureWorkspace();
 
     try {
@@ -147,7 +153,7 @@ describe('UltraShape request contract', () => {
     }
   });
 
-  it('normalizes native and fallback requests with semantic parity', () => {
+  it('keeps named-contract and fallback normalization semantically aligned', () => {
     const fixture = createFixtureWorkspace();
 
     try {
