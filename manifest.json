@@ -3,61 +3,75 @@
   "name": "UltraShape Refiner Process",
   "type": "process",
   "version": "0.1.0",
-  "node": {
-    "id": "ultrashape-refiner",
-    "kind": "process",
-    "inputs": [
-      {
-        "id": "reference_image",
-        "kind": "image",
-        "required": true
-      },
-      {
-        "id": "coarse_mesh",
-        "kind": "mesh",
-        "required": true
+  "entry": "processor.js",
+  "nodes": [
+    {
+      "id": "ultrashape-refiner",
+      "name": "UltraShape Refiner Process",
+      "type": "process",
+      "input": "image",
+      "output": "mesh",
+      "inputs": [
+        {
+          "id": "reference_image",
+          "name": "Reference Image",
+          "type": "image",
+          "required": true
+        },
+        {
+          "id": "coarse_mesh",
+          "name": "Coarse Mesh",
+          "type": "mesh",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "id": "refined_mesh",
+          "name": "Refined Mesh",
+          "type": "mesh",
+          "required": true
+        }
+      ],
+      "params_schema": {
+        "type": "object",
+        "properties": {
+          "checkpoint": {
+            "type": ["string", "null"],
+            "default": null
+          },
+          "backend": {
+            "type": "string",
+            "enum": ["auto", "local", "remote", "hybrid"],
+            "default": "auto"
+          },
+          "steps": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 30
+          },
+          "guidance_scale": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "default": 5.5
+          },
+          "seed": {
+            "type": ["integer", "null"],
+            "default": null
+          },
+          "preserve_scale": {
+            "type": "boolean",
+            "default": true
+          },
+          "output_format": {
+            "type": "string",
+            "enum": ["glb", "obj", "fbx", "ply"],
+            "default": "glb"
+          }
+        }
       }
-    ],
-    "outputs": [
-      {
-        "id": "refined_mesh",
-        "kind": "mesh",
-        "required": true
-      }
-    ]
-  },
-  "params": {
-    "checkpoint": {
-      "type": "string",
-      "nullable": true,
-      "default": null
-    },
-    "backend": {
-      "type": "string",
-      "default": "auto"
-    },
-    "steps": {
-      "type": "number",
-      "default": 30
-    },
-    "guidance_scale": {
-      "type": "number",
-      "default": 5.5
-    },
-    "seed": {
-      "type": "number",
-      "nullable": true,
-      "default": null
-    },
-    "preserve_scale": {
-      "type": "boolean",
-      "default": true
-    },
-    "output_format": {
-      "type": "string",
-      "default": "glb"
     }
-  },
+  ],
   "testing_fallback_only": {
     "status": "temporary_non_native",
     "temporary": true,

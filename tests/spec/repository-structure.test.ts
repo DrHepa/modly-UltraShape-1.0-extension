@@ -21,9 +21,20 @@ const runtimePaths = [
   'adapters/ultrashape/client.ts',
   'adapters/ultrashape/remote.ts',
   'adapters/ultrashape/local.ts',
+  'runtime/modly/package.json',
+  'runtime/modly/processes/ultrashape-refiner/index.js',
+  'runtime/modly/processes/ultrashape-refiner/validate.js',
+  'runtime/modly/processes/ultrashape-refiner/normalize.js',
+  'runtime/modly/processes/ultrashape-refiner/preflight.js',
+  'runtime/modly/processes/ultrashape-refiner/runtime.js',
+  'runtime/modly/processes/ultrashape-refiner/progress.js',
+  'runtime/modly/processes/ultrashape-refiner/types.js',
+  'runtime/modly/adapters/ultrashape/client.js',
+  'runtime/modly/adapters/ultrashape/remote.js',
+  'runtime/modly/adapters/ultrashape/local.js',
 ];
 
-const configAndDocsPaths = ['manifest.json', 'README.md'];
+const configAndDocsPaths = ['manifest.json', 'processor.js', 'README.md'];
 
 const fixturePaths = [
   'fixtures/requests/refiner-bundle/request.json',
@@ -52,7 +63,11 @@ describe('UltraShape repository structure contract', () => {
     }
 
     for (const filePath of runtimePaths) {
-      expect(filePath.startsWith('src/') || filePath.startsWith('adapters/')).toBe(true);
+      expect(
+        filePath.startsWith('src/') ||
+          filePath.startsWith('adapters/') ||
+          filePath.startsWith('runtime/modly/'),
+      ).toBe(true);
     }
 
     for (const filePath of configAndDocsPaths) {
@@ -74,5 +89,10 @@ describe('UltraShape repository structure contract', () => {
     expect(typeof adapterBoundary).toBe('object');
     expect(UltraShapeLocalAdapter).toBeTypeOf('function');
     expect(UltraShapeRemoteAdapter).toBeTypeOf('function');
+  });
+
+  it('keeps the committed Modly runtime mirror isolated from the repo root ESM package contract', () => {
+    expect(existsSync(resolve(repoRoot, 'package.json'))).toBe(true);
+    expect(existsSync(resolve(repoRoot, 'runtime/modly/package.json'))).toBe(true);
   });
 });

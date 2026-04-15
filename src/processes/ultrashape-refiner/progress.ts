@@ -89,10 +89,14 @@ export function normalizeRuntimeError(error: unknown): UltraShapeProcessError {
   }
 
   if (error instanceof Error) {
-    return createProcessError('BACKEND_UNAVAILABLE', error.message, 'backend');
+    return createProcessError('BACKEND_UNAVAILABLE', `BACKEND_UNAVAILABLE: ${error.message}`, 'backend');
   }
 
-  return createProcessError('BACKEND_UNAVAILABLE', 'UltraShape backend failed unexpectedly.', 'backend');
+  return createProcessError(
+    'BACKEND_UNAVAILABLE',
+    'BACKEND_UNAVAILABLE: UltraShape backend failed unexpectedly.',
+    'backend',
+  );
 }
 
 function isAbortError(error: unknown): boolean {
