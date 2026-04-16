@@ -14,6 +14,7 @@ const extractedRootPaths = [
   'runtime/configs/infer_dit_refine.yaml',
   'runtime/patches/README.md',
   'runtime/vendor/ultrashape_runtime/__init__.py',
+  'runtime/vendor/ultrashape_runtime/local_runner.py',
   'runtime/vendor/ultrashape_runtime/pipelines.py',
   'runtime/vendor/ultrashape_runtime/preprocessors.py',
   'runtime/vendor/ultrashape_runtime/rembg.py',
@@ -134,6 +135,7 @@ describe('UltraShape GitHub install smoke', () => {
       expect(setup.status).toBe(0);
       expect(existsSync(resolve(simulation.installDir, 'venv'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/configs/infer_dit_refine.yaml'))).toBe(true);
+      expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/local_runner.py'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/pipelines.py'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/models/denoisers/dit_mask.py'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/models/autoencoders/surface_extractors.py'))).toBe(true);
@@ -217,10 +219,6 @@ describe('UltraShape GitHub install smoke', () => {
         cwd: simulation.installDir,
         encoding: 'utf8',
         input: `${JSON.stringify(smokePayload)}\n`,
-        env: {
-          ...process.env,
-          ULTRASHAPE_TEST_ARTIFACT_PATH: resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb'),
-        },
       });
 
       const events = outcome.stdout
@@ -233,13 +231,20 @@ describe('UltraShape GitHub install smoke', () => {
 
       const expectedOutcome = expectedProcessorOutcome(readiness);
       if (expectedOutcome === 'done') {
+        const smokeOutputPath = resolve(simulation.installDir, 'smoke-output/refined.glb');
         expect(events.at(-1)).toEqual({
           type: 'done',
           result: {
-            filePath: resolve(simulation.installDir, 'smoke-output/refined.glb'),
+            filePath: smokeOutputPath,
           },
         });
-        expect(existsSync(resolve(simulation.installDir, 'smoke-output/refined.glb'))).toBe(true);
+        expect(existsSync(smokeOutputPath)).toBe(true);
+        expect(readFileSync(smokeOutputPath, 'utf8')).toBe(
+          readFileSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/assets/coarse-mesh.glb'), 'utf8'),
+        );
+        expect(readFileSync(smokeOutputPath, 'utf8')).not.toBe(
+          readFileSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb'), 'utf8'),
+        );
       } else {
         expect(events.at(-1)).toEqual({
           type: 'error',

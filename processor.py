@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
-import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -215,20 +215,134 @@ def ensure_runtime_ready(readiness: dict) -> None:
         raise ProcessorError('WEIGHTS_MISSING', f'Local UltraShape weights are not ready.{suffix}')
 
 
-def package_result(output_dir: str, output_format: str) -> str:
-    source_path = os.environ.get('ULTRASHAPE_TEST_ARTIFACT_PATH')
-    if not source_path:
-        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'UltraShape local runtime artifact source is not configured for this request.')
+def ensure_mvp_execution_contract(params: dict, readiness: dict) -> None:
+    requested_scope = params.get('mvp_scope') or params.get('scope')
+    if requested_scope not in (None, 'mc-only'):
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'UltraShape local execution is mc-only in this MVP.')
 
-    source = Path(source_path)
-    if not source.is_file():
-        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Configured UltraShape local runtime artifact is not readable.')
+    if readiness.get('mvp_scope') not in (None, 'mc-only'):
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Installed UltraShape runtime is not compatible with mc-only execution.')
 
-    destination_dir = Path(output_dir)
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    destination = destination_dir / f'refined.{output_format}'
-    shutil.copyfile(source, destination)
-    return str(destination)
+    if params['output_format'] != 'glb':
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'UltraShape local execution is glb-only in this MVP.')
+
+
+def resolve_runner_paths(ext_dir: Path) -> tuple[str, str]:
+    python_path = ext_dir / 'venv' / 'bin' / 'python'
+    config_path = ext_dir / 'runtime' / 'configs' / 'infer_dit_refine.yaml'
+
+    if not python_path.is_file():
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', f'Missing local runtime Python executable: {python_path}.')
+    if not config_path.is_file():
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', f'Missing local runtime config: {config_path}.')
+
+    return str(python_path), str(config_path)
+
+
+def resolve_checkpoint_path(ext_dir: Path, params: dict) -> str:
+    configured = params.get('checkpoint')
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+
+    return str(ext_dir / 'models' / 'ultrashape' / 'ultrashape_v1.pt')
+
+
+def run_local_runtime(
+    *,
+    ext_dir: Path,
+    output_dir: str,
+    reference_image: str,
+    coarse_mesh: str,
+    backend: str,
+    params: dict,
+) -> str:
+    python_path, config_path = resolve_runner_paths(ext_dir)
+    runner_runtime_path = ext_dir / 'runtime'
+    job = {
+        'reference_image': reference_image,
+        'coarse_mesh': coarse_mesh,
+        'output_dir': output_dir,
+        'output_format': params['output_format'],
+        'checkpoint': resolve_checkpoint_path(ext_dir, params),
+        'config_path': config_path,
+        'ext_dir': str(ext_dir),
+        'backend': backend,
+        'steps': params['steps'],
+        'guidance_scale': params['guidance_scale'],
+        'seed': params['seed'],
+        'preserve_scale': params['preserve_scale'],
+    }
+
+    env = dict(os.environ)
+    env['PYTHONPATH'] = str(runner_runtime_path)
+
+    try:
+        outcome = subprocess.run(
+            [python_path, '-m', 'ultrashape_runtime.local_runner'],
+            input=json.dumps(job) + '\n',
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+    except OSError as error:
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', f'Unable to launch local runtime runner: {error}.') from error
+
+    stdout = outcome.stdout.strip()
+    if not stdout:
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner produced no JSON result on stdout.')
+
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', f'Local runtime runner returned invalid JSON: {error}.') from error
+
+    if not isinstance(envelope, dict):
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner stdout must be a JSON object.')
+
+    if envelope.get('ok') is False:
+        code = envelope.get('error_code')
+        message = envelope.get('error_message')
+        if code not in {'DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'}:
+            code = 'LOCAL_RUNTIME_UNAVAILABLE'
+        if not isinstance(message, str) or not message.strip():
+            message = 'Local runtime runner reported an unknown execution failure.'
+        raise ProcessorError(code, message)
+
+    result = envelope.get('result')
+    if envelope.get('ok') is not True or not isinstance(result, dict):
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner success envelope is malformed.')
+
+    return validate_runner_result(result, output_dir)
+
+
+def validate_runner_result(result: dict, output_dir: str) -> str:
+    file_path = result.get('file_path')
+    output_format = result.get('format')
+    backend = result.get('backend')
+
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner did not return a readable file path.')
+    if output_format != 'glb':
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner returned a non-glb artifact.')
+    if backend != 'local':
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner returned a non-local backend result.')
+
+    resolved_output_dir = Path(output_dir).resolve()
+    resolved_file = Path(file_path).resolve()
+
+    try:
+        resolved_file.relative_to(resolved_output_dir)
+    except ValueError as error:
+        raise ProcessorError(
+            'LOCAL_RUNTIME_UNAVAILABLE',
+            'Local runtime runner returned a file path outside the requested output directory.',
+        ) from error
+
+    if not resolved_file.is_file():
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', f'Local runtime runner did not create the reported output file: {resolved_file}.')
+
+    return str(resolved_file)
 
 
 def nested_get(payload: dict, *keys: str):
@@ -278,12 +392,20 @@ def main() -> int:
         )
 
         ensure_runtime_ready(readiness)
+        ensure_mvp_execution_contract(params, readiness)
 
         emit_progress(20, f'preflight:{selected_backend}')
         emit_progress(60, f'running:{selected_backend}')
         emit_progress(90, 'packaging')
 
-        file_path = package_result(output_dir, params['output_format'])
+        file_path = run_local_runtime(
+            ext_dir=ext_dir,
+            output_dir=output_dir,
+            reference_image=reference_image,
+            coarse_mesh=coarse_mesh,
+            backend=selected_backend,
+            params=params,
+        )
         emit({'type': 'done', 'result': {'filePath': file_path}})
         return 0
     except Exception as error:

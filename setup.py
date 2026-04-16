@@ -126,6 +126,7 @@ PACKAGE_STUBS = {
 }
 REQUIRED_RUNTIME_FILES = [
     'ultrashape_runtime/__init__.py',
+    'ultrashape_runtime/local_runner.py',
     'ultrashape_runtime/pipelines.py',
     'ultrashape_runtime/preprocessors.py',
     'ultrashape_runtime/rembg.py',

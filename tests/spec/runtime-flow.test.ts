@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -7,19 +7,26 @@ import { describe, expect, it } from 'vitest';
 
 const repoRoot = process.cwd();
 const processorPath = resolve(repoRoot, 'processor.py');
+const runtimeVendorPath = resolve(repoRoot, 'runtime', 'vendor');
+const runtimeConfigSourcePath = resolve(repoRoot, 'runtime', 'configs', 'infer_dit_refine.yaml');
 
 function createFixtureWorkspace() {
   const root = mkdtempSync(join(tmpdir(), 'ultrashape-runtime-'));
   const outputDir = join(root, 'output');
+  const modelsDir = join(root, 'models', 'ultrashape');
   mkdirSync(outputDir);
+  mkdirSync(modelsDir, { recursive: true });
 
   const referenceImage = join(root, 'reference.png');
   const coarseMesh = join(root, 'coarse.glb');
   const packagedArtifact = join(root, 'artifact.glb');
+  const checkpoint = join(modelsDir, 'ultrashape_v1.pt');
+  const configPath = join(root, 'infer_dit_refine.yaml');
 
   writeFileSync(referenceImage, 'image');
   writeFileSync(coarseMesh, 'mesh');
   writeFileSync(packagedArtifact, 'refined-mesh');
+  writeFileSync(checkpoint, 'checkpoint');
 
   return {
     root,
@@ -27,8 +34,62 @@ function createFixtureWorkspace() {
     referenceImage,
     coarseMesh,
     packagedArtifact,
+    checkpoint,
+    configPath,
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
+}
+
+function installProcessorRuntime(extDir: string) {
+  const runtimeDir = join(extDir, 'runtime');
+  const runtimePackageDir = join(runtimeDir, 'ultrashape_runtime');
+  const runtimeConfigDir = join(runtimeDir, 'configs');
+  const venvBinDir = join(extDir, 'venv', 'bin');
+  const modelsDir = join(extDir, 'models', 'ultrashape');
+  const pythonShimPath = join(venvBinDir, 'python');
+
+  mkdirSync(runtimeConfigDir, { recursive: true });
+  mkdirSync(venvBinDir, { recursive: true });
+  mkdirSync(modelsDir, { recursive: true });
+
+  cpSync(resolve(repoRoot, 'runtime', 'vendor', 'ultrashape_runtime'), runtimePackageDir, { recursive: true });
+  writeFileSync(join(runtimeConfigDir, 'infer_dit_refine.yaml'), readFileSync(runtimeConfigSourcePath, 'utf8'));
+  writeFileSync(join(modelsDir, 'ultrashape_v1.pt'), 'checkpoint');
+  writeFileSync(
+    pythonShimPath,
+    ['#!/usr/bin/env bash', 'set -euo pipefail', 'exec python3 "$@"', ''].join('\n'),
+  );
+  chmodSync(pythonShimPath, 0o755);
+}
+
+function writeRuntimeConfig(
+  path: string,
+  overrides: Partial<{
+    scope: string;
+    backend: string;
+    extraction: string;
+    primaryWeight: string;
+    requiredImports: string[];
+  }> = {},
+) {
+  const requiredImports = overrides.requiredImports ?? [];
+  writeFileSync(
+    path,
+    [
+      'model:',
+      `  scope: ${overrides.scope ?? 'mc-only'}`,
+      'runtime:',
+      `  backend: ${overrides.backend ?? 'local'}`,
+      'surface:',
+      `  extraction: ${overrides.extraction ?? 'mc'}`,
+      'weights:',
+      `  primary: ${overrides.primaryWeight ?? 'models/ultrashape/ultrashape_v1.pt'}`,
+      'dependencies:',
+      '  required_imports:',
+      ...requiredImports.map((entry) => `    - ${entry}`),
+      '',
+    ].join('\n'),
+  );
 }
 
 function writeReadiness(
@@ -85,11 +146,27 @@ function runProcessor(
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+function runLocalRunner(payload: Record<string, unknown>, options: { env?: NodeJS.ProcessEnv; cwd?: string } = {}) {
+  const outcome = spawnSync('python3', ['-m', 'ultrashape_runtime.local_runner'], {
+    cwd: options.cwd ?? repoRoot,
+    encoding: 'utf8',
+    input: `${JSON.stringify(payload)}\n`,
+    env: {
+      ...process.env,
+      PYTHONPATH: runtimeVendorPath,
+      ...options.env,
+    },
+  });
+
+  return outcome.stdout ? (JSON.parse(outcome.stdout) as Record<string, unknown>) : null;
+}
+
 describe('UltraShape runtime flow', () => {
   it('runs the repo-root Python boundary from the named-input contract and packages refined.<format> without any JS install artifact', () => {
     const fixture = createFixtureWorkspace();
 
     try {
+      installProcessorRuntime(fixture.root);
       writeReadiness(fixture.root);
 
       const events = runProcessor(
@@ -113,9 +190,6 @@ describe('UltraShape runtime flow', () => {
         },
         {
           cwd: fixture.root,
-          env: {
-            ULTRASHAPE_TEST_ARTIFACT_PATH: fixture.packagedArtifact,
-          },
         },
       );
 
@@ -127,7 +201,7 @@ describe('UltraShape runtime flow', () => {
           filePath: join(fixture.outputDir, 'refined.glb'),
         },
       });
-      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toBe('refined-mesh');
+      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toContain('mesh');
     } finally {
       fixture.cleanup();
     }
@@ -178,6 +252,7 @@ describe('UltraShape runtime flow', () => {
     try {
       mkdirSync(installedExtDir);
       writeFileSync(installedProcessorPath, readFileSync(processorPath, 'utf8'));
+      installProcessorRuntime(installedExtDir);
       writeReadiness(installedExtDir);
 
       const events = runProcessor(
@@ -200,9 +275,6 @@ describe('UltraShape runtime flow', () => {
         },
         {
           cwd: fixture.root,
-          env: {
-            ULTRASHAPE_TEST_ARTIFACT_PATH: fixture.packagedArtifact,
-          },
           processorPath: installedProcessorPath,
         },
       );
@@ -213,7 +285,7 @@ describe('UltraShape runtime flow', () => {
           filePath: join(fixture.outputDir, 'refined.glb'),
         },
       });
-      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toBe('refined-mesh');
+      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toContain('mesh');
     } finally {
       fixture.cleanup();
     }
@@ -254,6 +326,238 @@ describe('UltraShape runtime flow', () => {
         type: 'error',
         message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
         code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('runs the vendored local runner to generate refined.glb inside the requested output directory', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+
+      expect(outcome).toEqual({
+        ok: true,
+        result: {
+          file_path: join(fixture.outputDir, 'refined.glb'),
+          format: 'glb',
+          backend: 'local',
+          warnings: [],
+        },
+      });
+      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toContain('mesh');
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects non-mc scope configs at the vendored runner seam as LOCAL_RUNTIME_UNAVAILABLE', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath, {
+        scope: 'full-volume',
+      });
+
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: null,
+        preserve_scale: true,
+      });
+
+      expect(outcome).toEqual({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        error_message: expect.stringContaining('mc-only'),
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects non-glb output requests at the vendored runner seam as LOCAL_RUNTIME_UNAVAILABLE', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'obj',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: null,
+        preserve_scale: true,
+      });
+
+      expect(outcome).toEqual({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        error_message: expect.stringContaining('glb-only'),
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('maps missing checkpoint drift after config resolution to WEIGHTS_MISSING at the vendored runner seam', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+      rmSync(fixture.checkpoint);
+
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: null,
+        preserve_scale: true,
+      });
+
+      expect(outcome).toEqual({
+        ok: false,
+        error_code: 'WEIGHTS_MISSING',
+        error_message: expect.stringContaining('ultrashape_v1.pt'),
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('maps missing config bootstrap failures to LOCAL_RUNTIME_UNAVAILABLE at the vendored runner seam', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: fixture.checkpoint,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: null,
+        preserve_scale: true,
+      });
+
+      expect(outcome).toEqual({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        error_message: expect.stringContaining('config_path'),
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('maps missing required runtime imports to DEPENDENCY_MISSING at the vendored runner seam', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath, {
+        requiredImports: ['module_that_does_not_exist_for_ultrashape_tests'],
+      });
+
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: null,
+        preserve_scale: true,
+      });
+
+      expect(outcome).toEqual({
+        ok: false,
+        error_code: 'DEPENDENCY_MISSING',
+        error_message: expect.stringContaining('module_that_does_not_exist_for_ultrashape_tests'),
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('maps missing output generation to LOCAL_RUNTIME_UNAVAILABLE at the vendored runner seam', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const outcome = runLocalRunner(
+        {
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: fixture.outputDir,
+          output_format: 'glb',
+          checkpoint: null,
+          config_path: fixture.configPath,
+          ext_dir: fixture.root,
+          backend: 'local',
+          steps: 30,
+          guidance_scale: 5.5,
+          seed: null,
+          preserve_scale: true,
+        },
+        {
+          env: {
+            ULTRASHAPE_TEST_SKIP_OUTPUT_WRITE: '1',
+          },
+        },
+      );
+
+      expect(outcome).toEqual({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        error_message: expect.stringContaining('refined.glb'),
       });
     } finally {
       fixture.cleanup();
