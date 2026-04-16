@@ -15,6 +15,27 @@ const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
   }>;
 };
 
+function createBinaryGlbBytes() {
+  const jsonChunk = Buffer.from('{"asset":{"version":"2.0"}}   ', 'utf8');
+  const binaryChunk = Buffer.from([0x00, 0x80, 0x00, 0x00]);
+  const totalLength = 12 + 8 + jsonChunk.length + 8 + binaryChunk.length;
+
+  return Buffer.concat([
+    Buffer.from('glTF', 'ascii'),
+    Buffer.from(Uint32Array.of(2, totalLength).buffer),
+    Buffer.from(Uint32Array.of(jsonChunk.length, 0x4e4f534a).buffer),
+    jsonChunk,
+    Buffer.from(Uint32Array.of(binaryChunk.length, 0x004e4942).buffer),
+    binaryChunk,
+  ]);
+}
+
+function expectBinaryGlb(path: string) {
+  const payload = readFileSync(path);
+  expect(payload.subarray(0, 4).toString('ascii')).toBe('glTF');
+  expect(payload.includes(0x80)).toBe(true);
+}
+
 function createFixtureWorkspace() {
   const root = mkdtempSync(join(tmpdir(), 'ultrashape-processor-'));
   const outputDir = join(root, 'output');
@@ -26,7 +47,7 @@ function createFixtureWorkspace() {
   const packagedArtifact = join(root, 'artifact.obj');
 
   writeFileSync(referenceImage, 'image');
-  writeFileSync(namedCoarseMesh, 'named-mesh');
+  writeFileSync(namedCoarseMesh, createBinaryGlbBytes());
   writeFileSync(fallbackCoarseMesh, 'fallback-mesh');
   writeFileSync(packagedArtifact, 'refined-artifact');
 
@@ -449,7 +470,7 @@ describe('UltraShape processor.py protocol', () => {
           warnings: [],
         },
       });
-      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).not.toBe('refined-artifact');
+      expectBinaryGlb(join(fixture.outputDir, 'refined.glb'));
     } finally {
       fixture.cleanup();
     }

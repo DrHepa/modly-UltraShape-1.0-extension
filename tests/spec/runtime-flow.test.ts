@@ -10,6 +10,27 @@ const processorPath = resolve(repoRoot, 'processor.py');
 const runtimeVendorPath = resolve(repoRoot, 'runtime', 'vendor');
 const runtimeConfigSourcePath = resolve(repoRoot, 'runtime', 'configs', 'infer_dit_refine.yaml');
 
+function createBinaryGlbBytes() {
+  const jsonChunk = Buffer.from('{"asset":{"version":"2.0"}}   ', 'utf8');
+  const binaryChunk = Buffer.from([0x00, 0x80, 0x00, 0x00]);
+  const totalLength = 12 + 8 + jsonChunk.length + 8 + binaryChunk.length;
+
+  return Buffer.concat([
+    Buffer.from('glTF', 'ascii'),
+    Buffer.from(Uint32Array.of(2, totalLength).buffer),
+    Buffer.from(Uint32Array.of(jsonChunk.length, 0x4e4f534a).buffer),
+    jsonChunk,
+    Buffer.from(Uint32Array.of(binaryChunk.length, 0x004e4942).buffer),
+    binaryChunk,
+  ]);
+}
+
+function expectBinaryGlb(path: string) {
+  const payload = readFileSync(path);
+  expect(payload.subarray(0, 4).toString('ascii')).toBe('glTF');
+  expect(payload.length).toBeGreaterThanOrEqual(24);
+}
+
 function createFixtureWorkspace() {
   const root = mkdtempSync(join(tmpdir(), 'ultrashape-runtime-'));
   const outputDir = join(root, 'output');
@@ -19,24 +40,27 @@ function createFixtureWorkspace() {
 
   const referenceImage = join(root, 'reference.png');
   const coarseMesh = join(root, 'coarse.glb');
+  const binaryCoarseMesh = join(root, 'binary-coarse.glb');
   const packagedArtifact = join(root, 'artifact.glb');
   const checkpoint = join(modelsDir, 'ultrashape_v1.pt');
   const configPath = join(root, 'infer_dit_refine.yaml');
 
   writeFileSync(referenceImage, 'image');
   writeFileSync(coarseMesh, 'mesh');
+  writeFileSync(binaryCoarseMesh, createBinaryGlbBytes());
   writeFileSync(packagedArtifact, 'refined-mesh');
   writeFileSync(checkpoint, 'checkpoint');
 
   return {
     root,
     outputDir,
-    referenceImage,
-    coarseMesh,
-    packagedArtifact,
-    checkpoint,
-    configPath,
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
+     referenceImage,
+     coarseMesh,
+     binaryCoarseMesh,
+     packagedArtifact,
+     checkpoint,
+     configPath,
+     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
 }
 
@@ -201,7 +225,7 @@ describe('UltraShape runtime flow', () => {
           filePath: join(fixture.outputDir, 'refined.glb'),
         },
       });
-      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toContain('mesh');
+      expectBinaryGlb(join(fixture.outputDir, 'refined.glb'));
     } finally {
       fixture.cleanup();
     }
@@ -285,7 +309,7 @@ describe('UltraShape runtime flow', () => {
           filePath: join(fixture.outputDir, 'refined.glb'),
         },
       });
-      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toContain('mesh');
+      expectBinaryGlb(join(fixture.outputDir, 'refined.glb'));
     } finally {
       fixture.cleanup();
     }
@@ -362,7 +386,44 @@ describe('UltraShape runtime flow', () => {
           warnings: [],
         },
       });
-      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toContain('mesh');
+      expectBinaryGlb(join(fixture.outputDir, 'refined.glb'));
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('accepts binary glb coarse meshes without utf8 decode failures and writes a binary refined.glb', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.binaryCoarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+
+      expect(outcome).toEqual({
+        ok: true,
+        result: {
+          file_path: join(fixture.outputDir, 'refined.glb'),
+          format: 'glb',
+          backend: 'local',
+          warnings: [],
+        },
+      });
+      expectBinaryGlb(join(fixture.outputDir, 'refined.glb'));
+      expect(readFileSync(join(fixture.outputDir, 'refined.glb')).includes(0x80)).toBe(true);
     } finally {
       fixture.cleanup();
     }

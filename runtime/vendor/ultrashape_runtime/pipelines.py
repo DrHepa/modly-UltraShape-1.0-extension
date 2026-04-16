@@ -173,7 +173,7 @@ def run_refine_pipeline(
     output_path = export_refined_glb(
         output_dir=output_dir,
         output_format=output_format,
-        mesh_payload=str(refined_surface['payload']),
+        mesh_payload=refined_surface['payload'],
     )
 
     if not Path(output_path).is_file():

@@ -57,6 +57,12 @@ type HfTrace = {
   token: string | null;
 };
 
+function expectBinaryGlb(path: string) {
+  const payload = readFileSync(path);
+  expect(payload.subarray(0, 4).toString('ascii')).toBe('glTF');
+  expect(payload.length).toBeGreaterThanOrEqual(24);
+}
+
 function expectedProcessorOutcome(readiness: Readiness): 'done' | 'WEIGHTS_MISSING' | 'DEPENDENCY_MISSING' | 'LOCAL_RUNTIME_UNAVAILABLE' {
   if (!readiness.weights_ready) {
     return 'WEIGHTS_MISSING';
@@ -316,11 +322,9 @@ describe('UltraShape Python install surface', () => {
           },
         });
         expect(existsSync(smokeOutputPath)).toBe(true);
-        expect(readFileSync(smokeOutputPath, 'utf8')).toBe(
-          readFileSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/assets/coarse-mesh.glb'), 'utf8'),
-        );
-        expect(readFileSync(smokeOutputPath, 'utf8')).not.toBe(
-          readFileSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb'), 'utf8'),
+        expectBinaryGlb(smokeOutputPath);
+        expect(readFileSync(smokeOutputPath)).not.toEqual(
+          readFileSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb')),
         );
       } else {
         expect(events.at(-1)).toEqual({
