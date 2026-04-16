@@ -9,7 +9,6 @@ export interface UltraShapePreflightOptions {
   hostPlatform?: NodeJS.Platform;
   hostArch?: string;
   localAvailable?: boolean;
-  remoteAvailable?: boolean;
 }
 
 export function detectRuntimeCapabilities(
@@ -18,7 +17,6 @@ export function detectRuntimeCapabilities(
   const hostPlatform = options.hostPlatform ?? process.platform;
   const hostArch = options.hostArch ?? process.arch;
   const localSupported = options.localAvailable ?? true;
-  const remoteSupported = false;
   const recommendedBackend = 'local';
 
   let reason: string | undefined;
@@ -32,7 +30,6 @@ export function detectRuntimeCapabilities(
     hostPlatform,
     hostArch,
     localSupported,
-    remoteSupported,
     recommendedBackend,
     reason,
   };
@@ -58,16 +55,8 @@ function selectBackend(
   capabilities: UltraShapeRuntimeCapabilities,
 ): Pick<UltraShapePreflightResult, 'selectedBackend' | 'fallbackApplied' | 'reason'> {
   switch (requestedBackend) {
-    case 'remote':
-    case 'hybrid':
-      throw createProcessError(
-        'LOCAL_RUNTIME_UNAVAILABLE',
-        'LOCAL_RUNTIME_UNAVAILABLE: Remote and hybrid UltraShape backends are out of scope for this MVP.',
-        'backend',
-      );
-
     case 'local':
-    if (capabilities.localSupported) {
+      if (capabilities.localSupported) {
         return {
           selectedBackend: 'local',
           fallbackApplied: false,

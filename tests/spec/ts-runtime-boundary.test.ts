@@ -48,7 +48,6 @@ function createPreflight(selectedBackend: UltraShapePreflightResult['selectedBac
     hostPlatform: 'linux',
     hostArch: 'arm64',
     localSupported: true,
-    remoteSupported: false,
     recommendedBackend: 'local',
     selectedBackend,
     fallbackApplied: false,
@@ -81,19 +80,17 @@ describe('UltraShape TypeScript runtime boundary', () => {
     }
   });
 
-  it('rejects remote runtime execution even when a remote client is provided', async () => {
+  it('rejects corrupted preflight state that bypasses the local-only contract', async () => {
     const fixture = createFixtureWorkspace();
 
     try {
+      const corruptedPreflight = {
+        ...createPreflight('local'),
+        selectedBackend: 'remote',
+      } as unknown as UltraShapePreflightResult;
+
       await expect(
-        runRefinerRuntime(createRequest(fixture.outputDir), createPreflight('remote'), {
-          remoteClient: {
-            execute: vi.fn(async () => ({
-              path: fixture.artifactPath,
-              format: 'glb' as const,
-            })),
-          },
-        }),
+        runRefinerRuntime(createRequest(fixture.outputDir), corruptedPreflight),
       ).rejects.toMatchObject({
         code: 'LOCAL_RUNTIME_UNAVAILABLE',
       });

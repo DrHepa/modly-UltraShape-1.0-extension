@@ -2,7 +2,6 @@ import { copyFileSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import type {
-  UltraShapeExecutionClient,
   UltraShapeExecutionRequest,
   UltraShapeRuntimeAdapter,
 } from '../../adapters/ultrashape/client.js';
@@ -24,7 +23,6 @@ import type {
 } from './types.js';
 
 export interface UltraShapeRuntimeOptions {
-  remoteClient?: UltraShapeExecutionClient;
   localAdapter?: UltraShapeRuntimeAdapter;
   onProgress?: (event: UltraShapeProgressEvent) => void;
 }
@@ -102,7 +100,7 @@ function selectAdapter(
 
   throw createProcessError(
     'LOCAL_RUNTIME_UNAVAILABLE',
-    'LOCAL_RUNTIME_UNAVAILABLE: Remote and hybrid UltraShape execution paths are disabled in this MVP.',
+    'LOCAL_RUNTIME_UNAVAILABLE: The TypeScript compatibility layer only models the local Python runtime boundary.',
     'backend',
   );
 }

@@ -89,12 +89,16 @@ export function normalizeRuntimeError(error: unknown): UltraShapeProcessError {
   }
 
   if (error instanceof Error) {
-    return createProcessError('BACKEND_UNAVAILABLE', `BACKEND_UNAVAILABLE: ${error.message}`, 'backend');
+    return createProcessError(
+      'LOCAL_RUNTIME_UNAVAILABLE',
+      `LOCAL_RUNTIME_UNAVAILABLE: ${error.message}`,
+      'backend',
+    );
   }
 
   return createProcessError(
-    'BACKEND_UNAVAILABLE',
-    'BACKEND_UNAVAILABLE: UltraShape backend failed unexpectedly.',
+    'LOCAL_RUNTIME_UNAVAILABLE',
+    'LOCAL_RUNTIME_UNAVAILABLE: The TypeScript compatibility layer failed before reaching the Python runtime boundary.',
     'backend',
   );
 }

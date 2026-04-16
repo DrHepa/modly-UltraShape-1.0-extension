@@ -195,9 +195,9 @@ function accessOrThrow(path: string, field: UltraShapeProcessError['field']): vo
 }
 
 function validateBackend(value: unknown): UltraShapeBackendMode {
-  const allowed: UltraShapeBackendMode[] = ['auto', 'local', 'remote', 'hybrid'];
+  const allowed: UltraShapeBackendMode[] = ['auto', 'local'];
   if (typeof value !== 'string' || !allowed.includes(value as UltraShapeBackendMode)) {
-    throw createProcessError('INVALID_PARAMS', 'backend must be auto, local, remote, or hybrid.', 'backend');
+    throw createProcessError('INVALID_PARAMS', 'backend must be auto or local.', 'backend');
   }
 
   return value as UltraShapeBackendMode;
@@ -278,6 +278,6 @@ export function createProcessError(
   const error = new Error(message) as UltraShapeProcessError;
   error.code = code;
   error.field = field;
-  error.recoverable = code !== 'BACKEND_UNAVAILABLE';
+  error.recoverable = code !== 'LOCAL_RUNTIME_UNAVAILABLE';
   return error;
 }

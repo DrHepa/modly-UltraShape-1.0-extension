@@ -3,7 +3,7 @@ import type {
   UltraShapeOutputFormat,
 } from '../../processes/ultrashape-refiner/types.js';
 
-export type UltraShapeAdapterBackend = 'local' | 'remote' | 'hybrid';
+export type UltraShapeAdapterBackend = 'local';
 
 export interface UltraShapeAdapterUpdate {
   stage: 'queued' | 'running';
@@ -24,10 +24,6 @@ export interface UltraShapeExecutionRequest {
   contract?: 'named-inputs' | 'compatibility-fallback';
   signal?: AbortSignal;
   onUpdate?: (update: UltraShapeAdapterUpdate) => void;
-}
-
-export interface UltraShapeExecutionClient {
-  execute(request: UltraShapeExecutionRequest): Promise<UltraShapeExecutionArtifact>;
 }
 
 export interface UltraShapeRuntimeAdapter {

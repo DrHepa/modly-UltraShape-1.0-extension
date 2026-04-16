@@ -3,9 +3,8 @@ import { resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import * as adapterBoundary from '../../adapters/ultrashape/client.js';
-import { UltraShapeLocalAdapter } from '../../adapters/ultrashape/local.js';
-import { UltraShapeRemoteAdapter } from '../../adapters/ultrashape/remote.js';
+import * as adapterBoundary from '../../src/adapters/ultrashape/client.js';
+import { UltraShapeLocalAdapter } from '../../src/adapters/ultrashape/local.js';
 
 const repoRoot = process.cwd();
 
@@ -16,11 +15,7 @@ const runtimePaths = [
   'src/processes/ultrashape-refiner/runtime.ts',
   'src/processes/ultrashape-refiner/progress.ts',
   'src/adapters/ultrashape/client.ts',
-  'src/adapters/ultrashape/remote.ts',
   'src/adapters/ultrashape/local.ts',
-  'adapters/ultrashape/client.ts',
-  'adapters/ultrashape/remote.ts',
-  'adapters/ultrashape/local.ts',
 ];
 
 const configAndDocsPaths = ['manifest.json', 'processor.py', 'setup.py', 'README.md'];
@@ -80,7 +75,6 @@ describe('UltraShape repository structure contract', () => {
     for (const filePath of runtimePaths) {
       expect(
         filePath.startsWith('src/') ||
-          filePath.startsWith('adapters/') ||
           filePath.startsWith('runtime/modly/'),
       ).toBe(true);
     }
@@ -100,10 +94,11 @@ describe('UltraShape repository structure contract', () => {
     }
   });
 
-  it('exposes the adapter boundary through the spec-required top-level path without changing runtime exports', () => {
+  it('keeps the local-only TypeScript compatibility adapter inside src/', () => {
     expect(typeof adapterBoundary).toBe('object');
     expect(UltraShapeLocalAdapter).toBeTypeOf('function');
-    expect(UltraShapeRemoteAdapter).toBeTypeOf('function');
+    expect(existsSync(resolve(repoRoot, 'src/adapters/ultrashape/remote.ts'))).toBe(false);
+    expect(existsSync(resolve(repoRoot, 'adapters/ultrashape/client.ts'))).toBe(false);
   });
 
   it('keeps the repo-root Python boundary as the only active install surface', () => {

@@ -163,7 +163,7 @@ describe('UltraShape request contract', () => {
         output_dir: fixture.outputDir,
         checkpoint: null,
         params: {
-          backend: 'remote',
+          backend: 'local',
           steps: 40,
           guidance_scale: 6,
           preserve_scale: false,
@@ -178,7 +178,7 @@ describe('UltraShape request contract', () => {
         output_dir: fixture.outputDir,
         checkpoint: null,
         params: {
-          backend: 'remote',
+          backend: 'local',
           steps: 40,
           guidance_scale: 6,
           preserve_scale: false,
@@ -191,8 +191,8 @@ describe('UltraShape request contract', () => {
       expect(native.coarseMesh).toEqual(fallback.coarseMesh);
       expect(native.outputDir).toBe(fallback.outputDir);
       expect(native.params).toEqual(fallback.params);
-      expect(native.requestedBackend).toBe('remote');
-      expect(fallback.requestedBackend).toBe('remote');
+      expect(native.requestedBackend).toBe('local');
+      expect(fallback.requestedBackend).toBe('local');
     } finally {
       fixture.cleanup();
     }
@@ -203,19 +203,42 @@ describe('UltraShape request contract', () => {
       hostPlatform: 'linux',
       hostArch: 'arm64',
       localAvailable: true,
-      remoteAvailable: true,
     });
 
     expect(result.localSupported).toBe(true);
-    expect(result.remoteSupported).toBe(false);
     expect(result.recommendedBackend).toBe('local');
     expect(result.selectedBackend).toBe('local');
     expect(result.fallbackApplied).toBe(false);
     expect(result.reason).toContain('local');
   });
 
-  it('rejects remote and hybrid preflight requests because only the local runtime is in scope', () => {
-    expect(() => preflightRefinerExecution('remote')).toThrowError(/LOCAL_RUNTIME_UNAVAILABLE/);
-    expect(() => preflightRefinerExecution('hybrid')).toThrowError(/LOCAL_RUNTIME_UNAVAILABLE/);
+  it('rejects remote and hybrid backend values at validation time because only the local runtime is in scope', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      expect(() =>
+        validateRefinerRequest({
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: fixture.outputDir,
+          params: {
+            backend: 'remote' as never,
+          },
+        }),
+      ).toThrowError(/backend must be auto or local/);
+
+      expect(() =>
+        validateRefinerRequest({
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: fixture.outputDir,
+          params: {
+            backend: 'hybrid' as never,
+          },
+        }),
+      ).toThrowError(/backend must be auto or local/);
+    } finally {
+      fixture.cleanup();
+    }
   });
 });

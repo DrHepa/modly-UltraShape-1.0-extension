@@ -1,5 +1,5 @@
 export type UltraShapeAssetKind = 'image' | 'mesh';
-export type UltraShapeBackendMode = 'auto' | 'local' | 'remote' | 'hybrid';
+export type UltraShapeBackendMode = 'auto' | 'local';
 export type UltraShapeOutputFormat = 'glb' | 'obj' | 'fbx' | 'ply';
 export type UltraShapeProgressStage =
   | 'validating'
@@ -79,13 +79,12 @@ export interface UltraShapeRuntimeCapabilities {
   hostPlatform?: NodeJS.Platform;
   hostArch?: string;
   localSupported: boolean;
-  remoteSupported: boolean;
-  recommendedBackend: Exclude<UltraShapeBackendMode, 'auto'>;
+  recommendedBackend: 'local';
   reason?: string;
 }
 
 export interface UltraShapePreflightResult extends UltraShapeRuntimeCapabilities {
-  selectedBackend: Exclude<UltraShapeBackendMode, 'auto'>;
+  selectedBackend: 'local';
   fallbackApplied: boolean;
 }
 
@@ -97,7 +96,6 @@ export type UltraShapeErrorCode =
   | 'DEPENDENCY_MISSING'
   | 'WEIGHTS_MISSING'
   | 'LOCAL_RUNTIME_UNAVAILABLE'
-  | 'BACKEND_UNAVAILABLE'
   | 'CANCELLED';
 
 export interface UltraShapeProcessError extends Error {
