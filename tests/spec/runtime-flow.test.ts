@@ -66,9 +66,9 @@ function writeReadiness(
 
 function runProcessor(
   payload: Record<string, unknown>,
-  options: { env?: NodeJS.ProcessEnv; cwd?: string } = {},
+  options: { env?: NodeJS.ProcessEnv; cwd?: string; processorPath?: string } = {},
 ) {
-  const outcome = spawnSync('python3', [processorPath], {
+  const outcome = spawnSync('python3', [options.processorPath ?? processorPath], {
     cwd: options.cwd ?? repoRoot,
     encoding: 'utf8',
     input: `${JSON.stringify(payload)}\n`,
@@ -94,6 +94,7 @@ describe('UltraShape runtime flow', () => {
 
       const events = runProcessor(
         {
+          extDir: fixture.root,
           input: {
             inputs: {
               reference_image: {
@@ -144,6 +145,7 @@ describe('UltraShape runtime flow', () => {
 
       const events = runProcessor(
         {
+          extDir: fixture.root,
           input: {
             filePath: fixture.referenceImage,
           },
@@ -168,6 +170,55 @@ describe('UltraShape runtime flow', () => {
     }
   });
 
+  it('prefers the installed extension directory from processor.py before cwd fallback when extDir is omitted', () => {
+    const fixture = createFixtureWorkspace();
+    const installedExtDir = join(fixture.root, 'installed-extension');
+    const installedProcessorPath = join(installedExtDir, 'processor.py');
+
+    try {
+      mkdirSync(installedExtDir);
+      writeFileSync(installedProcessorPath, readFileSync(processorPath, 'utf8'));
+      writeReadiness(installedExtDir);
+
+      const events = runProcessor(
+        {
+          input: {
+            inputs: {
+              reference_image: {
+                filePath: fixture.referenceImage,
+              },
+              coarse_mesh: {
+                filePath: fixture.coarseMesh,
+              },
+            },
+          },
+          params: {
+            backend: 'local',
+            output_format: 'glb',
+          },
+          workspaceDir: fixture.outputDir,
+        },
+        {
+          cwd: fixture.root,
+          env: {
+            ULTRASHAPE_TEST_ARTIFACT_PATH: fixture.packagedArtifact,
+          },
+          processorPath: installedProcessorPath,
+        },
+      );
+
+      expect(events.at(-1)).toEqual({
+        type: 'done',
+        result: {
+          filePath: join(fixture.outputDir, 'refined.glb'),
+        },
+      });
+      expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toBe('refined-mesh');
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it('maps blocked local readiness without missing deps or weights to LOCAL_RUNTIME_UNAVAILABLE', () => {
     const fixture = createFixtureWorkspace();
 
@@ -178,6 +229,7 @@ describe('UltraShape runtime flow', () => {
 
       const events = runProcessor(
         {
+          extDir: fixture.root,
           input: {
             inputs: {
               reference_image: {

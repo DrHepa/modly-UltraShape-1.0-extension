@@ -143,8 +143,11 @@ def resolve_ext_dir(payload: dict) -> Path:
         os.environ.get('ULTRASHAPE_EXT_DIR'),
         payload.get('extDir'),
         nested_get(payload, 'context', 'extDir'),
+        Path(__file__).resolve().parent,
         os.getcwd(),
     ):
+        if isinstance(candidate, Path):
+            return candidate
         if isinstance(candidate, str) and candidate.strip():
             return Path(candidate.strip())
 

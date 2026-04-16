@@ -122,6 +122,7 @@ describe('UltraShape processor.py protocol', () => {
 
       const outcome = runProcessor(
         {
+          extDir: fixture.root,
           nodeId: 'ultrashape-refiner',
           input: {
             filePath: fixture.referenceImage,
@@ -192,6 +193,7 @@ describe('UltraShape processor.py protocol', () => {
 
       const outcome = runProcessor(
         {
+          extDir: fixture.root,
           input: {
             filePath: fixture.referenceImage,
           },
@@ -238,6 +240,7 @@ describe('UltraShape processor.py protocol', () => {
 
       const outcome = runProcessor(
         {
+          extDir: fixture.root,
           input: {
             filePath: fixture.referenceImage,
           },
@@ -272,6 +275,7 @@ describe('UltraShape processor.py protocol', () => {
       for (const backend of ['remote', 'hybrid'] as const) {
         const outcome = runProcessor(
           {
+            extDir: fixture.root,
             input: {
               inputs: {
                 reference_image: {
