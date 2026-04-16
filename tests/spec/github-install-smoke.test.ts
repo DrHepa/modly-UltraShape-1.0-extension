@@ -49,6 +49,14 @@ type Readiness = {
   expected_weights: string[];
 };
 
+type HfTrace = {
+  api: string;
+  repo_id: string;
+  filename: string;
+  revision: string | null;
+  token: string | null;
+};
+
 function expectedProcessorOutcome(readiness: Readiness): 'done' | 'WEIGHTS_MISSING' | 'DEPENDENCY_MISSING' | 'LOCAL_RUNTIME_UNAVAILABLE' {
   if (!readiness.weights_ready) {
     return 'WEIGHTS_MISSING';
@@ -86,16 +94,18 @@ function stageRequiredWeight(installDir: string) {
   return weightPath;
 }
 
-function buildSetupEnv() {
+function buildSetupEnv(extra: NodeJS.ProcessEnv = {}) {
   return {
     ...process.env,
     ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+    ...extra,
   };
 }
 
 describe('UltraShape GitHub install smoke', () => {
-  it('fails GitHub/root install smoke when the required weight is absent', () => {
+  it('acquires the default HF weight during GitHub/root install smoke when local sources are absent', () => {
     const simulation = copyExtractedRoot();
+    const hfTracePath = resolve(simulation.installDir, '.hf-download-trace.json');
 
     try {
       expect(existsSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/request.json'))).toBe(true);
@@ -115,26 +125,50 @@ describe('UltraShape GitHub install smoke', () => {
       })], {
         cwd: simulation.installDir,
         encoding: 'utf8',
-        env: buildSetupEnv(),
+        env: buildSetupEnv({
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'hf-default-weight',
+          ULTRASHAPE_SETUP_TEST_HF_TRACE_PATH: hfTracePath,
+        }),
       });
 
-      expect(setup.status).not.toBe(0);
+      expect(setup.status).toBe(0);
       expect(existsSync(resolve(simulation.installDir, 'venv'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/configs/infer_dit_refine.yaml'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/pipelines.py'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/models/denoisers/dit_mask.py'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/models/autoencoders/surface_extractors.py'))).toBe(true);
+      expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe('hf-default-weight');
 
-      const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness;
-      expect((readiness as Readiness & { install_success: boolean; failure_code: string }).install_success).toBe(false);
-      expect((readiness as Readiness & { install_success: boolean; failure_code: string }).failure_code).toBe('WEIGHT_ACQUISITION_FAILED');
-      expect(readiness.status).toBe('blocked');
+      const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness & {
+        install_success: boolean;
+        failure_code: string | null;
+        attempted_weight_source_kinds: string[];
+        resolved_weight_source_kind: string;
+        weight_source_repo_id: string;
+        weight_source_filename: string;
+      };
+      expect(readiness.install_success).toBe(true);
+      expect(readiness.failure_code).toBe(null);
+      expect(readiness.status).toBe('ready');
       expect(readiness.backend).toBe('local');
-      expect(readiness.weights_ready).toBe(false);
+      expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
-      expect(readiness.missing_required).toEqual(['models/ultrashape/ultrashape_v1.pt']);
+      expect(readiness.missing_required).toEqual([]);
       expect(readiness.missing_optional).toEqual([]);
       expect(readiness.expected_weights).toEqual(['models/ultrashape/ultrashape_v1.pt']);
+      expect(readiness.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-default']);
+      expect(readiness.resolved_weight_source_kind).toBe('hf-default');
+      expect(readiness.weight_source_repo_id).toBe('infinith/UltraShape');
+      expect(readiness.weight_source_filename).toBe('ultrashape_v1.pt');
+
+      const hfTrace = JSON.parse(readFileSync(hfTracePath, 'utf8')) as HfTrace;
+      expect(hfTrace).toEqual({
+        api: 'hf_hub_download',
+        repo_id: 'infinith/UltraShape',
+        filename: 'ultrashape_v1.pt',
+        revision: null,
+        token: null,
+      });
     } finally {
       simulation.cleanup();
     }

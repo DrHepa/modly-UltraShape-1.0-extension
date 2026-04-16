@@ -48,6 +48,14 @@ type Readiness = {
   expected_weights: string[];
 };
 
+type HfTrace = {
+  api: string;
+  repo_id: string;
+  filename: string;
+  revision: string | null;
+  token: string | null;
+};
+
 function expectedProcessorOutcome(readiness: Readiness): 'done' | 'WEIGHTS_MISSING' | 'DEPENDENCY_MISSING' | 'LOCAL_RUNTIME_UNAVAILABLE' {
   if (!readiness.weights_ready) {
     return 'WEIGHTS_MISSING';
@@ -85,10 +93,11 @@ function stageRequiredWeight(installDir: string) {
   return weightPath;
 }
 
-function buildSetupEnv() {
+function buildSetupEnv(extra: NodeJS.ProcessEnv = {}) {
   return {
     ...process.env,
     ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+    ...extra,
   };
 }
 
@@ -109,8 +118,9 @@ describe('UltraShape Python install surface', () => {
     }
   });
 
-  it('fails extracted-root setup when the required weight is absent but writes truthful failure artifacts', () => {
+  it('uses the default HF source for extracted-root setup when local sources are absent', () => {
     const simulation = copyInstallSurface();
+    const hfTracePath = resolve(simulation.installDir, '.hf-download-trace.json');
 
     try {
       const manifest = JSON.parse(readFileSync(resolve(simulation.installDir, 'manifest.json'), 'utf8')) as {
@@ -125,10 +135,13 @@ describe('UltraShape Python install surface', () => {
       })], {
         cwd: simulation.installDir,
         encoding: 'utf8',
-        env: buildSetupEnv(),
+        env: buildSetupEnv({
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'hf-default-weight',
+          ULTRASHAPE_SETUP_TEST_HF_TRACE_PATH: hfTracePath,
+        }),
       });
 
-      expect(outcome.status).not.toBe(0);
+      expect(outcome.status).toBe(0);
       expect(existsSync(resolve(simulation.installDir, 'venv'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, '.setup-summary.json'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, '.runtime-readiness.json'))).toBe(true);
@@ -142,20 +155,99 @@ describe('UltraShape Python install surface', () => {
         torch_profile: string;
         runtime_layout_version: string;
         install_success: boolean;
+        attempted_weight_source_kinds: string[];
+        resolved_weight_source_kind: string;
+        weight_source_repo_id: string;
+        weight_source_filename: string;
       };
       expect(summary.torch_profile).toBe('linux-arm64-cu128-sm90+');
       expect(summary.runtime_layout_version).toBe('1');
-      expect(summary.install_success).toBe(false);
+      expect(summary.install_success).toBe(true);
+      expect(summary.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-default']);
+      expect(summary.resolved_weight_source_kind).toBe('hf-default');
+      expect(summary.weight_source_repo_id).toBe('infinith/UltraShape');
+      expect(summary.weight_source_filename).toBe('ultrashape_v1.pt');
 
-      const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness;
-      expect((readiness as Readiness & { install_success: boolean; failure_code: string }).install_success).toBe(false);
-      expect((readiness as Readiness & { install_success: boolean; failure_code: string }).failure_code).toBe('WEIGHT_ACQUISITION_FAILED');
-      expect(readiness.status).toBe('blocked');
+      const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness & {
+        install_success: boolean;
+        failure_code: string | null;
+        attempted_weight_source_kinds: string[];
+        resolved_weight_source_kind: string;
+      };
+      expect(readiness.install_success).toBe(true);
+      expect(readiness.failure_code).toBe(null);
+      expect(readiness.status).toBe('ready');
       expect(readiness.backend).toBe('local');
-      expect(readiness.weights_ready).toBe(false);
+      expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
-      expect(readiness.missing_required).toEqual(['models/ultrashape/ultrashape_v1.pt']);
+      expect(readiness.missing_required).toEqual([]);
       expect(readiness.expected_weights).toEqual(['models/ultrashape/ultrashape_v1.pt']);
+      expect(readiness.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-default']);
+      expect(readiness.resolved_weight_source_kind).toBe('hf-default');
+      expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe('hf-default-weight');
+
+      const hfTrace = JSON.parse(readFileSync(hfTracePath, 'utf8')) as HfTrace;
+      expect(hfTrace).toEqual({
+        api: 'hf_hub_download',
+        repo_id: 'infinith/UltraShape',
+        filename: 'ultrashape_v1.pt',
+        revision: null,
+        token: null,
+      });
+    } finally {
+      simulation.cleanup();
+    }
+  });
+
+  it('prefers payload HF overrides over env HF defaults and keeps the download seam single-file', () => {
+    const simulation = copyInstallSurface();
+    const hfTracePath = resolve(simulation.installDir, '.hf-download-trace.json');
+
+    try {
+      const outcome = spawnSync('python3', ['setup.py', JSON.stringify({
+        python_exe: 'python3',
+        ext_dir: simulation.installDir,
+        gpu_sm: '90',
+        weight_repo_id: 'payload/UltraShape',
+        weight_repo_revision: 'payload-main',
+      })], {
+        cwd: simulation.installDir,
+        encoding: 'utf8',
+        env: buildSetupEnv({
+          ULTRASHAPE_WEIGHT_REPO_ID: 'env/UltraShape',
+          ULTRASHAPE_WEIGHT_REPO_REVISION: 'env-main',
+          ULTRASHAPE_WEIGHT_HF_TOKEN: 'token-from-env',
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'hf-override-weight',
+          ULTRASHAPE_SETUP_TEST_HF_TRACE_PATH: hfTracePath,
+        }),
+      });
+
+      expect(outcome.status).toBe(0);
+      expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe('hf-override-weight');
+
+      const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as {
+        attempted_weight_source_kinds: string[];
+        resolved_weight_source_kind: string;
+        weight_source_repo_id: string;
+        weight_source_filename: string;
+        weight_source_revision: string;
+        weight_source_auth_used: boolean;
+      };
+      expect(summary.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-override']);
+      expect(summary.resolved_weight_source_kind).toBe('hf-override');
+      expect(summary.weight_source_repo_id).toBe('payload/UltraShape');
+      expect(summary.weight_source_filename).toBe('ultrashape_v1.pt');
+      expect(summary.weight_source_revision).toBe('payload-main');
+      expect(summary.weight_source_auth_used).toBe(true);
+
+      const hfTrace = JSON.parse(readFileSync(hfTracePath, 'utf8')) as HfTrace;
+      expect(hfTrace).toEqual({
+        api: 'hf_hub_download',
+        repo_id: 'payload/UltraShape',
+        filename: 'ultrashape_v1.pt',
+        revision: 'payload-main',
+        token: 'token-from-env',
+      });
     } finally {
       simulation.cleanup();
     }

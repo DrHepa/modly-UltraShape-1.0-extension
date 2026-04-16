@@ -29,7 +29,10 @@ REQUIRED_DEPENDENCIES = [
     'tqdm',
 ]
 OPTIONAL_DEPENDENCIES = ['cubvh', 'flash_attn', 'diffusers', 'diso']
-EXPECTED_WEIGHTS = ['models/ultrashape/ultrashape_v1.pt']
+WEIGHT_FILENAME = 'ultrashape_v1.pt'
+WEIGHT_RELATIVE_PATH = f'models/ultrashape/{WEIGHT_FILENAME}'
+EXPECTED_WEIGHTS = [WEIGHT_RELATIVE_PATH]
+DEFAULT_WEIGHT_REPO_ID = 'infinith/UltraShape'
 RUNTIME_LAYOUT_VERSION = '1'
 WEIGHT_FAILURE_CODE = 'WEIGHT_ACQUISITION_FAILED'
 IMPORT_FAILURE_CODE = 'REQUIRED_IMPORT_SMOKE_FAILED'
@@ -65,7 +68,52 @@ PACKAGE_STUBS = {
     'omegaconf': 'class OmegaConf:\n    pass\n',
     'einops': '__version__ = "0.0-test"\n',
     'transformers': '__version__ = "0.0-test"\n',
-    'huggingface_hub': 'def snapshot_download(*args, **kwargs):\n    raise RuntimeError("stub")\n',
+    'huggingface_hub': (
+        'import json\n'
+        'import os\n'
+        'from pathlib import Path\n\n'
+        'class GatedRepoError(Exception):\n'
+        '    status_code = 401\n\n'
+        'class HfHubHTTPError(Exception):\n'
+        '    def __init__(self, message, status_code=None):\n'
+        '        super().__init__(message)\n'
+        '        self.status_code = status_code\n\n'
+        'class RepositoryNotFoundError(Exception):\n'
+        '    status_code = 404\n\n'
+        'class RevisionNotFoundError(Exception):\n'
+        '    status_code = 404\n\n'
+        'class RemoteEntryNotFoundError(Exception):\n'
+        '    status_code = 404\n\n'
+        'class EntryNotFoundError(Exception):\n'
+        '    status_code = 404\n\n'
+        'class LocalEntryNotFoundError(Exception):\n'
+        '    pass\n\n'
+        'def _write_trace(payload):\n'
+        '    trace_path = os.environ.get("ULTRASHAPE_SETUP_TEST_HF_TRACE_PATH")\n'
+        '    if not trace_path:\n'
+        '        return\n'
+        '    Path(trace_path).write_text(json.dumps(payload), encoding="utf8")\n\n'
+        'def hf_hub_download(repo_id, filename, revision=None, token=None, local_dir=None, local_dir_use_symlinks=False, **kwargs):\n'
+        '    _write_trace({"api": "hf_hub_download", "repo_id": repo_id, "filename": filename, "revision": revision, "token": token})\n'
+        '    scenario = os.environ.get("ULTRASHAPE_SETUP_TEST_HF_SCENARIO")\n'
+        '    if scenario == "auth":\n'
+        '        raise GatedRepoError("401 Unauthorized from Hugging Face")\n'
+        '    if scenario == "network":\n'
+        '        raise LocalEntryNotFoundError("Connection error while downloading UltraShape weights")\n'
+        '    if scenario == "not-found":\n'
+        '        raise RemoteEntryNotFoundError("404 missing ultrashape_v1.pt")\n'
+        '    if scenario == "other":\n'
+        '        raise RuntimeError("Unexpected HF failure during UltraShape acquisition")\n'
+        '    if "ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE" not in os.environ:\n'
+        '        raise RuntimeError("hf_hub_download test seam not configured")\n'
+        '    target_dir = Path(local_dir) if local_dir else Path.cwd()\n'
+        '    target_dir.mkdir(parents=True, exist_ok=True)\n'
+        '    target_path = target_dir / filename\n'
+        '    target_path.write_text(os.environ.get("ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE", "stub-weight"), encoding="utf8")\n'
+        '    return str(target_path)\n\n'
+        'def snapshot_download(*args, **kwargs):\n'
+        '    raise RuntimeError("snapshot_download should not be used for UltraShape weight acquisition")\n'
+    ),
     'accelerate': '__version__ = "0.0-test"\n',
     'rembg': '__version__ = "0.0-test"\n',
     'onnxruntime': '__version__ = "0.0-test"\n',
@@ -98,6 +146,22 @@ REQUIRED_RUNTIME_FILES = [
     'ultrashape_runtime/models/autoencoders/surface_extractors.py',
     'ultrashape_runtime/models/autoencoders/volume_decoders.py',
 ]
+HF_AUTH_ERROR_CLASSES = {'GatedRepoError'}
+HF_NOT_FOUND_ERROR_CLASSES = {
+    'RepositoryNotFoundError',
+    'RevisionNotFoundError',
+    'RemoteEntryNotFoundError',
+    'EntryNotFoundError',
+}
+HF_NETWORK_ERROR_CLASSES = {
+    'LocalEntryNotFoundError',
+    'ConnectionError',
+    'ConnectTimeout',
+    'ReadTimeout',
+    'Timeout',
+    'ProxyError',
+    'ChunkedEncodingError',
+}
 
 
 def parse_args(argv: list[str]) -> dict[str, object]:
@@ -284,91 +348,241 @@ def install_required_dependencies(venv_dir: Path, profile: dict[str, str]) -> di
 def copy_required_weight(source_path: Path, target_path: Path) -> bool:
     if not source_path.is_file():
         return False
+    copy_test_scenario = os.environ.get('ULTRASHAPE_SETUP_TEST_COPY_SCENARIO')
+    if copy_test_scenario == 'permission-error':
+        raise PermissionError('copy blocked for test')
+    if copy_test_scenario == 'missing-file':
+        raise FileNotFoundError('copy source disappeared for test')
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if source_path.resolve() != target_path.resolve():
         copy2(source_path, target_path)
     return target_path.is_file()
 
 
+def render_weight_source(kind: str, source: Path | str | None) -> str | None:
+    if source is None:
+        return None
+    if kind in {'ext-dir', 'required_weight_path', 'env-local', 'repo-local'}:
+        return str(Path(source).resolve())
+    return str(source)
+
+
+def build_weight_source_descriptor(kind: str, source: Path | str) -> dict[str, object]:
+    return {
+        'kind': kind,
+        'source': render_weight_source(kind, source),
+    }
+
+
+def render_hf_weight_source(repo_id: str, revision: str | None, filename: str = WEIGHT_FILENAME) -> str:
+    return f'huggingface://{repo_id}/{filename}@{revision or "default"}'
+
+
+def resolve_hf_source(payload: dict[str, object]) -> dict[str, object] | None:
+    payload_repo_id = payload.get('weight_repo_id') if isinstance(payload.get('weight_repo_id'), str) and payload.get('weight_repo_id').strip() else None
+    payload_revision = payload.get('weight_repo_revision') if isinstance(payload.get('weight_repo_revision'), str) and payload.get('weight_repo_revision').strip() else None
+    env_repo_id = os.environ.get('ULTRASHAPE_WEIGHT_REPO_ID') or None
+    env_revision = os.environ.get('ULTRASHAPE_WEIGHT_REPO_REVISION') or None
+    token = payload.get('weight_hf_token') if isinstance(payload.get('weight_hf_token'), str) and payload.get('weight_hf_token').strip() else os.environ.get('ULTRASHAPE_WEIGHT_HF_TOKEN')
+    repo_id = payload_repo_id or env_repo_id or DEFAULT_WEIGHT_REPO_ID
+    revision = payload_revision or env_revision
+
+    if not repo_id:
+        return None
+
+    kind = 'hf-default'
+    if payload_repo_id or payload_revision or env_repo_id or env_revision:
+        kind = 'hf-override'
+
+    return {
+        'kind': kind,
+        'repo_id': repo_id,
+        'revision': revision,
+        'filename': WEIGHT_FILENAME,
+        'token': token,
+        'auth_used': bool(token),
+        'source': render_hf_weight_source(repo_id, revision),
+    }
+
+
+def classify_local_weight_failure(error: Exception) -> str:
+    if isinstance(error, FileNotFoundError):
+        return 'not-found'
+    if isinstance(error, OSError):
+        return 'other'
+    return 'other'
+
+
+def classify_hf_weight_failure(error_class: str | None, status_code: int | None) -> str:
+    if error_class in HF_AUTH_ERROR_CLASSES:
+        return 'auth'
+    if error_class == 'HfHubHTTPError' and status_code in {401, 403}:
+        return 'auth'
+    if error_class in HF_NOT_FOUND_ERROR_CLASSES:
+        return 'not-found'
+    if error_class == 'HfHubHTTPError' and status_code == 404:
+        return 'not-found'
+    if error_class in HF_NETWORK_ERROR_CLASSES or error_class == 'CalledProcessError':
+        return 'network'
+    return 'other'
+
+
+def parse_hf_error_payload(raw_output: str) -> dict[str, object]:
+    if not raw_output.strip():
+        return {}
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError:
+        return {'error_message': raw_output.strip()}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def download_hf_weight(venv_dir: Path, target_path: Path, hf_source: dict[str, object], cache_dir: Path) -> dict[str, object]:
+    venv_python = get_venv_python(venv_dir)
+    script_lines = [
+        'import json',
+        'import sys',
+        'from pathlib import Path',
+        'from shutil import copy2',
+        'from huggingface_hub import hf_hub_download',
+        f'repo_id = {hf_source["repo_id"]!r}',
+        f'filename = {hf_source["filename"]!r}',
+        f'revision = {hf_source["revision"]!r}',
+        f'token = {hf_source["token"]!r}',
+        f'target = Path({str(target_path)!r})',
+        f'cache_dir = Path({str(cache_dir)!r})',
+        'try:',
+        '    downloaded = Path(hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, token=token, local_dir=cache_dir, local_dir_use_symlinks=False))',
+        '    target.parent.mkdir(parents=True, exist_ok=True)',
+        '    if downloaded.resolve() != target.resolve():',
+        '        copy2(downloaded, target)',
+        '    else:',
+        '        target.write_bytes(downloaded.read_bytes())',
+        '    print(json.dumps({"ok": True, "downloaded": str(downloaded)}))',
+        'except Exception as error:',
+        '    print(json.dumps({',
+        '        "ok": False,',
+        '        "error_class": error.__class__.__name__,',
+        '        "error_message": str(error),',
+        '        "status_code": getattr(error, "status_code", None),',
+        '    }))',
+        '    sys.exit(1)',
+    ]
+    outcome = subprocess.run(
+        [str(venv_python), '-c', '\n'.join(script_lines)],
+        check=False,
+        capture_output=True,
+        encoding='utf8',
+    )
+    if outcome.returncode != 0:
+        error_payload = parse_hf_error_payload(outcome.stdout)
+        error_class = error_payload.get('error_class') if isinstance(error_payload.get('error_class'), str) else 'CalledProcessError'
+        error_message = error_payload.get('error_message') if isinstance(error_payload.get('error_message'), str) else (outcome.stderr.strip() or outcome.stdout.strip() or 'HF child process failed')
+        status_code = error_payload.get('status_code') if isinstance(error_payload.get('status_code'), int) else None
+        return {
+            'ok': False,
+            'error_class': error_class,
+            'error_message': error_message,
+            'status_code': status_code,
+            'failure_classification': classify_hf_weight_failure(error_class, status_code),
+        }
+    return {'ok': target_path.is_file()}
+
+
 def acquire_required_weight(ext_dir: str, payload: dict[str, object], venv_dir: Path) -> dict[str, object]:
     install_root = Path(ext_dir)
-    target_path = install_root / EXPECTED_WEIGHTS[0]
+    target_path = install_root / WEIGHT_RELATIVE_PATH
     repo_root = Path(__file__).resolve().parent
-    attempted_sources = [str(target_path)]
+    attempted_descriptors = [build_weight_source_descriptor('ext-dir', target_path)]
+
+    def build_result(acquired: bool, resolved_descriptor: dict[str, object] | None) -> dict[str, object]:
+        attempted_sources = [descriptor['source'] for descriptor in attempted_descriptors]
+        attempted_source_kinds = [descriptor['kind'] for descriptor in attempted_descriptors]
+        resolved_source_kind = resolved_descriptor['kind'] if resolved_descriptor else None
+        resolved_source = resolved_descriptor['source'] if resolved_descriptor else None
+        return {
+            'acquired': acquired,
+            'target_path': str(target_path),
+            'attempted_source_kinds': attempted_source_kinds,
+            'attempted_sources': attempted_sources,
+            'resolved_source_kind': resolved_source_kind,
+            'resolved_source': resolved_source,
+            'weight_source_repo_id': resolved_descriptor.get('repo_id') if resolved_descriptor else None,
+            'weight_source_filename': resolved_descriptor.get('filename', WEIGHT_FILENAME) if resolved_descriptor else WEIGHT_FILENAME,
+            'weight_source_revision': resolved_descriptor.get('revision') if resolved_descriptor else None,
+            'weight_source_auth_used': resolved_descriptor.get('auth_used') if resolved_descriptor else None,
+            'failure_classification': None,
+            'error_class': None,
+            'error_message': None,
+        }
+
+    def build_failure_result(
+        descriptor: dict[str, object] | None = None,
+        *,
+        failure_classification: str,
+        error_class: str,
+        error_message: str,
+    ) -> dict[str, object]:
+        result = build_result(False, None)
+        if descriptor is not None:
+            result['weight_source_repo_id'] = descriptor.get('repo_id')
+            result['weight_source_filename'] = descriptor.get('filename', WEIGHT_FILENAME)
+            result['weight_source_revision'] = descriptor.get('revision')
+            result['weight_source_auth_used'] = descriptor.get('auth_used')
+        result['failure_classification'] = failure_classification
+        result['error_class'] = error_class
+        result['error_message'] = error_message
+        return result
 
     if target_path.is_file():
-        return {
-            'acquired': True,
-            'target_path': str(target_path),
-            'attempted_sources': attempted_sources,
-            'resolved_source': str(target_path),
-        }
+        return build_result(True, attempted_descriptors[0])
 
     local_candidates = []
     required_weight_path = payload.get('required_weight_path')
     if isinstance(required_weight_path, str) and required_weight_path.strip():
-        local_candidates.append(Path(required_weight_path.strip()))
+        local_candidates.append(build_weight_source_descriptor('required_weight_path', Path(required_weight_path.strip())))
 
     env_source = os.environ.get('ULTRASHAPE_WEIGHT_SOURCE_PATH')
     if env_source:
-        local_candidates.append(Path(env_source))
+        local_candidates.append(build_weight_source_descriptor('env-local', Path(env_source)))
 
-    repo_weight = repo_root / EXPECTED_WEIGHTS[0]
-    local_candidates.append(repo_weight)
+    repo_weight = repo_root / WEIGHT_RELATIVE_PATH
+    local_candidates.append(build_weight_source_descriptor('repo-local', repo_weight))
 
     for candidate in local_candidates:
-        attempted_sources.append(str(candidate))
-        if copy_required_weight(candidate, target_path):
-            return {
-                'acquired': True,
-                'target_path': str(target_path),
-                'attempted_sources': attempted_sources,
-                'resolved_source': str(candidate),
-            }
+        attempted_descriptors.append(candidate)
+        try:
+            if copy_required_weight(Path(candidate['source']), target_path):
+                return build_result(True, candidate)
+        except Exception as error:
+            return build_failure_result(
+                candidate,
+                failure_classification=classify_local_weight_failure(error),
+                error_class=error.__class__.__name__,
+                error_message=str(error),
+            )
 
-    hf_repo_id = payload.get('weight_repo_id') if isinstance(payload.get('weight_repo_id'), str) else os.environ.get('ULTRASHAPE_WEIGHT_REPO_ID')
-    hf_repo_revision = payload.get('weight_repo_revision') if isinstance(payload.get('weight_repo_revision'), str) else os.environ.get('ULTRASHAPE_WEIGHT_REPO_REVISION')
-    if isinstance(hf_repo_id, str) and hf_repo_id.strip():
-        attempted_sources.append(f'huggingface://{hf_repo_id.strip()}')
-        venv_python = get_venv_python(venv_dir)
+    hf_source = resolve_hf_source(payload)
+    if hf_source is not None:
+        attempted_descriptors.append(build_weight_source_descriptor(hf_source['kind'], hf_source['source']))
+        attempted_descriptors[-1].update({
+            'repo_id': hf_source['repo_id'],
+            'filename': hf_source['filename'],
+            'revision': hf_source['revision'],
+            'auth_used': hf_source['auth_used'],
+        })
         download_cache = install_root / '.hf-cache'
-        command = [
-            str(venv_python),
-            '-c',
-            (
-                'from huggingface_hub import snapshot_download\n'
-                'from pathlib import Path\n'
-                'repo_id = Path("' + hf_repo_id.strip().replace('"', '\\"') + '")\n'
-            ),
-        ]
-        script_lines = [
-            'from huggingface_hub import snapshot_download',
-            'from pathlib import Path',
-            f'repo_id = {hf_repo_id.strip()!r}',
-            f'revision = {hf_repo_revision.strip()!r}' if isinstance(hf_repo_revision, str) and hf_repo_revision.strip() else 'revision = None',
-            f'target = Path({str(target_path)!r})',
-            f'cache_dir = Path({str(download_cache)!r})',
-            f'filename = {Path(EXPECTED_WEIGHTS[0]).name!r}',
-            'snapshot_path = Path(snapshot_download(repo_id=repo_id, revision=revision, allow_patterns=[filename], cache_dir=cache_dir))',
-            'source = next(snapshot_path.rglob(filename))',
-            'target.parent.mkdir(parents=True, exist_ok=True)',
-            'target.write_bytes(source.read_bytes())',
-        ]
-        subprocess.run([str(venv_python), '-c', '\n'.join(script_lines)], check=True)
-        if target_path.is_file():
-            return {
-                'acquired': True,
-                'target_path': str(target_path),
-                'attempted_sources': attempted_sources,
-                'resolved_source': f'huggingface://{hf_repo_id.strip()}',
-            }
+        hf_result = download_hf_weight(venv_dir, target_path, hf_source, download_cache)
+        if hf_result['ok']:
+            return build_result(True, attempted_descriptors[-1])
+        return build_failure_result(
+            attempted_descriptors[-1],
+            failure_classification=str(hf_result['failure_classification']),
+            error_class=str(hf_result['error_class']),
+            error_message=str(hf_result['error_message']),
+        )
 
-    return {
-        'acquired': False,
-        'target_path': str(target_path),
-        'attempted_sources': attempted_sources,
-        'resolved_source': None,
-    }
+    return build_result(False, None)
 
 
 def run_import_smoke(venv_dir: Path, ext_dir: str, modules: list[str]) -> list[str]:
@@ -478,7 +692,7 @@ def collect_install_health(ext_dir: str, required_import_failures: list[str], op
     }
 
 
-def build_readiness(ext_dir: str, health: dict[str, object]) -> dict[str, object]:
+def build_readiness(ext_dir: str, health: dict[str, object], weight_result: dict[str, object]) -> dict[str, object]:
     missing_required = list(health['missing_required'])
 
     return {
@@ -493,7 +707,22 @@ def build_readiness(ext_dir: str, health: dict[str, object]) -> dict[str, object
         'install_success': health['install_success'],
         'failure_stage': health['failure_stage'],
         'failure_code': health['failure_code'],
-        'failure_detail': health['failure_detail'],
+    }
+
+
+def build_weight_diagnostics(weight_result: dict[str, object]) -> dict[str, object]:
+    return {
+        'attempted_weight_source_kinds': weight_result['attempted_source_kinds'],
+        'attempted_weight_sources': weight_result['attempted_sources'],
+        'resolved_weight_source_kind': weight_result['resolved_source_kind'],
+        'resolved_weight_source': weight_result['resolved_source'],
+        'weight_source_repo_id': weight_result['weight_source_repo_id'],
+        'weight_source_filename': weight_result['weight_source_filename'],
+        'weight_source_revision': weight_result['weight_source_revision'],
+        'weight_source_auth_used': weight_result['weight_source_auth_used'],
+        'weight_source_failure_classification': weight_result['failure_classification'],
+        'weight_source_error_class': weight_result['error_class'],
+        'weight_source_error_message': weight_result['error_message'],
     }
 
 
@@ -514,13 +743,14 @@ def write_summary(ext_dir: str, context: dict[str, str], payload: dict[str, obje
         'failure_stage': health['failure_stage'],
         'failure_code': health['failure_code'],
         'failure_detail': health['failure_detail'],
-        'attempted_weight_sources': weight_result['attempted_sources'],
-        'resolved_weight_source': weight_result['resolved_source'],
         'missing_required': health['missing_required'],
         'missing_optional': health['missing_optional'],
     })
+    summary.update(build_weight_diagnostics(weight_result))
     write_json(summary_path, summary)
-    write_json(readiness_path, build_readiness(ext_dir, health))
+    readiness = build_readiness(ext_dir, health, weight_result)
+    readiness.update(build_weight_diagnostics(weight_result))
+    write_json(readiness_path, readiness)
 
     if not health['install_success']:
         raise SystemExit(1)
