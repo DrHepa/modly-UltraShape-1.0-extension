@@ -62,8 +62,8 @@ describe('UltraShape request contract', () => {
       expect(outcome.status).toBe(0);
       expect(events.at(-1)).toEqual({
         type: 'error',
-        message: expect.stringContaining('BACKEND_UNAVAILABLE'),
-        code: 'BACKEND_UNAVAILABLE',
+        message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
       });
     } finally {
       fixture.cleanup();
@@ -198,19 +198,24 @@ describe('UltraShape request contract', () => {
     }
   });
 
-  it('prefers remote fallback on Linux ARM64 when local is unavailable', () => {
+  it('stays local-first on Linux ARM64 when the local runtime is available', () => {
     const result = preflightRefinerExecution('auto', {
       hostPlatform: 'linux',
       hostArch: 'arm64',
-      localAvailable: false,
+      localAvailable: true,
       remoteAvailable: true,
     });
 
-    expect(result.localSupported).toBe(false);
-    expect(result.remoteSupported).toBe(true);
-    expect(result.recommendedBackend).toBe('remote');
-    expect(result.selectedBackend).toBe('remote');
-    expect(result.fallbackApplied).toBe(true);
-    expect(result.reason).toContain('Linux ARM64');
+    expect(result.localSupported).toBe(true);
+    expect(result.remoteSupported).toBe(false);
+    expect(result.recommendedBackend).toBe('local');
+    expect(result.selectedBackend).toBe('local');
+    expect(result.fallbackApplied).toBe(false);
+    expect(result.reason).toContain('local');
+  });
+
+  it('rejects remote and hybrid preflight requests because only the local runtime is in scope', () => {
+    expect(() => preflightRefinerExecution('remote')).toThrowError(/LOCAL_RUNTIME_UNAVAILABLE/);
+    expect(() => preflightRefinerExecution('hybrid')).toThrowError(/LOCAL_RUNTIME_UNAVAILABLE/);
   });
 });

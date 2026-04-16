@@ -9,8 +9,8 @@ export class UltraShapeLocalAdapter implements UltraShapeRuntimeAdapter {
 
   async run(_request: UltraShapeExecutionRequest): Promise<never> {
     throw createProcessError(
-      'BACKEND_UNAVAILABLE',
-      'Local UltraShape execution is intentionally unsupported in this extension until a reliable runtime path exists.',
+      'LOCAL_RUNTIME_UNAVAILABLE',
+      'LOCAL_RUNTIME_UNAVAILABLE: The TypeScript compatibility adapter does not execute UltraShape locally; use the repo-root processor.py runtime boundary.',
       'backend',
     );
   }

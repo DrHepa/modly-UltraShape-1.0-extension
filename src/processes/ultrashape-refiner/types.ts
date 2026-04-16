@@ -36,6 +36,9 @@ export interface UltraShapeFallbackBundle {
   params?: Partial<UltraShapeRefinerParams>;
 }
 
+/** Temporary compatibility-only seam for legacy callers. */
+export type UltraShapeCompatibilityFallbackBundle = UltraShapeFallbackBundle;
+
 export interface UltraShapeNativeRequest {
   reference_image: UltraShapeAssetInput;
   coarse_mesh: UltraShapeAssetInput;
@@ -46,7 +49,7 @@ export interface UltraShapeNativeRequest {
   abortSignal?: AbortSignal;
 }
 
-export type UltraShapeRequestInput = UltraShapeNativeRequest | UltraShapeFallbackBundle;
+export type UltraShapeRequestInput = UltraShapeNativeRequest | UltraShapeCompatibilityFallbackBundle;
 
 export interface UltraShapeNormalizedRequest {
   correlationId: string;
@@ -91,6 +94,9 @@ export type UltraShapeErrorCode =
   | 'UNREADABLE_ASSET'
   | 'UNSUPPORTED_ASSET_TYPE'
   | 'INVALID_PARAMS'
+  | 'DEPENDENCY_MISSING'
+  | 'WEIGHTS_MISSING'
+  | 'LOCAL_RUNTIME_UNAVAILABLE'
   | 'BACKEND_UNAVAILABLE'
   | 'CANCELLED';
 

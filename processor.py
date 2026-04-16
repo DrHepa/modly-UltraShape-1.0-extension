@@ -20,6 +20,15 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 MESH_EXTENSIONS = {'.glb', '.obj', '.fbx', '.ply'}
 ALLOWED_BACKENDS = {'auto', 'local', 'remote', 'hybrid'}
 ALLOWED_OUTPUTS = {'glb', 'obj', 'fbx', 'ply'}
+PUBLIC_ERROR_CODES = {
+    'INVALID_PARAMS',
+    'MISSING_INPUT',
+    'UNREADABLE_ASSET',
+    'UNSUPPORTED_ASSET_TYPE',
+    'DEPENDENCY_MISSING',
+    'WEIGHTS_MISSING',
+    'LOCAL_RUNTIME_UNAVAILABLE',
+}
 
 
 class ProcessorError(Exception):
@@ -38,8 +47,15 @@ def emit_progress(percent: int, label: str) -> None:
 
 
 def emit_error(error: Exception) -> None:
-    code = getattr(error, 'code', 'BACKEND_UNAVAILABLE')
-    emit({'type': 'error', 'message': str(error), 'code': code})
+    code = getattr(error, 'code', 'LOCAL_RUNTIME_UNAVAILABLE')
+    if code not in PUBLIC_ERROR_CODES:
+        code = 'LOCAL_RUNTIME_UNAVAILABLE'
+
+    message = str(error)
+    if not message.startswith(f'{code}:'):
+        message = f'{code}: {message}'
+
+    emit({'type': 'error', 'message': message, 'code': code})
 
 
 def read_payload() -> dict:
@@ -122,6 +138,19 @@ def resolve_input_paths(payload: dict, params: dict) -> tuple[str, str]:
     return reference_path.strip(), coarse_path.strip()
 
 
+def resolve_ext_dir(payload: dict) -> Path:
+    for candidate in (
+        os.environ.get('ULTRASHAPE_EXT_DIR'),
+        payload.get('extDir'),
+        nested_get(payload, 'context', 'extDir'),
+        os.getcwd(),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return Path(candidate.strip())
+
+    raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Unable to resolve the installed UltraShape runtime directory.')
+
+
 def ensure_file(path_value: str, field: str, allowed_extensions: set[str] | None) -> None:
     path = Path(path_value)
     if not path.is_file():
@@ -130,46 +159,67 @@ def ensure_file(path_value: str, field: str, allowed_extensions: set[str] | None
         raise ProcessorError('UNSUPPORTED_ASSET_TYPE', f'{field} must use an allowed format.')
 
 
-def compute_preflight(requested_backend: str) -> str:
-    host_platform = os.environ.get('ULTRASHAPE_HOST_PLATFORM', sys.platform)
-    host_arch = os.environ.get('ULTRASHAPE_HOST_ARCH', os.uname().machine)
-    local_available = env_flag('ULTRASHAPE_LOCAL_AVAILABLE', False)
-    remote_available = env_flag('ULTRASHAPE_REMOTE_AVAILABLE', False) or bool(
-        os.environ.get('ULTRASHAPE_TEST_ARTIFACT_PATH')
-    )
-    linux_arm64 = host_platform.startswith('linux') and host_arch in {'arm64', 'aarch64'}
+def load_runtime_readiness(ext_dir: Path) -> dict:
+    readiness_path = ext_dir / '.runtime-readiness.json'
+    if not readiness_path.is_file():
+        raise ProcessorError(
+            'LOCAL_RUNTIME_UNAVAILABLE',
+            f'Missing runtime readiness file: {readiness_path}.',
+        )
 
-    recommended = 'remote' if linux_arm64 and remote_available else 'local' if local_available else 'remote'
+    with readiness_path.open('r', encoding='utf8') as handle:
+        readiness = json.load(handle)
 
-    if requested_backend == 'local':
-        if local_available:
-            return 'local'
-        if remote_available:
-            return 'remote'
-        raise ProcessorError('BACKEND_UNAVAILABLE', 'BACKEND_UNAVAILABLE: Requested local backend is unavailable and no remote fallback is configured.')
+    if not isinstance(readiness, dict):
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Runtime readiness payload must be a JSON object.')
 
+    return readiness
+
+
+def select_backend(requested_backend: str) -> str:
     if requested_backend in {'remote', 'hybrid'}:
-        if remote_available:
-            return requested_backend
-        raise ProcessorError('BACKEND_UNAVAILABLE', 'BACKEND_UNAVAILABLE: Remote/hybrid backend is unavailable for this request.')
+        raise ProcessorError(
+            'LOCAL_RUNTIME_UNAVAILABLE',
+            'Remote and hybrid execution are explicitly unsupported in the local-only MVP.',
+        )
 
-    if recommended == 'local' and local_available:
-        return 'local'
-    if remote_available:
-        return recommended
-    if local_available:
-        return 'local'
-    raise ProcessorError('BACKEND_UNAVAILABLE', 'BACKEND_UNAVAILABLE: No eligible UltraShape backend is available for this host.')
+    return 'local'
+
+
+def ensure_runtime_ready(readiness: dict) -> None:
+    if readiness.get('required_imports_ok') is False:
+        missing_required = ', '.join(as_string_list(readiness.get('missing_required')))
+        suffix = f' Missing: {missing_required}.' if missing_required else ''
+        raise ProcessorError('DEPENDENCY_MISSING', f'Required local UltraShape dependencies are unavailable.{suffix}')
+
+    if readiness.get('status') == 'blocked':
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local UltraShape runtime is blocked for this installation.')
+
+    if readiness.get('backend') not in (None, 'local'):
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Installed readiness is not compatible with local UltraShape execution.')
+
+    if readiness.get('status') not in {'ready', 'degraded'}:
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local UltraShape runtime readiness is invalid for execution.')
+
+    if readiness.get('weights_ready') is False:
+        missing_weights = ', '.join(as_string_list(readiness.get('missing_required')))
+        suffix = f' Missing: {missing_weights}.' if missing_weights else ''
+        if readiness.get('status') != 'ready':
+            raise ProcessorError(
+                'LOCAL_RUNTIME_UNAVAILABLE',
+                f'Local UltraShape install readiness is not executable while required weights are absent.{suffix}',
+            )
+        raise ProcessorError('WEIGHTS_MISSING', f'Local UltraShape weights are not ready.{suffix}')
 
 
 def package_result(output_dir: str, output_format: str) -> str:
     source_path = os.environ.get('ULTRASHAPE_TEST_ARTIFACT_PATH')
     if not source_path:
-        raise ProcessorError('BACKEND_UNAVAILABLE', 'BACKEND_UNAVAILABLE: UltraShape backend is not configured for this request.')
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'UltraShape local runtime artifact source is not configured for this request.')
 
     source = Path(source_path)
     if not source.is_file():
-        raise ProcessorError('BACKEND_UNAVAILABLE', 'BACKEND_UNAVAILABLE: Configured UltraShape test artifact is not readable.')
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Configured UltraShape local runtime artifact is not readable.')
 
     destination_dir = Path(output_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
@@ -187,11 +237,10 @@ def nested_get(payload: dict, *keys: str):
     return current
 
 
-def env_flag(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.lower() in {'1', 'true', 'yes', 'on'}
+def as_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 def main() -> int:
@@ -201,6 +250,9 @@ def main() -> int:
         params = normalize_params(payload)
         output_dir = resolve_output_dir(payload)
         reference_image, coarse_mesh = resolve_input_paths(payload, params)
+        ext_dir = resolve_ext_dir(payload)
+        selected_backend = select_backend(params['backend'])
+        readiness = load_runtime_readiness(ext_dir)
 
         ensure_file(reference_image, 'reference_image', IMAGE_EXTENSIONS)
         ensure_file(coarse_mesh, 'coarse_mesh', MESH_EXTENSIONS)
@@ -212,16 +264,18 @@ def main() -> int:
                     {
                         'reference_image': reference_image,
                         'coarse_mesh': coarse_mesh,
-                        'backend': params['backend'],
+                        'backend': selected_backend,
                         'output_format': params['output_format'],
                         'output_dir': output_dir,
+                        'ext_dir': str(ext_dir),
                         'node_id': payload.get('nodeId') or nested_get(payload, 'input', 'nodeId'),
                     }
                 ),
             }
         )
 
-        selected_backend = compute_preflight(params['backend'])
+        ensure_runtime_ready(readiness)
+
         emit_progress(20, f'preflight:{selected_backend}')
         emit_progress(60, f'running:{selected_backend}')
         emit_progress(90, 'packaging')

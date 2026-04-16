@@ -25,6 +25,31 @@ const runtimePaths = [
 
 const configAndDocsPaths = ['manifest.json', 'processor.py', 'setup.py', 'README.md'];
 
+const vendoredRuntimePaths = [
+  'runtime/configs/infer_dit_refine.yaml',
+  'runtime/patches/README.md',
+  'runtime/vendor/ultrashape_runtime/__init__.py',
+  'runtime/vendor/ultrashape_runtime/pipelines.py',
+  'runtime/vendor/ultrashape_runtime/preprocessors.py',
+  'runtime/vendor/ultrashape_runtime/rembg.py',
+  'runtime/vendor/ultrashape_runtime/surface_loaders.py',
+  'runtime/vendor/ultrashape_runtime/schedulers.py',
+  'runtime/vendor/ultrashape_runtime/utils/__init__.py',
+  'runtime/vendor/ultrashape_runtime/utils/checkpoint.py',
+  'runtime/vendor/ultrashape_runtime/utils/mesh.py',
+  'runtime/vendor/ultrashape_runtime/utils/tensors.py',
+  'runtime/vendor/ultrashape_runtime/models/conditioner_mask.py',
+  'runtime/vendor/ultrashape_runtime/models/denoisers/__init__.py',
+  'runtime/vendor/ultrashape_runtime/models/denoisers/dit_mask.py',
+  'runtime/vendor/ultrashape_runtime/models/denoisers/moe_layers.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/__init__.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/model.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/attention_blocks.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/attention_processors.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/surface_extractors.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/volume_decoders.py',
+];
+
 const fixturePaths = [
   'fixtures/requests/refiner-bundle/request.json',
   'fixtures/requests/refiner-bundle/assets/reference-image.png',
@@ -45,6 +70,7 @@ describe('UltraShape repository structure contract', () => {
     for (const filePath of [
       ...runtimePaths,
       ...configAndDocsPaths,
+      ...vendoredRuntimePaths,
       ...fixturePaths,
       ...testPaths,
     ]) {
@@ -84,6 +110,7 @@ describe('UltraShape repository structure contract', () => {
     expect(existsSync(resolve(repoRoot, 'package.json'))).toBe(true);
     expect(existsSync(resolve(repoRoot, 'processor.py'))).toBe(true);
     expect(existsSync(resolve(repoRoot, 'setup.py'))).toBe(true);
+    expect(existsSync(resolve(repoRoot, 'runtime/vendor/ultrashape_runtime'))).toBe(true);
     expect(existsSync(resolve(repoRoot, 'processor.js'))).toBe(false);
     expect(existsSync(resolve(repoRoot, 'runtime/modly'))).toBe(false);
   });

@@ -7,7 +7,6 @@ import type {
   UltraShapeRuntimeAdapter,
 } from '../../adapters/ultrashape/client.js';
 import { UltraShapeLocalAdapter } from '../../adapters/ultrashape/local.js';
-import { UltraShapeRemoteAdapter } from '../../adapters/ultrashape/remote.js';
 import {
   cancelledProgressEvent,
   completedProgressEvent,
@@ -16,6 +15,7 @@ import {
   runningProgressEvent,
   terminalErrorProgressEvent,
 } from './progress.js';
+import { createProcessError } from './validate.js';
 import type {
   UltraShapeNormalizedRequest,
   UltraShapePreflightResult,
@@ -100,15 +100,11 @@ function selectAdapter(
     return options.localAdapter ?? new UltraShapeLocalAdapter();
   }
 
-  if (!options.remoteClient) {
-    return new UltraShapeRemoteAdapter({
-      async execute() {
-        throw new Error('Remote/hybrid backend is not configured for this request.');
-      },
-    }, backend);
-  }
-
-  return new UltraShapeRemoteAdapter(options.remoteClient, backend);
+  throw createProcessError(
+    'LOCAL_RUNTIME_UNAVAILABLE',
+    'LOCAL_RUNTIME_UNAVAILABLE: Remote and hybrid UltraShape execution paths are disabled in this MVP.',
+    'backend',
+  );
 }
 
 function packageArtifact(sourcePath: string, outputDir: string, outputFormat: UltraShapeRefinerResult['outputFormat']): string {

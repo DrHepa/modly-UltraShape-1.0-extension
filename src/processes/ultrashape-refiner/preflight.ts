@@ -17,24 +17,15 @@ export function detectRuntimeCapabilities(
 ): UltraShapeRuntimeCapabilities {
   const hostPlatform = options.hostPlatform ?? process.platform;
   const hostArch = options.hostArch ?? process.arch;
-  const localSupported = options.localAvailable ?? !isLinuxArm64(hostPlatform, hostArch);
-  const remoteSupported = options.remoteAvailable ?? true;
-  const recommendedBackend =
-    isLinuxArm64(hostPlatform, hostArch) && remoteSupported
-      ? 'remote'
-      : localSupported
-        ? 'local'
-        : remoteSupported
-          ? 'remote'
-          : 'local';
+  const localSupported = options.localAvailable ?? true;
+  const remoteSupported = false;
+  const recommendedBackend = 'local';
 
   let reason: string | undefined;
-  if (isLinuxArm64(hostPlatform, hostArch) && remoteSupported) {
-    reason = 'Linux ARM64 prefers remote/hybrid execution because local UltraShape support is not a reliable first target.';
-  } else if (!localSupported && remoteSupported) {
-    reason = 'Local backend is unavailable; remote execution is eligible.';
-  } else if (!localSupported && !remoteSupported) {
-    reason = 'Neither local nor remote backend is available.';
+  if (localSupported) {
+    reason = 'UltraShape local runtime is the only active backend in this MVP.';
+  } else {
+    reason = 'LOCAL_RUNTIME_UNAVAILABLE: UltraShape local runtime is not available for this host/request.';
   }
 
   return {
@@ -68,23 +59,15 @@ function selectBackend(
 ): Pick<UltraShapePreflightResult, 'selectedBackend' | 'fallbackApplied' | 'reason'> {
   switch (requestedBackend) {
     case 'remote':
-      ensureRemote(capabilities);
-      return {
-        selectedBackend: 'remote',
-        fallbackApplied: false,
-        reason: capabilities.reason,
-      };
-
     case 'hybrid':
-      ensureRemote(capabilities);
-      return {
-        selectedBackend: 'hybrid',
-        fallbackApplied: false,
-        reason: capabilities.reason,
-      };
+      throw createProcessError(
+        'LOCAL_RUNTIME_UNAVAILABLE',
+        'LOCAL_RUNTIME_UNAVAILABLE: Remote and hybrid UltraShape backends are out of scope for this MVP.',
+        'backend',
+      );
 
     case 'local':
-      if (capabilities.localSupported) {
+    if (capabilities.localSupported) {
         return {
           selectedBackend: 'local',
           fallbackApplied: false,
@@ -92,38 +75,14 @@ function selectBackend(
         };
       }
 
-      if (capabilities.remoteSupported) {
-        return {
-          selectedBackend: capabilities.recommendedBackend,
-          fallbackApplied: true,
-          reason: 'Requested local backend is unavailable; falling back to an eligible remote/hybrid path.',
-        };
-      }
-
       throw createProcessError(
-        'BACKEND_UNAVAILABLE',
-        'Requested local backend is unavailable and no remote fallback is configured.',
+        'LOCAL_RUNTIME_UNAVAILABLE',
+        'LOCAL_RUNTIME_UNAVAILABLE: Requested local backend is unavailable.',
         'backend',
       );
 
     case 'auto':
     default:
-      if (capabilities.recommendedBackend === 'local' && capabilities.localSupported) {
-        return {
-          selectedBackend: 'local',
-          fallbackApplied: false,
-          reason: capabilities.reason,
-        };
-      }
-
-      if (capabilities.remoteSupported) {
-        return {
-          selectedBackend: capabilities.recommendedBackend,
-          fallbackApplied: capabilities.recommendedBackend !== 'local',
-          reason: capabilities.reason,
-        };
-      }
-
       if (capabilities.localSupported) {
         return {
           selectedBackend: 'local',
@@ -133,23 +92,9 @@ function selectBackend(
       }
 
       throw createProcessError(
-        'BACKEND_UNAVAILABLE',
-        'No eligible UltraShape backend is available for this host.',
+        'LOCAL_RUNTIME_UNAVAILABLE',
+        'LOCAL_RUNTIME_UNAVAILABLE: UltraShape local runtime is unavailable for this host/request.',
         'backend',
       );
   }
-}
-
-function ensureRemote(capabilities: UltraShapeRuntimeCapabilities): void {
-  if (!capabilities.remoteSupported) {
-    throw createProcessError(
-      'BACKEND_UNAVAILABLE',
-      'Remote/hybrid backend is unavailable for this request.',
-      'backend',
-    );
-  }
-}
-
-function isLinuxArm64(platform: NodeJS.Platform, arch: string): boolean {
-  return platform === 'linux' && arch === 'arm64';
 }

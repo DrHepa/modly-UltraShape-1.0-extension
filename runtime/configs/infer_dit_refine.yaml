@@ -1,0 +1,10 @@
+model:
+  name: ultrashape-refiner
+  scope: mc-only
+runtime:
+  backend: local
+  readiness_file: .runtime-readiness.json
+surface:
+  extraction: mc
+weights:
+  primary: models/ultrashape/ultrashape_v1.pt

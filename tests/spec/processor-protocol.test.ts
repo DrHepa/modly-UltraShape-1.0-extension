@@ -41,14 +41,50 @@ function createFixtureWorkspace() {
   };
 }
 
-function runProcessor(payload: Record<string, unknown>, env: NodeJS.ProcessEnv = {}) {
+function writeReadiness(
+  root: string,
+  overrides: Partial<{
+    status: 'ready' | 'degraded' | 'blocked';
+    backend: 'local';
+    mvp_scope: 'mc-only';
+    weights_ready: boolean;
+    required_imports_ok: boolean;
+    missing_required: string[];
+    missing_optional: string[];
+    expected_weights: string[];
+  }> = {},
+) {
+  writeFileSync(
+    join(root, '.runtime-readiness.json'),
+    JSON.stringify(
+      {
+        status: 'ready',
+        backend: 'local',
+        mvp_scope: 'mc-only',
+        weights_ready: true,
+        required_imports_ok: true,
+        missing_required: [],
+        missing_optional: [],
+        expected_weights: ['models/ultrashape/ultrashape_v1.pt'],
+        ...overrides,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function runProcessor(
+  payload: Record<string, unknown>,
+  options: { env?: NodeJS.ProcessEnv; cwd?: string } = {},
+) {
   const outcome = spawnSync('python3', [processorPath], {
-    cwd: repoRoot,
+    cwd: options.cwd ?? repoRoot,
     encoding: 'utf8',
     input: `${JSON.stringify(payload)}\n`,
     env: {
       ...process.env,
-      ...env,
+      ...options.env,
     },
   });
 
@@ -82,6 +118,8 @@ describe('UltraShape processor.py protocol', () => {
     const fixture = createFixtureWorkspace();
 
     try {
+      writeReadiness(fixture.root);
+
       const outcome = runProcessor(
         {
           nodeId: 'ultrashape-refiner',
@@ -97,13 +135,17 @@ describe('UltraShape processor.py protocol', () => {
             },
           },
           params: {
+            backend: 'auto',
             coarse_mesh: join(fixture.root, 'missing-fallback.glb'),
             output_format: 'obj',
           },
           workspaceDir: fixture.outputDir,
         },
         {
-          ULTRASHAPE_TEST_ARTIFACT_PATH: fixture.packagedArtifact,
+          cwd: fixture.root,
+          env: {
+            ULTRASHAPE_TEST_ARTIFACT_PATH: fixture.packagedArtifact,
+          },
         },
       );
 
@@ -121,6 +163,7 @@ describe('UltraShape processor.py protocol', () => {
       const resolved = JSON.parse(String(resolutionLog.message)) as Record<string, string>;
       expect(resolved.reference_image).toBe(fixture.referenceImage);
       expect(resolved.coarse_mesh).toBe(fixture.namedCoarseMesh);
+      expect(resolved.backend).toBe('local');
       expect(resolved.output_format).toBe('obj');
 
       const done = outcome.events.at(-1);
@@ -137,19 +180,31 @@ describe('UltraShape processor.py protocol', () => {
     }
   });
 
-  it('uses input.filePath plus params.coarse_mesh only as a secondary fallback seam when named inputs are absent', () => {
+  it('treats degraded readiness with missing required weights as a blocked install contract, not a normal WEIGHTS_MISSING outcome', () => {
     const fixture = createFixtureWorkspace();
 
     try {
-      const outcome = runProcessor({
-        input: {
-          filePath: fixture.referenceImage,
-        },
-        params: {
-          coarse_mesh: fixture.fallbackCoarseMesh,
-        },
-        workspaceDir: fixture.outputDir,
+      writeReadiness(fixture.root, {
+        status: 'degraded',
+        weights_ready: false,
+        missing_required: ['models/ultrashape/ultrashape_v1.pt'],
       });
+
+      const outcome = runProcessor(
+        {
+          input: {
+            filePath: fixture.referenceImage,
+          },
+          params: {
+            backend: 'local',
+            coarse_mesh: fixture.fallbackCoarseMesh,
+          },
+          workspaceDir: fixture.outputDir,
+        },
+        {
+          cwd: fixture.root,
+        },
+      );
 
       expect(outcome.status).toBe(0);
 
@@ -157,14 +212,92 @@ describe('UltraShape processor.py protocol', () => {
       const resolved = JSON.parse(String(resolutionLog.message)) as Record<string, string>;
       expect(resolved.reference_image).toBe(fixture.referenceImage);
       expect(resolved.coarse_mesh).toBe(fixture.fallbackCoarseMesh);
+      expect(resolved.backend).toBe('local');
       expect(resolved.output_format).toBe('glb');
 
       const error = outcome.events.at(-1);
       expect(error).toEqual({
         type: 'error',
-        message: expect.stringContaining('BACKEND_UNAVAILABLE'),
-        code: 'BACKEND_UNAVAILABLE',
+        message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
       });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('reserves WEIGHTS_MISSING for post-install drift when readiness still claims ready', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeReadiness(fixture.root, {
+        status: 'ready',
+        weights_ready: false,
+        missing_required: ['models/ultrashape/ultrashape_v1.pt'],
+      });
+
+      const outcome = runProcessor(
+        {
+          input: {
+            filePath: fixture.referenceImage,
+          },
+          params: {
+            backend: 'local',
+            coarse_mesh: fixture.fallbackCoarseMesh,
+          },
+          workspaceDir: fixture.outputDir,
+        },
+        {
+          cwd: fixture.root,
+        },
+      );
+
+      expect(outcome.status).toBe(0);
+      expect(outcome.events.at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('WEIGHTS_MISSING'),
+        code: 'WEIGHTS_MISSING',
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects remote and hybrid requests explicitly because this MVP is local-only', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeReadiness(fixture.root);
+
+      for (const backend of ['remote', 'hybrid'] as const) {
+        const outcome = runProcessor(
+          {
+            input: {
+              inputs: {
+                reference_image: {
+                  filePath: fixture.referenceImage,
+                },
+                coarse_mesh: {
+                  filePath: fixture.namedCoarseMesh,
+                },
+              },
+            },
+            params: {
+              backend,
+            },
+            workspaceDir: fixture.outputDir,
+          },
+          {
+            cwd: fixture.root,
+          },
+        );
+
+        expect(outcome.events.at(-1)).toEqual({
+          type: 'error',
+          message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
+          code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        });
+      }
     } finally {
       fixture.cleanup();
     }

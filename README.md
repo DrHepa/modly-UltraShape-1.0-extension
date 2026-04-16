@@ -4,25 +4,57 @@ Pure process extension for UltraShape mesh refinement.
 
 ## Installable Modly contract
 
-The active install surface is the repo root Python boundary only:
+The active install surface is the repo-root Python boundary only:
 
-- root `manifest.json` + `setup.py` + `processor.py`
-- root `README.md`
+- `manifest.json`
+- `setup.py`
+- `processor.py`
+- `README.md`
+- `runtime/configs/infer_dit_refine.yaml`
+- `runtime/vendor/ultrashape_runtime/**`
+- `runtime/patches/README.md`
 
-Do NOT curate a separate CommonJS payload. GitHub install validation should target the extracted repo root exactly as Modly receives it.
+Do NOT curate a separate CommonJS payload. GitHub install validation must target the extracted repo root exactly as Modly receives it.
 
-### GitHub install expectation
+This repo stays on the root `manifest.json` + `setup.py` + `processor.py` contract.
 
-1. Modly extracts the repository root into its extensions directory.
-2. Modly discovers `manifest.json` and sees `entry: "processor.py"`.
-3. Modly invokes `python setup.py '{...}'` to create `ext_dir/venv`.
-4. Modly runs `processor.py`, sending one JSON object line on stdin.
+## Linux ARM64 local-first runtime
 
-Discovery success MUST NOT depend on any legacy CommonJS mirror or curated copy.
+This MVP is LOCAL-FIRST and LOCAL-ONLY for execution.
 
-### Processor protocol
+- Host target: Linux ARM64
+- GPU target: CUDA 12.8-class / SM 90+
+- Torch profile: `torch==2.7.0+cu128` + `torchvision==0.22.0`
+- Runtime scope: `mc-only`
+- Active runtime backend: `local`
 
-`processor.py` reads exactly one JSON object line from stdin and writes JSON lines to stdout.
+`setup.py` parses Modly JSON args (`python_exe`, `ext_dir`, `gpu_sm`, optional `cuda_version`), creates `ext_dir/venv`, installs the required MVP dependencies into that venv, copies the vendored runtime into `ext_dir/runtime/ultrashape_runtime/**`, stages `ext_dir/runtime/configs/infer_dit_refine.yaml`, acquires `ext_dir/models/ultrashape/ultrashape_v1.pt` from a provided local source or configured Hugging Face source, runs a real import smoke for the required runtime deps, and writes:
+
+- `ext_dir/.setup-summary.json`
+- `ext_dir/.runtime-readiness.json`
+
+`processor.py` must trust `.runtime-readiness.json` as the authoritative install/runtime signal. It does NOT reintroduce remote-first fallback behavior.
+
+## Readiness states
+
+`.runtime-readiness.json` is the source of truth for smoke verification and runtime behavior.
+
+- `ready` — local runtime is operable; required weights and required import smoke both passed, so processor may emit `done`
+- `degraded` — install succeeded, but only OPTIONAL gaps remain; processor must emit the documented public error that matches the readiness evidence
+- `blocked` — runtime cannot operate locally; processor must emit `LOCAL_RUNTIME_UNAVAILABLE`
+
+Required readiness fields:
+
+- `status`
+- `backend`
+- `mvp_scope`
+- `weights_ready`
+- `required_imports_ok`
+- `missing_required[]`
+- `missing_optional[]`
+- `expected_weights[]`
+
+## Public runtime outcomes
 
 Allowed stdout events:
 
@@ -31,27 +63,78 @@ Allowed stdout events:
 - `{"type":"done","result":{"filePath":"/abs/path/refined.glb"}}`
 - `{"type":"error","message":string,"code":"..."}`
 
+Public runtime error codes are limited to:
+
+- `INVALID_PARAMS`
+- `MISSING_INPUT`
+- `UNREADABLE_ASSET`
+- `UNSUPPORTED_ASSET_TYPE`
+- `DEPENDENCY_MISSING`
+- `WEIGHTS_MISSING`
+- `LOCAL_RUNTIME_UNAVAILABLE`
+
+Smoke validation should accept ONLY:
+
+1. `done` when readiness is truly `ready`, or
+2. an explicit readiness-driven public error (`WEIGHTS_MISSING`, `DEPENDENCY_MISSING`, or `LOCAL_RUNTIME_UNAVAILABLE`).
+
+`BACKEND_UNAVAILABLE` is obsolete for this MVP and must not be treated as the normal install/runtime outcome.
+
+## Dependency policy
+
+Mandatory dependency set for the local MVP:
+
+- `torch==2.7.0+cu128`
+- `torchvision==0.22.0`
+- `numpy`
+- `trimesh`
+- `Pillow`
+- `opencv-python-headless`
+- `scikit-image`
+- `PyYAML`
+- `omegaconf`
+- `einops`
+- `transformers`
+- `huggingface_hub`
+- `accelerate`
+- `rembg`
+- `onnxruntime`
+- `safetensors`
+- `tqdm`
+
+Optional / degradable dependencies:
+
+- `cubvh`
+- `flash_attn`
+- `diffusers`
+- `diso`
+
+Missing optional dependencies must be recorded explicitly in readiness; they do not justify remote fallback.
+
+## Weights policy
+
+Required MVP weights are expected at:
+
+- `ext_dir/models/ultrashape/ultrashape_v1.pt`
+
+Missing required weights are a FATAL install failure. `setup.py` must copy or download `ultrashape_v1.pt` during install, write truthful failure metadata, and exit non-zero instead of reporting a successful `degraded` state.
+
+## Input contract
+
+`processor.py` reads exactly one JSON object line from stdin.
+
+Fallback fixture bundle fields remain documented as: `reference_image`, `coarse_mesh`, `output_dir`, `checkpoint`, and `params`.
+
 Input resolution order:
 
-1. Prefer named inputs:
+1. Preferred named inputs:
    - `payload.input.inputs.reference_image.filePath`
    - `payload.input.inputs.coarse_mesh.filePath`
-2. Temporary fallback seam:
-   - `payload.input.filePath` becomes `reference_image`
-   - `payload.params.coarse_mesh` provides the second input
+2. Temporary compatibility seam:
+    - `payload.input.filePath` becomes `reference_image`
+    - `payload.params.coarse_mesh` provides `coarse_mesh`
 
-The temporary `params.coarse_mesh` seam exists ONLY until Modly exposes native multi-input process routing for both semantic ids.
-
-### Setup responsibilities
-
-`setup.py` is intentionally minimal:
-
-- parse Modly JSON args (`python_exe`, `ext_dir`, `gpu_sm`, optional `cuda_version`)
-- create `ext_dir/venv`
-- remain idempotent on re-install
-- avoid heavyweight model/bootstrap side effects
-
-Because the Python boundary currently uses only stdlib facilities, the minimal dependency set is empty.
+The temporary `params.coarse_mesh` seam exists only until Modly exposes native multi-input routing for both semantic ids.
 
 ## Extension identity
 
@@ -62,74 +145,35 @@ Because the Python boundary currently uses only stdlib facilities, the minimal d
 
 This extension is a refiner, NOT a coarse-mesh generator or single-image generation wrapper.
 
-## Runtime stance
-
-- Remote/hybrid-first execution remains the stance.
-- Linux ARM64 is treated as a strong reason to prefer remote or hybrid execution.
-- Missing or unsupported backend configuration must surface explicit `BACKEND_UNAVAILABLE`.
-- Discovery + `BACKEND_UNAVAILABLE` is an acceptable smoke outcome when external runtime services are unavailable.
-
 ## Coarse-mesh policy
 
 Hunyuan is the recommended and currently validated upstream source, but it is NOT required. Any coarse mesh that satisfies the accepted mesh-format validation may be used.
-
-## Temporary fallback usage
-
-For repo-local validation, `fixtures/requests/refiner-bundle/request.json` keeps the semantic contract visible while Modly still lacks native multi-input routing.
-
-This fixture documents the temporary `params.coarse_mesh` seam. It is not the install surface.
-
-Fallback bundle fields:
-
-- `reference_image`
-- `coarse_mesh`
-- `output_dir`
-- `checkpoint`
-- `params`
-
-Example:
-
-```json
-{
-  "reference_image": "./assets/reference-image.png",
-  "coarse_mesh": "./assets/coarse-mesh.glb",
-  "output_dir": "./expected/output",
-  "checkpoint": null,
-  "params": {
-    "backend": "remote",
-    "steps": 30,
-    "guidance_scale": 5.5,
-    "seed": null,
-    "preserve_scale": true,
-    "output_format": "glb"
-  }
-}
-```
 
 ## Fixture layout
 
 `fixtures/requests/refiner-bundle/`
 
-- `request.json` — fallback documentation fixture
+- `request.json` — compatibility-seam documentation fixture
 - `assets/reference-image.png` — placeholder reference image asset
 - `assets/coarse-mesh.glb` — placeholder coarse mesh asset
-- `expected/output/refined-mesh.glb` — placeholder refined mesh output layout
+- `expected/output/refined-mesh.glb` — placeholder packaged artifact for repo-local smoke tests
 
 ## Future Modly seam
 
-The following follow-ups belong to Modly core, not this extension repo:
+The following items belong to Modly core, not this extension repo:
 
 - native named multi-input routing for `reference_image` and `coarse_mesh`
 - workflow plumbing that supplies both inputs without the temporary seam
 - Generate panel `Type mismatch` follow-up
 
-When Modly supports the native seam, this extension should drop the temporary fallback without renaming the semantic contract.
+When Modly supports the native seam, this extension should drop the temporary compatibility seam without renaming the semantic contract.
 
 ## Smoke-test expectation
 
-The best faithful smoke from this repo is:
+The faithful smoke from this repo is:
 
 1. validate the extracted repo-root install surface,
 2. run `setup.py` with Modly-style JSON args,
-3. invoke `processor.py` with valid fixture assets,
-4. accept either `done` or explicit `BACKEND_UNAVAILABLE` after successful discovery.
+3. read `.runtime-readiness.json` as authoritative evidence,
+4. invoke `processor.py` with valid fixture assets,
+5. accept either `done` for local-ready installs or the explicit readiness-driven public error.
