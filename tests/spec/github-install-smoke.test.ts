@@ -47,6 +47,8 @@ type Readiness = {
   required_imports_ok: boolean;
   missing_required: string[];
   missing_optional: string[];
+  missing_conditional: string[];
+  missing_degradable: string[];
   expected_weights: string[];
 };
 
@@ -62,6 +64,15 @@ function expectBinaryGlb(path: string) {
   const payload = readFileSync(path);
   expect(payload.subarray(0, 4).toString('ascii')).toBe('glTF');
   expect(payload.length).toBeGreaterThanOrEqual(24);
+}
+
+function checkpointBundleText() {
+  return JSON.stringify({
+    format: 'ultrashape-checkpoint-bundle/v1',
+    vae: { tensors: { latent_basis: [0.11, 0.33, 0.55, 0.77] } },
+    dit: { tensors: { attention_bias: [0.21, 0.41, 0.61, 0.81] } },
+    conditioner: { tensors: { mask_bias: [0.14, 0.24, 0.64, 0.74] } },
+  });
 }
 
 function expectedProcessorOutcome(readiness: Readiness): 'done' | 'WEIGHTS_MISSING' | 'DEPENDENCY_MISSING' | 'LOCAL_RUNTIME_UNAVAILABLE' {
@@ -97,7 +108,7 @@ function copyExtractedRoot() {
 function stageRequiredWeight(installDir: string) {
   const weightPath = resolve(installDir, 'models/ultrashape/ultrashape_v1.pt');
   mkdirSync(resolve(installDir, 'models/ultrashape'), { recursive: true });
-  writeFileSync(weightPath, 'test-weight');
+  writeFileSync(weightPath, checkpointBundleText());
   return weightPath;
 }
 
@@ -116,6 +127,17 @@ describe('UltraShape GitHub install smoke', () => {
 
     try {
       expect(existsSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/request.json'))).toBe(true);
+      expectBinaryGlb(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/assets/coarse-mesh.glb'));
+      expectBinaryGlb(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb'));
+
+      const fixtureRequest = JSON.parse(readFileSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/request.json'), 'utf8')) as {
+        params: {
+          backend: string;
+          output_format: string;
+        };
+      };
+      expect(fixtureRequest.params.backend).toBe('local');
+      expect(fixtureRequest.params.output_format).toBe('glb');
 
       const manifest = JSON.parse(readFileSync(resolve(simulation.installDir, 'manifest.json'), 'utf8')) as {
         id: string;
@@ -133,7 +155,7 @@ describe('UltraShape GitHub install smoke', () => {
         cwd: simulation.installDir,
         encoding: 'utf8',
         env: buildSetupEnv({
-          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'hf-default-weight',
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: checkpointBundleText(),
           ULTRASHAPE_SETUP_TEST_HF_TRACE_PATH: hfTracePath,
         }),
       });
@@ -145,7 +167,7 @@ describe('UltraShape GitHub install smoke', () => {
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/pipelines.py'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/models/denoisers/dit_mask.py'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/models/autoencoders/surface_extractors.py'))).toBe(true);
-      expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe('hf-default-weight');
+      expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe(checkpointBundleText());
 
       const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness & {
         install_success: boolean;
@@ -163,6 +185,8 @@ describe('UltraShape GitHub install smoke', () => {
       expect(readiness.required_imports_ok).toBe(true);
       expect(readiness.missing_required).toEqual([]);
       expect(readiness.missing_optional).toEqual([]);
+      expect(readiness.missing_conditional).toEqual([]);
+      expect(readiness.missing_degradable).toEqual([]);
       expect(readiness.expected_weights).toEqual(['models/ultrashape/ultrashape_v1.pt']);
       expect(readiness.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-default']);
       expect(readiness.resolved_weight_source_kind).toBe('hf-default');
@@ -209,6 +233,9 @@ describe('UltraShape GitHub install smoke', () => {
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
       expect(readiness.missing_required).toEqual([]);
+      expect(readiness.missing_optional).toEqual([]);
+      expect(readiness.missing_conditional).toEqual([]);
+      expect(readiness.missing_degradable).toEqual([]);
       expect(readiness.expected_weights).toEqual(['models/ultrashape/ultrashape_v1.pt']);
 
       const smokePayload = {

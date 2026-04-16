@@ -65,7 +65,8 @@ describe('UltraShape setup.py contract', () => {
         failure_code: string;
         dependencies: {
           required: string[];
-          optional: string[];
+          conditional: string[];
+          degradable: string[];
         };
       };
       expect(summary.torch_profile).toBe('linux-arm64-cu128-sm90+');
@@ -73,8 +74,9 @@ describe('UltraShape setup.py contract', () => {
       expect(summary.install_success).toBe(false);
       expect(summary.failure_stage).toBe('weight-validation');
       expect(summary.failure_code).toBe('WEIGHT_ACQUISITION_FAILED');
-      expect(summary.dependencies.required).toContain('onnxruntime');
-      expect(summary.dependencies.optional).toContain('cubvh');
+      expect(summary.dependencies.required).toContain('cubvh');
+      expect(summary.dependencies.conditional).toEqual(['rembg', 'onnxruntime']);
+      expect(summary.dependencies.degradable).toEqual(['flash_attn']);
 
       const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as {
         status: string;
@@ -353,7 +355,7 @@ describe('UltraShape setup.py contract', () => {
         required_weight_path: sourceWeight,
       }, {
         ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
-        ULTRASHAPE_SETUP_TEST_STUB_DEPS_MISSING: 'cubvh',
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS_MISSING: 'flash_attn',
       });
 
       expect(outcome.status).toBe(0);
@@ -369,7 +371,43 @@ describe('UltraShape setup.py contract', () => {
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
       expect(readiness.missing_required).toEqual([]);
-      expect(readiness.missing_optional).toEqual(['cubvh']);
+      expect(readiness.missing_optional).toEqual(['flash_attn']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails install when an effectively required real-refinement dependency is absent even if placeholder runtime could still run', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-real-required-'));
+    const installDir = join(root, 'extension-root');
+    const sourceWeight = join(root, 'download-cache', 'ultrashape_v1.pt');
+    mkdirSync(join(root, 'download-cache'), { recursive: true });
+    writeFileSync(sourceWeight, 'copied-weight');
+
+    try {
+      const outcome = runSetupWithEnv({
+        python_exe: 'python3',
+        ext_dir: installDir,
+        gpu_sm: 90,
+        cuda_version: 12.8,
+        required_weight_path: sourceWeight,
+      }, {
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS_MISSING: 'cubvh',
+      });
+
+      expect(outcome.status).not.toBe(0);
+
+      const { summary, readiness } = readSetupArtifacts(installDir);
+      expect(summary.dependencies).toMatchObject({
+        required: expect.arrayContaining(['cubvh']),
+        conditional: ['rembg', 'onnxruntime'],
+        degradable: ['flash_attn'],
+      });
+      expect(readiness.status).toBe('blocked');
+      expect(readiness.required_imports_ok).toBe(false);
+      expect(readiness.missing_required).toContain('import:cubvh');
+      expect(readiness.missing_optional).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

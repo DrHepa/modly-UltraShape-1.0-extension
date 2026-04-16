@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 
+from .models.autoencoders.model import ShapeVAE
 from .models.autoencoders.surface_extractors import extract_surface
+from .models.autoencoders.volume_decoders import decode_volume
+from .models.conditioner_mask import build_conditioning_mask
+from .models.denoisers.dit_mask import denoise_conditioned_latents
 from .preprocessors import normalize_reference_asset
+from .schedulers import build_flow_matching_schedule
 from .surface_loaders import load_coarse_surface
-from .utils.checkpoint import resolve_checkpoint
-from .utils.mesh import export_refined_glb
+from .utils.checkpoint import load_checkpoint_subtrees
+from .utils.mesh import evaluate_geometric_gate, export_refined_glb
 
 
 class PipelineDependencyError(Exception):
@@ -113,6 +119,11 @@ def require_imports(config: dict[str, object]) -> None:
         raw_required = dependencies.get('required_imports')
         if isinstance(raw_required, list):
             required_imports = [entry for entry in raw_required if isinstance(entry, str)]
+        required_group = dependencies.get('required')
+        if isinstance(required_group, dict):
+            nested_imports = required_group.get('imports')
+            if isinstance(nested_imports, list):
+                required_imports = [entry for entry in nested_imports if isinstance(entry, str)]
 
     for module_name in required_imports:
         try:
@@ -154,26 +165,66 @@ def run_refine_pipeline(
     config_path: str,
     ext_dir: str,
     backend: str,
+    steps: int,
+    guidance_scale: float,
+    seed: int | None,
     preserve_scale: bool,
 ) -> dict[str, object]:
     config = load_runtime_config(config_path)
     require_imports(config)
     _, extraction = validate_mvp_scope(config, backend, output_format)
 
+    checkpoint_config = config.get('checkpoint') if isinstance(config.get('checkpoint'), dict) else {}
     weights = config.get('weights') if isinstance(config.get('weights'), dict) else {}
     reference_asset = normalize_reference_asset(reference_image)
     coarse_surface = load_coarse_surface(coarse_mesh)
-    resolved_checkpoint = resolve_checkpoint(checkpoint, weights.get('primary') if isinstance(weights, dict) else None, ext_dir)
+    checkpoint_bundle = load_checkpoint_subtrees(
+        checkpoint,
+        weights.get('primary') if isinstance(weights, dict) else None,
+        ext_dir,
+        checkpoint_config.get('required_subtrees') if isinstance(checkpoint_config.get('required_subtrees'), list) else None,
+    )
+    checkpoint_state = checkpoint_bundle['bundle'] if isinstance(checkpoint_bundle.get('bundle'), dict) else {}
+    conditioning = build_conditioning_mask(
+        reference_asset=reference_asset,
+        coarse_surface=coarse_surface,
+        checkpoint_state=checkpoint_state.get('conditioner'),
+    )
+    schedule = build_flow_matching_schedule(steps=steps, guidance_scale=guidance_scale)
+    denoised = denoise_conditioned_latents(
+        conditioning=conditioning,
+        schedule=schedule,
+        checkpoint_state=checkpoint_state.get('dit'),
+        seed=seed,
+    )
+    decoded_latents = ShapeVAE(checkpoint_state=checkpoint_state.get('vae')).decode_latents(denoised, reference_asset)
+    decoded_volume = decode_volume(decoded_latents)
     refined_surface = extract_surface(
         extraction=extraction,
         coarse_surface=coarse_surface,
         reference_asset=reference_asset,
+        decoded_volume=decoded_volume,
+        preserve_scale=preserve_scale,
+    )
+    refined_payload = dict(refined_surface['payload'])
+
+    if os.environ.get('ULTRASHAPE_TEST_FORCE_PASSTHROUGH') == '1':
+        refined_payload = {
+            **coarse_surface['mesh'],
+            'kind': 'refined-mesh',
+        }
+    elif os.environ.get('ULTRASHAPE_TEST_FORCE_SCALE_DRIFT') == '1':
+        refined_payload['test_extent_scale'] = [1.2, 1.2, 1.2]
+
+    gate_metrics = evaluate_geometric_gate(
+        coarse_mesh_payload=coarse_surface['mesh'],
+        refined_mesh_payload=refined_payload,
         preserve_scale=preserve_scale,
     )
     output_path = export_refined_glb(
         output_dir=output_dir,
         output_format=output_format,
-        mesh_payload=refined_surface['payload'],
+        mesh_payload=refined_payload,
     )
 
     if not Path(output_path).is_file():
@@ -184,5 +235,47 @@ def run_refine_pipeline(
         'format': 'glb',
         'backend': 'local',
         'warnings': [],
-        'checkpoint': resolved_checkpoint,
+        'metrics': {
+            'chamfer': gate_metrics['chamfer'],
+            'rms': gate_metrics['rms'],
+            'topology_changed': gate_metrics['topology_changed'],
+            'extent_ratio': gate_metrics['extent_ratio'],
+            'execution_trace': ['preprocess', 'conditioning', 'scheduler', 'denoise', 'decode', 'extract'],
+            'checkpoint': checkpoint_bundle.get('summary'),
+            'preprocess': {
+                'byte_length': reference_asset['byte_length'],
+                'normalized_channels': reference_asset['normalized_channels'],
+                'signature': reference_asset['signature'],
+            },
+            'conditioning': {
+                'voxel_count': conditioning['voxel_count'],
+                'mask_tokens': conditioning['mask_tokens'],
+                'signature': conditioning['signature'],
+            },
+            'scheduler': {
+                'family': schedule['family'],
+                'step_count': schedule['step_count'],
+            },
+            'denoise': {
+                'attention': denoised['attention'],
+                'latent_signature': denoised['latent_signature'],
+            },
+            'decode': {
+                'field_density': decoded_volume['field_density'],
+                'field_signature': decoded_volume['field_signature'],
+            },
+            'extract': {
+                'extractor': refined_surface['extractor'],
+                'payload_bytes': len(refined_payload['bytes']),
+                'surface_signature': refined_surface['surface_signature'],
+            },
+        },
+        'fallbacks': ['flash_attn->sdpa'] if denoised['attention'] == 'sdpa' else [],
+        'subtrees_loaded': checkpoint_bundle['subtrees_loaded'],
+        'checkpoint': checkpoint_bundle['path'],
+        'execution': {
+            'steps': steps,
+            'guidance_scale': guidance_scale,
+            'seed': seed,
+        },
     }

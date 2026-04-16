@@ -255,7 +255,7 @@ def run_local_runtime(
     coarse_mesh: str,
     backend: str,
     params: dict,
-) -> str:
+) -> dict:
     python_path, config_path = resolve_runner_paths(ext_dir)
     runner_runtime_path = ext_dir / 'runtime'
     job = {
@@ -316,10 +316,13 @@ def run_local_runtime(
     return validate_runner_result(result, output_dir)
 
 
-def validate_runner_result(result: dict, output_dir: str) -> str:
+def validate_runner_result(result: dict, output_dir: str) -> dict:
     file_path = result.get('file_path')
     output_format = result.get('format')
     backend = result.get('backend')
+    metrics = result.get('metrics')
+    fallbacks = result.get('fallbacks')
+    subtrees_loaded = result.get('subtrees_loaded')
 
     if not isinstance(file_path, str) or not file_path.strip():
         raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner did not return a readable file path.')
@@ -327,6 +330,15 @@ def validate_runner_result(result: dict, output_dir: str) -> str:
         raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner returned a non-glb artifact.')
     if backend != 'local':
         raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner returned a non-local backend result.')
+    if not isinstance(metrics, dict):
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner must return checkpoint-backed execution metadata.')
+    if not isinstance(fallbacks, list) or any(not isinstance(item, str) for item in fallbacks):
+        raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', 'Local runtime runner must return fallback metadata as a string list.')
+    if subtrees_loaded != ['vae', 'dit', 'conditioner']:
+        raise ProcessorError(
+            'LOCAL_RUNTIME_UNAVAILABLE',
+            'Local runtime runner must report checkpoint-backed execution metadata for vae/dit/conditioner.',
+        )
 
     resolved_output_dir = Path(output_dir).resolve()
     resolved_file = Path(file_path).resolve()
@@ -342,7 +354,13 @@ def validate_runner_result(result: dict, output_dir: str) -> str:
     if not resolved_file.is_file():
         raise ProcessorError('LOCAL_RUNTIME_UNAVAILABLE', f'Local runtime runner did not create the reported output file: {resolved_file}.')
 
-    return str(resolved_file)
+    return {
+        'file_path': str(resolved_file),
+        'backend': backend,
+        'metrics': metrics,
+        'fallbacks': fallbacks,
+        'subtrees_loaded': subtrees_loaded,
+    }
 
 
 def nested_get(payload: dict, *keys: str):
@@ -398,7 +416,7 @@ def main() -> int:
         emit_progress(60, f'running:{selected_backend}')
         emit_progress(90, 'packaging')
 
-        file_path = run_local_runtime(
+        runtime_result = run_local_runtime(
             ext_dir=ext_dir,
             output_dir=output_dir,
             reference_image=reference_image,
@@ -406,7 +424,20 @@ def main() -> int:
             backend=selected_backend,
             params=params,
         )
-        emit({'type': 'done', 'result': {'filePath': file_path}})
+        emit(
+            {
+                'type': 'log',
+                'message': json.dumps(
+                    {
+                        'backend': runtime_result['backend'],
+                        'metrics': runtime_result['metrics'],
+                        'fallbacks': runtime_result['fallbacks'],
+                        'subtrees_loaded': runtime_result['subtrees_loaded'],
+                    }
+                ),
+            }
+        )
+        emit({'type': 'done', 'result': {'filePath': runtime_result['file_path']}})
         return 0
     except Exception as error:
         emit_error(error)

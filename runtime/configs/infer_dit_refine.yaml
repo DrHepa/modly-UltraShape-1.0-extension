@@ -4,7 +4,54 @@ model:
 runtime:
   backend: local
   readiness_file: .runtime-readiness.json
-surface:
-  extraction: mc
+dependencies:
+  required:
+    imports:
+      - torch
+      - torchvision
+      - numpy
+      - trimesh
+      - PIL
+      - cv2
+      - skimage
+      - yaml
+      - omegaconf
+      - einops
+      - transformers
+      - huggingface_hub
+      - accelerate
+      - cubvh
+      - safetensors
+      - tqdm
+  conditional:
+    - rembg
+    - onnxruntime
+  degradable:
+    - flash_attn
+checkpoint:
+  primary: models/ultrashape/ultrashape_v1.pt
+  required_subtrees:
+    - vae
+    - dit
+    - conditioner
 weights:
   primary: models/ultrashape/ultrashape_v1.pt
+preprocess:
+  image_processor: ImageProcessorV2
+  require_cutout: conditional
+conditioning:
+  coarse_mesh_encoder: SharpEdgeSurfaceLoader
+  voxelizer: voxelize_from_point
+scheduler:
+  family: flow-matching
+decoder:
+  vae: ShapeVAE
+  volume_decoder: volume-decoder
+surface:
+  extraction: mc
+  loader: SharpEdgeSurfaceLoader
+gate:
+  mode: geometric-hard-gate
+export:
+  format: glb
+  filename: refined.glb

@@ -10,6 +10,7 @@ from .pipelines import run_refine_pipeline
 
 
 PUBLIC_ERROR_CODE = 'LOCAL_RUNTIME_UNAVAILABLE'
+PUBLIC_ERROR_CODES = {'DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'}
 REQUIRED_FIELDS = {
     'reference_image',
     'coarse_mesh',
@@ -30,6 +31,10 @@ class LocalRunnerError(Exception):
     def __init__(self, message: str, code: str = PUBLIC_ERROR_CODE):
         super().__init__(message)
         self.code = code
+
+
+def normalize_public_error_code(code: object) -> str:
+    return str(code) if code in PUBLIC_ERROR_CODES else PUBLIC_ERROR_CODE
 
 
 def read_job() -> dict[str, object]:
@@ -96,16 +101,22 @@ def run_refine_job(
             config_path=config_path,
             ext_dir=ext_dir,
             backend=backend,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
             preserve_scale=preserve_scale,
         )
     except Exception as error:
-        code = getattr(error, 'code', PUBLIC_ERROR_CODE)
+        code = normalize_public_error_code(getattr(error, 'code', PUBLIC_ERROR_CODE))
         raise LocalRunnerError(str(error), code=code) from error
 
     return {
         'file_path': pipeline_result['file_path'],
         'format': pipeline_result['format'],
         'backend': pipeline_result['backend'],
+        'metrics': pipeline_result['metrics'],
+        'fallbacks': pipeline_result['fallbacks'],
+        'subtrees_loaded': pipeline_result['subtrees_loaded'],
         'warnings': pipeline_result.get('warnings', []),
     }
 
@@ -118,7 +129,7 @@ def main() -> int:
         sys.stdout.flush()
         return 0
     except Exception as error:
-        code = getattr(error, 'code', PUBLIC_ERROR_CODE)
+        code = normalize_public_error_code(getattr(error, 'code', PUBLIC_ERROR_CODE))
         sys.stdout.write(
             json.dumps(
                 {

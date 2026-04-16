@@ -46,6 +46,9 @@ type Readiness = {
   weights_ready: boolean;
   required_imports_ok: boolean;
   missing_required: string[];
+  missing_optional: string[];
+  missing_conditional: string[];
+  missing_degradable: string[];
   expected_weights: string[];
 };
 
@@ -61,6 +64,15 @@ function expectBinaryGlb(path: string) {
   const payload = readFileSync(path);
   expect(payload.subarray(0, 4).toString('ascii')).toBe('glTF');
   expect(payload.length).toBeGreaterThanOrEqual(24);
+}
+
+function checkpointBundleText() {
+  return JSON.stringify({
+    format: 'ultrashape-checkpoint-bundle/v1',
+    vae: { tensors: { latent_basis: [0.11, 0.33, 0.55, 0.77] } },
+    dit: { tensors: { attention_bias: [0.21, 0.41, 0.61, 0.81] } },
+    conditioner: { tensors: { mask_bias: [0.14, 0.24, 0.64, 0.74] } },
+  });
 }
 
 function expectedProcessorOutcome(readiness: Readiness): 'done' | 'WEIGHTS_MISSING' | 'DEPENDENCY_MISSING' | 'LOCAL_RUNTIME_UNAVAILABLE' {
@@ -96,7 +108,7 @@ function copyInstallSurface() {
 function stageRequiredWeight(installDir: string) {
   const weightPath = resolve(installDir, 'models/ultrashape/ultrashape_v1.pt');
   mkdirSync(resolve(installDir, 'models/ultrashape'), { recursive: true });
-  writeFileSync(weightPath, 'test-weight');
+  writeFileSync(weightPath, checkpointBundleText());
   return weightPath;
 }
 
@@ -116,6 +128,18 @@ describe('UltraShape Python install surface', () => {
       for (const relativePath of installSurfacePaths) {
         expect(existsSync(resolve(simulation.installDir, relativePath)), `${relativePath} should be copied`).toBe(true);
       }
+
+      expectBinaryGlb(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/assets/coarse-mesh.glb'));
+      expectBinaryGlb(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb'));
+
+      const fixtureRequest = JSON.parse(readFileSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/request.json'), 'utf8')) as {
+        params: {
+          backend: string;
+          output_format: string;
+        };
+      };
+      expect(fixtureRequest.params.backend).toBe('local');
+      expect(fixtureRequest.params.output_format).toBe('glb');
 
       expect(existsSync(resolve(simulation.installDir, 'package.json'))).toBe(false);
       expect(existsSync(resolve(simulation.installDir, 'processor.js'))).toBe(false);
@@ -143,7 +167,7 @@ describe('UltraShape Python install surface', () => {
         cwd: simulation.installDir,
         encoding: 'utf8',
         env: buildSetupEnv({
-          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'hf-default-weight',
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: checkpointBundleText(),
           ULTRASHAPE_SETUP_TEST_HF_TRACE_PATH: hfTracePath,
         }),
       });
@@ -189,10 +213,13 @@ describe('UltraShape Python install surface', () => {
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
       expect(readiness.missing_required).toEqual([]);
+      expect(readiness.missing_optional).toEqual([]);
+      expect(readiness.missing_conditional).toEqual([]);
+      expect(readiness.missing_degradable).toEqual([]);
       expect(readiness.expected_weights).toEqual(['models/ultrashape/ultrashape_v1.pt']);
       expect(readiness.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-default']);
       expect(readiness.resolved_weight_source_kind).toBe('hf-default');
-      expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe('hf-default-weight');
+      expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe(checkpointBundleText());
 
       const hfTrace = JSON.parse(readFileSync(hfTracePath, 'utf8')) as HfTrace;
       expect(hfTrace).toEqual({
@@ -225,13 +252,13 @@ describe('UltraShape Python install surface', () => {
           ULTRASHAPE_WEIGHT_REPO_ID: 'env/UltraShape',
           ULTRASHAPE_WEIGHT_REPO_REVISION: 'env-main',
           ULTRASHAPE_WEIGHT_HF_TOKEN: 'token-from-env',
-          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'hf-override-weight',
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: checkpointBundleText(),
           ULTRASHAPE_SETUP_TEST_HF_TRACE_PATH: hfTracePath,
         }),
       });
 
       expect(outcome.status).toBe(0);
-      expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe('hf-override-weight');
+      expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe(checkpointBundleText());
 
       const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as {
         attempted_weight_source_kinds: string[];
@@ -289,6 +316,9 @@ describe('UltraShape Python install surface', () => {
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
       expect(readiness.missing_required).toEqual([]);
+      expect(readiness.missing_optional).toEqual([]);
+      expect(readiness.missing_conditional).toEqual([]);
+      expect(readiness.missing_degradable).toEqual([]);
 
       const smoke = spawnSync('python3', ['processor.py'], {
         cwd: simulation.installDir,

@@ -28,7 +28,7 @@ This MVP is LOCAL-FIRST and LOCAL-ONLY for execution.
 - Runtime scope: `mc-only`
 - Active runtime backend: `local`
 
-`setup.py` parses Modly JSON args (`python_exe`, `ext_dir`, `gpu_sm`, optional `cuda_version`), creates `ext_dir/venv`, installs the required MVP dependencies into that venv, copies the vendored runtime into `ext_dir/runtime/ultrashape_runtime/**`, stages `ext_dir/runtime/configs/infer_dit_refine.yaml`, acquires `ext_dir/models/ultrashape/ultrashape_v1.pt` from a provided local source or configured Hugging Face source, runs a real import smoke for the required runtime deps, and writes:
+`setup.py` parses Modly JSON args (`python_exe`, `ext_dir`, `gpu_sm`, optional `cuda_version`), creates `ext_dir/venv`, installs the real-refinement MVP dependency surface into that venv, copies the vendored runtime into `ext_dir/runtime/ultrashape_runtime/**`, stages `ext_dir/runtime/configs/infer_dit_refine.yaml`, acquires `ext_dir/models/ultrashape/ultrashape_v1.pt` from a provided local source or configured Hugging Face source, runs import smoke across required, conditional, and degradable tiers, and writes:
 
 - `ext_dir/.setup-summary.json`
 - `ext_dir/.runtime-readiness.json`
@@ -37,10 +37,10 @@ This MVP is LOCAL-FIRST and LOCAL-ONLY for execution.
 
 ## Readiness states
 
-`.runtime-readiness.json` is the source of truth for smoke verification and runtime behavior.
+`.runtime-readiness.json` is the source of truth for smoke verification and runtime behavior. It documents whether the installed runtime can execute the checkpoint-backed real-refinement closure truthfully.
 
-- `ready` — local runtime is operable; required weights and required import smoke both passed, so processor may emit `done`
-- `degraded` — install succeeded, but only OPTIONAL gaps remain; processor must emit the documented public error that matches the readiness evidence
+- `ready` — required weights and the supported real-refinement dependency tier passed import smoke; the staged contract is eligible for the local-only / mc-only / glb-only path
+- `degraded` — install succeeded, but only CONDITIONAL or DEGRADABLE gaps remain; readiness must record those gaps explicitly instead of pretending the runtime closure is fully available
 - `blocked` — runtime cannot operate locally; processor must emit `LOCAL_RUNTIME_UNAVAILABLE`
 
 Required readiness fields:
@@ -52,6 +52,8 @@ Required readiness fields:
 - `required_imports_ok`
 - `missing_required[]`
 - `missing_optional[]`
+- `missing_conditional[]`
+- `missing_degradable[]`
 - `expected_weights[]`
 
 ## Public runtime outcomes
@@ -82,7 +84,7 @@ Smoke validation should accept ONLY:
 
 ## Dependency policy
 
-Mandatory dependency set for the local MVP:
+Required dependency tier for the supported real-refinement path:
 
 - `torch==2.7.0+cu128`
 - `torchvision==0.22.0`
@@ -97,19 +99,20 @@ Mandatory dependency set for the local MVP:
 - `transformers`
 - `huggingface_hub`
 - `accelerate`
-- `rembg`
-- `onnxruntime`
+- `cubvh`
 - `safetensors`
 - `tqdm`
 
-Optional / degradable dependencies:
+Conditional dependencies (only skippable when the reference image is already cut out / alpha-ready):
 
-- `cubvh`
+- `rembg`
+- `onnxruntime`
+
+Degradable dependencies:
+
 - `flash_attn`
-- `diffusers`
-- `diso`
 
-Missing optional dependencies must be recorded explicitly in readiness; they do not justify remote fallback.
+Missing conditional or degradable dependencies must be recorded explicitly in readiness; they do not justify remote fallback, and missing `cubvh` is NOT degradable for the supported path.
 
 ## Weights policy
 
@@ -153,10 +156,10 @@ Hunyuan is the recommended and currently validated upstream source, but it is NO
 
 `fixtures/requests/refiner-bundle/`
 
-- `request.json` — compatibility-seam documentation fixture
-- `assets/reference-image.png` — placeholder reference image asset
-- `assets/coarse-mesh.glb` — placeholder coarse mesh asset
-- `expected/output/refined-mesh.glb` — placeholder packaged artifact for repo-local smoke tests
+- `request.json` — compatibility-seam documentation fixture for the local-only smoke path
+- `assets/reference-image.png` — install-smoke reference image fixture
+- `assets/coarse-mesh.glb` — binary GLB coarse-mesh fixture used by install smoke
+- `expected/output/refined-mesh.glb` — packaged binary GLB baseline kept in the copied payload for smoke comparisons
 
 ## Future Modly seam
 

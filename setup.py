@@ -9,6 +9,27 @@ from venv import EnvBuilder
 
 
 REQUIRED_STRING_KEYS = ('python_exe', 'ext_dir')
+INSTALL_DEPENDENCIES = [
+    'torch==2.7.0+cu128',
+    'torchvision==0.22.0',
+    'numpy',
+    'trimesh',
+    'Pillow',
+    'opencv-python-headless',
+    'scikit-image',
+    'PyYAML',
+    'omegaconf',
+    'einops',
+    'transformers',
+    'huggingface_hub',
+    'accelerate',
+    'cubvh',
+    'rembg',
+    'onnxruntime',
+    'safetensors',
+    'tqdm',
+    'flash_attn',
+]
 REQUIRED_DEPENDENCIES = [
     'torch==2.7.0+cu128',
     'torchvision==0.22.0',
@@ -23,12 +44,12 @@ REQUIRED_DEPENDENCIES = [
     'transformers',
     'huggingface_hub',
     'accelerate',
-    'rembg',
-    'onnxruntime',
+    'cubvh',
     'safetensors',
     'tqdm',
 ]
-OPTIONAL_DEPENDENCIES = ['cubvh', 'flash_attn', 'diffusers', 'diso']
+CONDITIONAL_DEPENDENCIES = ['rembg', 'onnxruntime']
+DEGRADABLE_DEPENDENCIES = ['flash_attn']
 WEIGHT_FILENAME = 'ultrashape_v1.pt'
 WEIGHT_RELATIVE_PATH = f'models/ultrashape/{WEIGHT_FILENAME}'
 EXPECTED_WEIGHTS = [WEIGHT_RELATIVE_PATH]
@@ -36,7 +57,6 @@ DEFAULT_WEIGHT_REPO_ID = 'infinith/UltraShape'
 RUNTIME_LAYOUT_VERSION = '1'
 WEIGHT_FAILURE_CODE = 'WEIGHT_ACQUISITION_FAILED'
 IMPORT_FAILURE_CODE = 'REQUIRED_IMPORT_SMOKE_FAILED'
-OPTIONAL_IMPORT_MODULES = ['cubvh', 'flash_attn', 'diffusers', 'diso']
 REQUIRED_IMPORT_MODULES = [
     'torch',
     'torchvision',
@@ -51,11 +71,12 @@ REQUIRED_IMPORT_MODULES = [
     'transformers',
     'huggingface_hub',
     'accelerate',
-    'rembg',
-    'onnxruntime',
+    'cubvh',
     'safetensors',
     'tqdm',
 ]
+CONDITIONAL_IMPORT_MODULES = ['rembg', 'onnxruntime']
+DEGRADABLE_IMPORT_MODULES = ['flash_attn']
 PACKAGE_STUBS = {
     'torch': '__version__ = "0.0-test"\n',
     'torchvision': '__version__ = "0.0-test"\n',
@@ -298,7 +319,7 @@ def install_stub_packages(venv_dir: Path) -> dict[str, object]:
         (package_dir / '__init__.py').write_text(PACKAGE_STUBS[module], encoding='utf8')
         installed_required.append(module)
 
-    for module in OPTIONAL_IMPORT_MODULES:
+    for module in [*CONDITIONAL_IMPORT_MODULES, *DEGRADABLE_IMPORT_MODULES]:
         if module in missing:
             continue
         package_dir = site_packages / module
@@ -329,7 +350,7 @@ def install_required_dependencies(venv_dir: Path, profile: dict[str, str]) -> di
             'https://download.pytorch.org/whl/cu128',
             profile['torch'],
             profile['torchvision'],
-            *[dependency for dependency in REQUIRED_DEPENDENCIES if dependency not in {profile['torch'], profile['torchvision']}],
+            *[dependency for dependency in INSTALL_DEPENDENCIES if dependency not in {profile['torch'], profile['torchvision']}],
         ],
     ]
 
@@ -340,7 +361,7 @@ def install_required_dependencies(venv_dir: Path, profile: dict[str, str]) -> di
 
     return {
         'mode': 'pip',
-        'installed_required_modules': REQUIRED_IMPORT_MODULES,
+        'installed_required_modules': [*REQUIRED_IMPORT_MODULES, *CONDITIONAL_IMPORT_MODULES, *DEGRADABLE_IMPORT_MODULES],
         'missing_stubbed_modules': [],
         'commands': rendered_commands,
     }
@@ -630,23 +651,30 @@ def build_summary(context: dict[str, str], profile: dict[str, str]) -> dict[str,
         'installed_at': timestamp,
         'dependencies': {
             'required': REQUIRED_DEPENDENCIES,
-            'optional': OPTIONAL_DEPENDENCIES,
+            'conditional': CONDITIONAL_DEPENDENCIES,
+            'degradable': DEGRADABLE_DEPENDENCIES,
         },
         'runtime_assets': {
             'required_files': REQUIRED_RUNTIME_FILES,
             'required_weights': EXPECTED_WEIGHTS,
-            'optional_dependencies': OPTIONAL_DEPENDENCIES,
+            'conditional_dependencies': CONDITIONAL_DEPENDENCIES,
+            'degradable_dependencies': DEGRADABLE_DEPENDENCIES,
         },
         'patch_intent': {
-            'flash_attn': 'optional -> PyTorch SDPA fallback',
-            'cubvh': 'optional -> skimage.measure.marching_cubes fallback',
-            'diffusers': 'optional outside mc-only MVP closure',
-            'diso': 'optional and excluded from mc-only MVP',
+            'cubvh': 'required for the supported real-refinement marching path',
+            'flash_attn': 'degradable -> PyTorch SDPA fallback',
+            'rembg': 'conditional -> only skippable when the input image already has cutout/alpha',
+            'onnxruntime': 'conditional -> only skippable when rembg is not needed for the provided image',
         },
     }
 
 
-def collect_install_health(ext_dir: str, required_import_failures: list[str], optional_import_failures: list[str]) -> dict[str, object]:
+def collect_install_health(
+    ext_dir: str,
+    required_import_failures: list[str],
+    conditional_import_failures: list[str],
+    degradable_import_failures: list[str],
+) -> dict[str, object]:
     install_root = Path(ext_dir)
     missing_weights = [weight for weight in EXPECTED_WEIGHTS if not (install_root / weight).is_file()]
     missing_runtime_files = list_missing_runtime_files(ext_dir)
@@ -672,9 +700,10 @@ def collect_install_health(ext_dir: str, required_import_failures: list[str], op
         failure_code = IMPORT_FAILURE_CODE
         failure_detail = 'Required dependency import smoke failed after dependency installation.'
 
+    missing_optional = [*conditional_import_failures, *degradable_import_failures]
     install_success = not missing_required
     status = 'blocked'
-    if install_success and optional_import_failures:
+    if install_success and missing_optional:
         status = 'degraded'
     elif install_success:
         status = 'ready'
@@ -683,7 +712,9 @@ def collect_install_health(ext_dir: str, required_import_failures: list[str], op
         'missing_weights': missing_weights,
         'missing_runtime_files': missing_runtime_files,
         'missing_required': missing_required,
-        'missing_optional': optional_import_failures,
+        'missing_optional': missing_optional,
+        'missing_conditional': conditional_import_failures,
+        'missing_degradable': degradable_import_failures,
         'failure_stage': failure_stage,
         'failure_code': failure_code,
         'failure_detail': failure_detail,
@@ -704,6 +735,8 @@ def build_readiness(ext_dir: str, health: dict[str, object], weight_result: dict
         'required_imports_ok': not health['required_import_failures'] and not health['missing_runtime_files'],
         'missing_required': missing_required,
         'missing_optional': list(health['missing_optional']),
+        'missing_conditional': list(health['missing_conditional']),
+        'missing_degradable': list(health['missing_degradable']),
         'expected_weights': EXPECTED_WEIGHTS,
         'install_success': health['install_success'],
         'failure_stage': health['failure_stage'],
@@ -731,13 +764,22 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf8')
 
 
-def write_summary(ext_dir: str, context: dict[str, str], payload: dict[str, object], dependency_install: dict[str, object], weight_result: dict[str, object], required_import_failures: list[str], optional_import_failures: list[str]) -> None:
+def write_summary(
+    ext_dir: str,
+    context: dict[str, str],
+    payload: dict[str, object],
+    dependency_install: dict[str, object],
+    weight_result: dict[str, object],
+    required_import_failures: list[str],
+    conditional_import_failures: list[str],
+    degradable_import_failures: list[str],
+) -> None:
     summary_path = Path(ext_dir) / '.setup-summary.json'
     readiness_path = Path(ext_dir) / '.runtime-readiness.json'
     profile = select_torch_profile(context)
     ensure_runtime_layout(ext_dir)
     summary = build_summary(context, profile)
-    health = collect_install_health(ext_dir, required_import_failures, optional_import_failures)
+    health = collect_install_health(ext_dir, required_import_failures, conditional_import_failures, degradable_import_failures)
     summary.update({
         'dependency_install': dependency_install,
         'install_success': health['install_success'],
@@ -766,8 +808,18 @@ def main() -> int:
     ensure_runtime_layout(context['ext_dir'])
     weight_result = acquire_required_weight(context['ext_dir'], payload, venv_dir)
     required_import_failures = run_import_smoke(venv_dir, context['ext_dir'], REQUIRED_IMPORT_MODULES + ['ultrashape_runtime'])
-    optional_import_failures = run_import_smoke(venv_dir, context['ext_dir'], OPTIONAL_IMPORT_MODULES)
-    write_summary(context['ext_dir'], context, payload, dependency_install, weight_result, required_import_failures, optional_import_failures)
+    conditional_import_failures = run_import_smoke(venv_dir, context['ext_dir'], CONDITIONAL_IMPORT_MODULES)
+    degradable_import_failures = run_import_smoke(venv_dir, context['ext_dir'], DEGRADABLE_IMPORT_MODULES)
+    write_summary(
+        context['ext_dir'],
+        context,
+        payload,
+        dependency_install,
+        weight_result,
+        required_import_failures,
+        conditional_import_failures,
+        degradable_import_failures,
+    )
     return 0
 
 

@@ -36,10 +36,26 @@ function expectBinaryGlb(path: string) {
   expect(payload.includes(0x80)).toBe(true);
 }
 
+function getRunnerMetrics(result: Record<string, unknown> | null): Record<string, unknown> {
+  const envelope = result?.result;
+  if (!envelope || typeof envelope !== 'object' || !('metrics' in envelope)) {
+    throw new Error('Expected runner success metrics to be present.');
+  }
+
+  const metrics = envelope.metrics;
+  if (!metrics || typeof metrics !== 'object') {
+    throw new Error('Expected runner metrics to be an object.');
+  }
+
+  return metrics as Record<string, unknown>;
+}
+
 function createFixtureWorkspace() {
   const root = mkdtempSync(join(tmpdir(), 'ultrashape-processor-'));
   const outputDir = join(root, 'output');
+  const stubDir = join(root, 'py-stubs');
   mkdirSync(outputDir);
+  mkdirSync(stubDir, { recursive: true });
 
   const referenceImage = join(root, 'reference.png');
   const namedCoarseMesh = join(root, 'named-coarse.glb');
@@ -50,6 +66,7 @@ function createFixtureWorkspace() {
   writeFileSync(namedCoarseMesh, createBinaryGlbBytes());
   writeFileSync(fallbackCoarseMesh, 'fallback-mesh');
   writeFileSync(packagedArtifact, 'refined-artifact');
+  writeFileSync(join(stubDir, 'cubvh.py'), '__version__ = "0.0-test"\n');
 
   return {
     root,
@@ -102,12 +119,20 @@ function installFakeRunnerExtension(root: string) {
       '    output_dir.mkdir(parents=True, exist_ok=True)',
       '    inside_output = output_dir / "refined.glb"',
       '    outside_output = output_dir.parent / "outside.glb"',
+      '    success_result = {"file_path": str(inside_output), "format": "glb", "backend": "local", "metrics": {"chamfer": 0.0042, "rms": 0.0125, "topology_changed": True, "extent_ratio": [1, 1, 1]}, "fallbacks": [], "subtrees_loaded": ["vae", "dit", "conditioner"], "warnings": []}',
       '    if mode == "invalid-json":',
       '        sys.stdout.write("not-json")',
       '        return 0',
       '    if mode == "outside-output":',
       '        outside_output.write_text("outside", encoding="utf8")',
-      '        sys.stdout.write(json.dumps({"ok": True, "result": {"file_path": str(outside_output), "format": "glb", "backend": "local", "warnings": []}}))',
+      '        result = dict(success_result)',
+      '        result["file_path"] = str(outside_output)',
+      '        sys.stdout.write(json.dumps({"ok": True, "result": result}))',
+      '        return 0',
+      '    if mode == "missing-metadata":',
+      '        incomplete = {"file_path": str(inside_output), "format": "glb", "backend": "local", "warnings": []}',
+      '        inside_output.write_text("runner-output", encoding="utf8")',
+      '        sys.stdout.write(json.dumps({"ok": True, "result": incomplete}))',
       '        return 0',
       '    if mode == "dependency-error":',
       '        sys.stdout.write(json.dumps({"ok": False, "error_code": "DEPENDENCY_MISSING", "error_message": "missing dependency"}))',
@@ -115,8 +140,11 @@ function installFakeRunnerExtension(root: string) {
       '    if mode == "weights-error":',
       '        sys.stdout.write(json.dumps({"ok": False, "error_code": "WEIGHTS_MISSING", "error_message": "missing checkpoint"}))',
       '        return 1',
+      '    if mode == "gate-error":',
+      '        sys.stdout.write(json.dumps({"ok": False, "error_code": "LOCAL_RUNTIME_UNAVAILABLE", "error_message": "GEOMETRIC_GATE_REJECTED: aligned passthrough geometry does not satisfy the real-refinement gate"}))',
+      '        return 1',
       '    inside_output.write_text("runner-output", encoding="utf8")',
-      '    sys.stdout.write(json.dumps({"ok": True, "result": {"file_path": str(inside_output), "format": "glb", "backend": "local", "warnings": []}}))',
+      '    sys.stdout.write(json.dumps({"ok": True, "result": success_result}))',
       '    return 0',
       '',
       'if __name__ == "__main__":',
@@ -146,6 +174,27 @@ function installFakeRunnerExtension(root: string) {
     invocationArgsPath,
     invocationEnvPath,
     invocationInputPath,
+  };
+}
+
+function checkpointBundlePayload() {
+  return {
+    format: 'ultrashape-checkpoint-bundle/v1',
+    vae: {
+      tensors: {
+        latent_basis: [0.11, 0.33, 0.55, 0.77],
+      },
+    },
+    dit: {
+      tensors: {
+        attention_bias: [0.21, 0.41, 0.61, 0.81],
+      },
+    },
+    conditioner: {
+      tensors: {
+        mask_bias: [0.14, 0.24, 0.64, 0.74],
+      },
+    },
   };
 }
 
@@ -210,13 +259,17 @@ function runLocalRunner(
   payload: Record<string, unknown>,
   options: { env?: NodeJS.ProcessEnv; cwd?: string } = {},
 ) {
+  const extDir = typeof payload.ext_dir === 'string' ? payload.ext_dir : null;
+  const stubDir = extDir ? join(extDir, 'py-stubs') : null;
+  const pythonPath = [stubDir, resolve(repoRoot, 'runtime', 'vendor'), options.env?.PYTHONPATH].filter(Boolean).join(':');
+
   const outcome = spawnSync('python3', ['-m', 'ultrashape_runtime.local_runner'], {
     cwd: options.cwd ?? repoRoot,
     encoding: 'utf8',
     input: `${JSON.stringify(payload)}\n`,
     env: {
       ...process.env,
-      PYTHONPATH: resolve(repoRoot, 'runtime', 'vendor'),
+      PYTHONPATH: pythonPath,
       ...options.env,
     },
   });
@@ -434,7 +487,10 @@ describe('UltraShape processor.py protocol', () => {
     const checkpointPath = join(fixture.root, 'ultrashape_v1.pt');
 
     writeFileSync(configPath, 'scope: mc-only\n');
-    writeFileSync(checkpointPath, 'weights');
+    writeFileSync(
+      checkpointPath,
+      JSON.stringify(checkpointBundlePayload()),
+    );
 
     try {
       const outcome = runLocalRunner(
@@ -467,9 +523,47 @@ describe('UltraShape processor.py protocol', () => {
           file_path: join(fixture.outputDir, 'refined.glb'),
           format: 'glb',
           backend: 'local',
+          metrics: expect.any(Object),
+          fallbacks: ['flash_attn->sdpa'],
+          subtrees_loaded: ['vae', 'dit', 'conditioner'],
           warnings: [],
         },
       });
+      const metrics = getRunnerMetrics(outcome.result);
+
+      expect(metrics).toEqual(
+        expect.objectContaining({
+          chamfer: expect.any(Number),
+          rms: expect.any(Number),
+          topology_changed: true,
+          extent_ratio: [1, 1, 1],
+          execution_trace: ['preprocess', 'conditioning', 'scheduler', 'denoise', 'decode', 'extract'],
+          preprocess: expect.objectContaining({
+            byte_length: expect.any(Number),
+            normalized_channels: 4,
+          }),
+          conditioning: expect.objectContaining({
+            voxel_count: expect.any(Number),
+            mask_tokens: expect.any(Number),
+          }),
+          scheduler: expect.objectContaining({
+            family: 'flow-matching',
+            step_count: 30,
+          }),
+          denoise: expect.objectContaining({
+            attention: expect.any(String),
+            latent_signature: expect.any(Number),
+          }),
+          decode: expect.objectContaining({
+            field_density: expect.any(Number),
+          }),
+          extract: expect.objectContaining({
+            extractor: expect.any(String),
+            payload_bytes: expect.any(Number),
+          }),
+        }),
+      );
+      expect(Number(metrics.rms)).toBeGreaterThan(0.01);
       expectBinaryGlb(join(fixture.outputDir, 'refined.glb'));
     } finally {
       fixture.cleanup();
@@ -573,7 +667,76 @@ describe('UltraShape processor.py protocol', () => {
         seed: null,
         preserve_scale: true,
       });
+      const metadataLog = outcome.events.find((event) => {
+        if (event.type !== 'log' || typeof event.message !== 'string') {
+          return false;
+        }
+
+        try {
+          const payload = JSON.parse(event.message) as Record<string, unknown>;
+          return Array.isArray(payload.subtrees_loaded);
+        } catch {
+          return false;
+        }
+      });
+
+      expect(metadataLog?.type).toBe('log');
+      expect(JSON.parse(String(metadataLog?.message))).toEqual({
+        backend: 'local',
+        metrics: {
+          chamfer: 0.0042,
+          rms: 0.0125,
+          topology_changed: true,
+          extent_ratio: [1, 1, 1],
+        },
+        fallbacks: [],
+        subtrees_loaded: ['vae', 'dit', 'conditioner'],
+      });
       expect(readFileSync(join(fixture.outputDir, 'refined.glb'), 'utf8')).toBe('runner-output');
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects runner success envelopes that omit checkpoint-backed execution metadata', () => {
+    const fixture = createFixtureWorkspace();
+    const installed = installFakeRunnerExtension(fixture.root);
+
+    try {
+      writeReadiness(installed.extDir);
+
+      const outcome = runProcessor(
+        {
+          extDir: installed.extDir,
+          input: {
+            inputs: {
+              reference_image: {
+                filePath: fixture.referenceImage,
+              },
+              coarse_mesh: {
+                filePath: fixture.namedCoarseMesh,
+              },
+            },
+          },
+          params: {
+            backend: 'local',
+            output_format: 'glb',
+          },
+          workspaceDir: fixture.outputDir,
+        },
+        {
+          cwd: fixture.root,
+          env: {
+            ULTRASHAPE_RUNNER_STDOUT_MODE: 'missing-metadata',
+          },
+        },
+      );
+
+      expect(outcome.events.at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('checkpoint-backed execution metadata'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
     } finally {
       fixture.cleanup();
     }
@@ -751,4 +914,51 @@ describe('UltraShape processor.py protocol', () => {
       fixture.cleanup();
     }
   });
+
+  it('blocks publish-path success when the runner rejects passthrough geometry at the gate', () => {
+    const fixture = createFixtureWorkspace();
+    const installed = installFakeRunnerExtension(fixture.root);
+
+    try {
+      writeReadiness(installed.extDir);
+
+      const outcome = runProcessor(
+        {
+          extDir: installed.extDir,
+          input: {
+            inputs: {
+              reference_image: {
+                filePath: fixture.referenceImage,
+              },
+              coarse_mesh: {
+                filePath: fixture.namedCoarseMesh,
+              },
+            },
+          },
+          params: {
+            backend: 'local',
+            output_format: 'glb',
+          },
+          workspaceDir: fixture.outputDir,
+        },
+        {
+          cwd: fixture.root,
+          env: {
+            ULTRASHAPE_RUNNER_STDOUT_MODE: 'gate-error',
+          },
+        },
+      );
+
+      expect(outcome.events.map((event) => event.type)).not.toContain('done');
+      expect(outcome.events.at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
+      expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
 });
