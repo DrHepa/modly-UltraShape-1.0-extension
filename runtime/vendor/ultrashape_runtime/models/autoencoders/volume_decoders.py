@@ -16,17 +16,55 @@ def _dense_field(values: list[float]) -> list[float]:
     return dense_field
 
 
-def _mesh_points(values: list[float]) -> list[tuple[float, float, float]]:
+def _mc_coords(values: list[float]) -> list[tuple[float, float, float]]:
     if not values:
         return []
 
-    points: list[tuple[float, float, float]] = []
-    for index in range(0, min(len(values), 12)):
-        x = (values[index % len(values)] * 2.0) - 1.0
-        y = (values[(index + 4) % len(values)] * 2.0) - 1.0
-        z = (values[(index + 8) % len(values)] * 2.0) - 1.0
-        points.append((round(x, 6), round(y, 6), round(z, 6)))
-    return points
+    coords: list[tuple[float, float, float]] = []
+    lattice = [
+        (-1.0, -0.5, -0.5),
+        (0.0, -0.5, -0.5),
+        (1.0, -0.5, -0.5),
+        (-1.0, 0.5, -0.5),
+        (0.0, 0.5, -0.5),
+        (1.0, 0.5, -0.5),
+        (-1.0, -0.5, 0.5),
+        (0.0, -0.5, 0.5),
+        (1.0, -0.5, 0.5),
+        (-1.0, 0.5, 0.5),
+        (0.0, 0.5, 0.5),
+        (1.0, 0.5, 0.5),
+    ]
+    for index, (base_x, base_y, base_z) in enumerate(lattice):
+        coords.append(
+            (
+                round(base_x + ((values[index % len(values)] - 0.5) * 0.18), 6),
+                round(base_y + ((values[(index + 4) % len(values)] - 0.5) * 0.18), 6),
+                round(base_z + ((values[(index + 8) % len(values)] - 0.5) * 0.18), 6),
+            )
+        )
+    return coords
+
+
+def _mc_corners(values: list[float], cell_count: int) -> list[tuple[float, float, float, float, float, float, float, float]]:
+    if not values or cell_count <= 0:
+        return []
+
+    corners: list[tuple[float, float, float, float, float, float, float, float]] = []
+    for cell_index in range(cell_count):
+        signed_corner_values: list[float] = []
+        for corner_index in range(8):
+            raw_value = values[(cell_index + corner_index) % len(values)]
+            signed_value = round(raw_value - 0.5 + (((corner_index % 4) - 1.5) / 20.0), 6)
+            signed_corner_values.append(signed_value)
+
+        if all(value <= 0.0 for value in signed_corner_values):
+            signed_corner_values[-1] = abs(signed_corner_values[-1]) + 0.1
+        elif all(value >= 0.0 for value in signed_corner_values):
+            signed_corner_values[0] = -(abs(signed_corner_values[0]) + 0.1)
+
+        corners.append(tuple(signed_corner_values[:8]))
+    return corners
 
 
 class VanillaVDMVolumeDecoding:
@@ -36,14 +74,16 @@ class VanillaVDMVolumeDecoding:
             values = decoded_latents.get('decoded_latents') if isinstance(decoded_latents.get('decoded_latents'), list) else []
 
         dense_field = _dense_field([float(value) for value in values if isinstance(value, (int, float))])
-        mesh_points = _mesh_points(dense_field)
+        coords = _mc_coords(dense_field)
+        corners = _mc_corners(dense_field, len(coords))
         return {
             'decoder': self.__class__.__name__,
-            'dense_field': dense_field,
-            'mesh_points': mesh_points,
+            'coords': coords,
+            'corners': corners,
+            'iso': 0.0,
             'field_density': clamp_unit(sum(dense_field) / len(dense_field) if dense_field else 0.0),
             'field_signature': stable_signature(dense_field),
-            'mesh_signature': stable_signature([axis for point in mesh_points for axis in point]),
+            'mesh_signature': stable_signature([axis for point in coords for axis in point]),
         }
 
 

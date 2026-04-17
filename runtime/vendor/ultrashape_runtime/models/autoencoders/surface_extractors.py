@@ -98,38 +98,48 @@ class MCSurfaceExtractor:
         if not isinstance(mesh_payload, dict):
             raise SurfaceExtractionError('coarse_surface.mesh must be a structured binary-safe mesh payload.')
 
-        mesh_points = decoded_volume.get('mesh_points') if isinstance(decoded_volume.get('mesh_points'), list) else []
-        if not mesh_points:
-            raise SurfaceExtractionError('decoded_volume.mesh_points must contain marching-cubes source points.')
+        coords = decoded_volume.get('coords') if isinstance(decoded_volume.get('coords'), list) else []
+        if not coords:
+            raise SurfaceExtractionError('decoded_volume.coords must contain marching-cubes cube coordinates.')
+
+        corners = decoded_volume.get('corners') if isinstance(decoded_volume.get('corners'), list) else []
+        if not corners:
+            raise SurfaceExtractionError('decoded_volume.corners must contain marching-cubes cube corner fields.')
+        if len(coords) != len(corners):
+            raise SurfaceExtractionError('decoded_volume.coords and decoded_volume.corners must have the same length.')
 
         field_signature = decoded_volume.get('field_signature') if isinstance(decoded_volume.get('field_signature'), int) else None
         if not isinstance(field_signature, int):
             raise SurfaceExtractionError('decoded_volume.field_signature must be an integer.')
+
+        iso = decoded_volume.get('iso', 0.0)
+        if not isinstance(iso, (int, float)):
+            raise SurfaceExtractionError('decoded_volume.iso must be numeric.')
 
         surface_signature = stable_signature([
             float(field_signature % 1000) / 1000.0,
             float(reference_asset.get('signature', 0) % 1000) / 1000.0,
             float(mesh_payload.get('signature', 0) % 1000) / 1000.0,
         ])
-        offset = ((surface_signature % 17) + 3) / 200.0
-        seed_points = []
-        for index, point in enumerate(mesh_points):
+        normalized_coords = []
+        normalized_corners = []
+        for point, corner_values in zip(coords, corners):
             if not isinstance(point, (list, tuple)) or len(point) != 3:
                 continue
-            direction = -1.0 if index % 2 else 1.0
-            seed_points.append(
-                (
-                    round(float(point[0]) * (1.0 + offset), 6),
-                    round(float(point[1]) * (1.0 - (offset / 2.0)), 6),
-                    round((float(point[2]) + (direction * offset)) * (1.0 if preserve_scale else 1.08), 6),
-                )
-            )
+            if not isinstance(corner_values, (list, tuple)) or len(corner_values) != 8:
+                continue
+
+            normalized_coords.append(tuple(round(float(axis), 6) for axis in point[:3]))
+            normalized_corners.append(tuple(round(float(value), 6) for value in corner_values[:8]))
+
+        if not normalized_coords or not normalized_corners:
+            raise SurfaceExtractionError('decoded_volume marching-cubes inputs must contain valid coords/corners rows.')
 
         sparse_marching_cubes = getattr(cubvh, 'sparse_marching_cubes', None)
         if not callable(sparse_marching_cubes):
             raise SurfaceExtractionDependencyError('Required runtime import is unavailable: cubvh.sparse_marching_cubes.')
 
-        raw_vertices, raw_faces = sparse_marching_cubes(points=seed_points, threshold=0.0, preserve_scale=preserve_scale)
+        raw_vertices, raw_faces = sparse_marching_cubes(normalized_coords, normalized_corners, float(iso), ensure_consistency=False)
         vertices = [tuple(float(axis) for axis in vertex[:3]) for vertex in raw_vertices if isinstance(vertex, (list, tuple)) and len(vertex) >= 3]
         faces = [tuple(int(index) for index in face[:3]) for face in raw_faces if isinstance(face, (list, tuple)) and len(face) >= 3]
 

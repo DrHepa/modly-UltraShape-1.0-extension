@@ -52,8 +52,15 @@ function diffusersStubSource() {
 function cubvhStubSource() {
   return [
     '__version__ = "0.0-test"',
-    'def sparse_marching_cubes(*, points, threshold=0.0, preserve_scale=True):',
-    '    vertices = [tuple(float(axis) for axis in point) for point in points]',
+    'def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):',
+    '    vertices = []',
+    '    for point, cube in zip(coords, corners):',
+    '        offset = sum(float(value) for value in cube) / max(len(cube), 1)',
+    '        vertices.append((',
+    '            float(point[0]) + offset,',
+    '            float(point[1]) - (offset / 2.0),',
+    '            float(point[2]) + (offset / 3.0),',
+    '        ))',
     '    faces = []',
     '    for index in range(1, max(len(vertices) - 1, 1)):',
     '        if index + 1 >= len(vertices):',
