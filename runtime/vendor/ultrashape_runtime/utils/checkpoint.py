@@ -10,6 +10,7 @@ import torch
 from .tensors import clamp_unit, stable_signature
 
 REQUIRED_SUBTREES = ('vae', 'dit', 'conditioner')
+MAX_TENSOR_SAMPLES = 8
 
 
 class CheckpointResolutionError(Exception):
@@ -62,8 +63,9 @@ def load_checkpoint_subtrees(
         )
 
     bundle: dict[str, object] = {}
-    tensor_values: list[float] = []
+    summary_tokens: list[float] = []
     tensor_count = 0
+    value_count = 0
     for name in expected:
         subtree = parsed.get(name)
         if not isinstance(subtree, Mapping):
@@ -73,20 +75,32 @@ def load_checkpoint_subtrees(
         if not tensors:
             raise CheckpointResolutionError(f'Checkpoint subtree {name} must include non-empty tensor data.')
 
-        for tensor_name, values in tensors.items():
+        subtree_tokens: list[float] = []
+        subtree_value_count = 0
+        for tensor_name, tensor_summary in tensors.items():
             if not isinstance(tensor_name, str) or not tensor_name.strip():
                 raise CheckpointResolutionError(f'Checkpoint subtree {name} has an invalid tensor key.')
-            if not values:
-                raise CheckpointResolutionError(f'Checkpoint subtree {name}.{tensor_name} must be a non-empty tensor list.')
+            if not isinstance(tensor_summary, Mapping):
+                raise CheckpointResolutionError(f'Checkpoint subtree {name}.{tensor_name} must be summarized tensor data.')
 
-            tensor_values.extend(values)
+            sample = tensor_summary.get('sample')
+            if not isinstance(sample, list) or not sample:
+                raise CheckpointResolutionError(f'Checkpoint subtree {name}.{tensor_name} must provide compact tensor samples.')
+
+            subtree_tokens.extend(float(value) for value in sample if isinstance(value, (int, float)))
+            subtree_value_count += int(tensor_summary.get('value_count', 0))
             tensor_count += 1
 
+        compact_tokens = subtree_tokens[:MAX_TENSOR_SAMPLES]
+        summary_tokens.extend(compact_tokens)
+        value_count += subtree_value_count
         bundle[name] = {
             'tensors': tensors,
+            'representation': 'tensor-summary-v1',
             'tensor_count': len(tensors),
-            'value_count': sum(len(values) for values in tensors.values()),
-            'signature': stable_signature([value for values in tensors.values() for value in values]),
+            'value_count': subtree_value_count,
+            'tokens': compact_tokens,
+            'signature': stable_signature(compact_tokens),
         }
 
     return {
@@ -95,27 +109,63 @@ def load_checkpoint_subtrees(
         'bundle': bundle,
         'summary': {
             'format': 'pytorch-binary-checkpoint',
+            'representation': 'tensor-summary-v1',
             'tensor_count': tensor_count,
-            'value_count': len(tensor_values),
-            'signature': stable_signature(tensor_values),
+            'value_count': value_count,
+            'signature': stable_signature(summary_tokens),
         },
     }
 
 
-def _normalize_checkpoint_subtree(subtree: Mapping[str, object]) -> dict[str, list[float]]:
+def checkpoint_tokens(checkpoint_state: object, *, limit: int = MAX_TENSOR_SAMPLES) -> list[float]:
+    if not isinstance(checkpoint_state, Mapping):
+        return []
+
+    direct_tokens = checkpoint_state.get('tokens')
+    if isinstance(direct_tokens, list):
+        return [clamp_unit(float(value)) for value in direct_tokens[:limit] if isinstance(value, (int, float))]
+
+    tensors = checkpoint_state.get('tensors')
+    if not isinstance(tensors, Mapping):
+        return []
+
+    tokens: list[float] = []
+    for tensor in tensors.values():
+        if isinstance(tensor, list):
+            tokens.extend(clamp_unit(float(value)) for value in tensor if isinstance(value, (int, float)))
+        elif isinstance(tensor, Mapping):
+            sample = tensor.get('sample')
+            if isinstance(sample, list):
+                tokens.extend(clamp_unit(float(value)) for value in sample if isinstance(value, (int, float)))
+            elif isinstance(tensor.get('mean'), (int, float)):
+                tokens.append(clamp_unit(float(tensor['mean'])))
+
+        if len(tokens) >= limit:
+            return tokens[:limit]
+
+    return tokens[:limit]
+
+
+def checkpoint_signature(checkpoint_state: object) -> int:
+    if isinstance(checkpoint_state, Mapping) and isinstance(checkpoint_state.get('signature'), int):
+        return int(checkpoint_state['signature'])
+    return stable_signature(checkpoint_tokens(checkpoint_state, limit=MAX_TENSOR_SAMPLES))
+
+
+def _normalize_checkpoint_subtree(subtree: Mapping[str, object]) -> dict[str, dict[str, object]]:
     tensor_source = subtree.get('tensors') if isinstance(subtree.get('tensors'), Mapping) else subtree
     normalized_tensors = _collect_tensor_values(tensor_source)
-    return {name: values for name, values in normalized_tensors.items() if values}
+    return {name: values for name, values in normalized_tensors.items() if values.get('sample')}
 
 
-def _collect_tensor_values(node: object, prefix: str = '') -> dict[str, list[float]]:
+def _collect_tensor_values(node: object, prefix: str = '') -> dict[str, dict[str, object]]:
     if not isinstance(node, Mapping):
         if not prefix:
             return {}
         values = _coerce_tensor_values(node)
         return {prefix: values} if values else {}
 
-    tensors: dict[str, list[float]] = {}
+    tensors: dict[str, dict[str, object]] = {}
     for key, value in node.items():
         if not isinstance(key, str) or not key.strip():
             continue
@@ -131,28 +181,122 @@ def _collect_tensor_values(node: object, prefix: str = '') -> dict[str, list[flo
     return tensors
 
 
-def _coerce_tensor_values(value: object) -> list[float]:
+def _coerce_tensor_values(value: object) -> dict[str, object] | None:
     if isinstance(value, (int, float)):
-        return [clamp_unit(float(value))]
+        normalized = clamp_unit(float(value))
+        return {
+            'sample': [normalized],
+            'sample_count': 1,
+            'value_count': 1,
+            'min': normalized,
+            'max': normalized,
+            'mean': normalized,
+            'signature': stable_signature([normalized]),
+        }
 
     if isinstance(value, (list, tuple)):
-        normalized: list[float] = []
-        for item in value:
-            normalized.extend(_coerce_tensor_values(item))
-        return normalized
+        return _summarize_iterable(value)
 
     tensor_like = value
-    for method_name in ('detach', 'cpu'):
+    for method_name in ('detach', 'cpu', 'float'):
         method = getattr(tensor_like, method_name, None)
         if callable(method):
             tensor_like = method()
 
-    flatten = getattr(tensor_like, 'flatten', None)
-    if callable(flatten):
-        tensor_like = flatten()
+    reshape = getattr(tensor_like, 'reshape', None)
+    if callable(reshape):
+        tensor_like = reshape(-1)
+    else:
+        flatten = getattr(tensor_like, 'flatten', None)
+        if callable(flatten):
+            tensor_like = flatten()
 
-    tolist = getattr(tensor_like, 'tolist', None)
-    if callable(tolist):
-        return _coerce_tensor_values(tolist())
+    numel = getattr(tensor_like, 'numel', None)
+    if callable(numel):
+        value_count = int(numel())
+        if value_count <= 0:
+            return None
 
-    return []
+        sample_indices = _sample_indices(value_count, MAX_TENSOR_SAMPLES)
+        sample = [clamp_unit(_tensor_scalar(tensor_like, index)) for index in sample_indices]
+
+        return {
+            'sample': sample,
+            'sample_count': len(sample),
+            'value_count': value_count,
+            'min': clamp_unit(_tensor_reduce_scalar(tensor_like, 'min')),
+            'max': clamp_unit(_tensor_reduce_scalar(tensor_like, 'max')),
+            'mean': clamp_unit(_tensor_reduce_scalar(tensor_like, 'mean')),
+            'signature': stable_signature(sample),
+        }
+
+    return None
+
+
+def _summarize_iterable(values: list[object] | tuple[object, ...]) -> dict[str, object] | None:
+    sample: list[float] = []
+    value_count = 0
+    total = 0.0
+    minimum: float | None = None
+    maximum: float | None = None
+
+    def visit(node: object) -> None:
+        nonlocal value_count, total, minimum, maximum
+        if isinstance(node, (int, float)):
+            normalized = clamp_unit(float(node))
+            value_count += 1
+            total += normalized
+            minimum = normalized if minimum is None else min(minimum, normalized)
+            maximum = normalized if maximum is None else max(maximum, normalized)
+            if len(sample) < MAX_TENSOR_SAMPLES:
+                sample.append(normalized)
+            return
+
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item)
+
+    visit(values)
+    if value_count <= 0 or not sample:
+        return None
+
+    return {
+        'sample': sample,
+        'sample_count': len(sample),
+        'value_count': value_count,
+        'min': minimum,
+        'max': maximum,
+        'mean': clamp_unit(total / value_count),
+        'signature': stable_signature(sample),
+    }
+
+
+def _sample_indices(value_count: int, sample_size: int) -> list[int]:
+    capped = min(value_count, sample_size)
+    if capped <= 0:
+        return []
+    if value_count <= capped:
+        return list(range(value_count))
+
+    last_index = value_count - 1
+    return sorted({round((last_index * index) / (capped - 1)) for index in range(capped)})
+
+
+def _tensor_scalar(tensor_like: object, index: int) -> float:
+    try:
+        value = tensor_like[index]
+    except TypeError:
+        value = tensor_like.__getitem__(index)
+    return _to_python_float(value)
+
+
+def _tensor_reduce_scalar(tensor_like: object, method_name: str) -> float:
+    method = getattr(tensor_like, method_name)
+    return _to_python_float(method())
+
+
+def _to_python_float(value: object) -> float:
+    item = getattr(value, 'item', None)
+    if callable(item):
+        value = item()
+    return float(value)

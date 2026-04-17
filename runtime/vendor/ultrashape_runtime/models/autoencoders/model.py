@@ -2,21 +2,8 @@
 
 from __future__ import annotations
 
+from ...utils.checkpoint import checkpoint_tokens
 from ...utils.tensors import blend_sequences, clamp_unit, stable_signature
-
-
-def _checkpoint_tokens(checkpoint_state: object) -> list[float]:
-    if not isinstance(checkpoint_state, dict):
-        return []
-    tensors = checkpoint_state.get('tensors')
-    if not isinstance(tensors, dict):
-        return []
-
-    values: list[float] = []
-    for tensor in tensors.values():
-        if isinstance(tensor, list):
-            values.extend(float(value) for value in tensor if isinstance(value, (int, float)))
-    return values
 
 
 class ShapeVAE:
@@ -28,8 +15,8 @@ class ShapeVAE:
     def decode_latents(self, latents: dict[str, object], reference_asset: dict[str, object]) -> dict[str, object]:
         latent_values = latents.get('latents') if isinstance(latents.get('latents'), list) else []
         reference_tokens = reference_asset.get('tokens') if isinstance(reference_asset.get('tokens'), list) else []
-        checkpoint_tokens = _checkpoint_tokens(self.checkpoint_state)
-        decoded = blend_sequences(latent_values, reference_tokens, checkpoint_tokens)[:8]
+        checkpoint_signal = checkpoint_tokens(self.checkpoint_state)
+        decoded = blend_sequences(latent_values, reference_tokens, checkpoint_signal)[:8]
         decoded = [clamp_unit((value * 0.8) + 0.05) for value in decoded]
         return {
             'decoded_latents': decoded,

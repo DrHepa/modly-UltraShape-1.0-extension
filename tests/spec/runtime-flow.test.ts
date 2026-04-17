@@ -46,6 +46,36 @@ function writeBinaryCheckpointBundle(path: string, payload: Record<string, unkno
   }
 }
 
+function inspectCheckpointBundle(checkpointPath: string, extDir: string, stubDir: string) {
+  const outcome = spawnSync(
+    'python3',
+    [
+      '-c',
+      [
+        'import json, sys',
+        'from ultrashape_runtime.utils.checkpoint import load_checkpoint_subtrees',
+        'result = load_checkpoint_subtrees(sys.argv[1], None, sys.argv[2])',
+        'print(json.dumps(result))',
+      ].join('\n'),
+      checkpointPath,
+      extDir,
+    ],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PYTHONPATH: [stubDir, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+      },
+    },
+  );
+
+  if (outcome.status !== 0) {
+    throw new Error(outcome.stderr || 'Failed to inspect checkpoint bundle.');
+  }
+
+  return JSON.parse(outcome.stdout) as Record<string, unknown>;
+}
+
 function expectUpstreamRuntimeGraph(configText: string) {
   expect(configText).toContain('checkpoint:');
   expect(configText).toContain('preprocess:');
@@ -775,6 +805,51 @@ describe('UltraShape runtime flow', () => {
         error_code: 'WEIGHTS_MISSING',
         error_message: expect.stringContaining('tensor'),
       });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stores compact checkpoint summaries instead of full tensor float lists', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeBinaryCheckpointBundle(fixture.checkpoint, {
+        vae: { tensors: { latent_basis: Array.from({ length: 16 }, (_, index) => (index + 1) / 20) } },
+        dit: { tensors: { attention_bias: Array.from({ length: 12 }, (_, index) => (index + 2) / 20) } },
+        conditioner: { tensors: { mask_bias: Array.from({ length: 10 }, (_, index) => (index + 3) / 20) } },
+      });
+
+      const inspected = inspectCheckpointBundle(fixture.checkpoint, fixture.root, fixture.stubDir);
+      const bundle = inspected.bundle as Record<string, unknown>;
+      const vae = bundle.vae as Record<string, unknown>;
+      const tensors = vae.tensors as Record<string, unknown>;
+      const latentBasis = tensors.latent_basis as Record<string, unknown>;
+
+      expect(inspected.summary).toEqual(
+        expect.objectContaining({
+          representation: 'tensor-summary-v1',
+          tensor_count: 3,
+          value_count: 38,
+        }),
+      );
+      expect(vae).toEqual(
+        expect.objectContaining({
+          representation: 'tensor-summary-v1',
+          value_count: 16,
+          tokens: expect.any(Array),
+        }),
+      );
+      expect(latentBasis).toEqual(
+        expect.objectContaining({
+          sample_count: 8,
+          value_count: 16,
+          sample: expect.any(Array),
+          mean: expect.any(Number),
+        }),
+      );
+      expect((latentBasis.sample as unknown[])).toHaveLength(8);
+      expect(vae.tokens).toEqual(latentBasis.sample);
     } finally {
       fixture.cleanup();
     }

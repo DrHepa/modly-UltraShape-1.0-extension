@@ -2,21 +2,8 @@
 
 from __future__ import annotations
 
+from ..utils.checkpoint import checkpoint_tokens
 from ..utils.tensors import blend_sequences, clamp_unit, stable_signature
-
-
-def _checkpoint_tokens(checkpoint_state: object) -> list[float]:
-    if not isinstance(checkpoint_state, dict):
-        return []
-    tensors = checkpoint_state.get('tensors')
-    if not isinstance(tensors, dict):
-        return []
-
-    tokens: list[float] = []
-    for values in tensors.values():
-        if isinstance(values, list):
-            tokens.extend(float(value) for value in values if isinstance(value, (int, float)))
-    return tokens
 
 
 class ConditionerMask:
@@ -32,8 +19,8 @@ class ConditionerMask:
         voxels = coarse_surface.get('voxels') if isinstance(coarse_surface.get('voxels'), dict) else {}
         voxel_values = voxels.get('voxel_values') if isinstance(voxels.get('voxel_values'), list) else []
         voxel_tokens = [value / 12.0 for value in voxel_values] if voxel_values else []
-        checkpoint_tokens = _checkpoint_tokens(self.checkpoint_state)
-        mask_tokens = blend_sequences(image_tokens, mesh_tokens, voxel_tokens, checkpoint_tokens)[:8]
+        checkpoint_signal = checkpoint_tokens(self.checkpoint_state)
+        mask_tokens = blend_sequences(image_tokens, mesh_tokens, voxel_tokens, checkpoint_signal)[:8]
 
         return {
             'mask_tokens': len(mask_tokens),
