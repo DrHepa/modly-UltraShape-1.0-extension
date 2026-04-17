@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -74,6 +74,7 @@ type SetupSummaryWithNative = SetupStatusArtifact & WeightSourceArtifact & {
   native_install_contract: NativeInstallContract;
   native_install: NativeInstallSummary;
   dependencies?: DependencySummary;
+  missing_required?: string[];
 };
 
 type SetupReadiness = SetupStatusArtifact & WeightSourceArtifact & {
@@ -84,6 +85,40 @@ type SetupReadiness = SetupStatusArtifact & WeightSourceArtifact & {
   missing_optional?: string[];
 };
 
+const extractedPayloadPaths = [
+  'manifest.json',
+  'setup.py',
+  'processor.py',
+  'README.md',
+  'runtime/configs/infer_dit_refine.yaml',
+  'runtime/patches/README.md',
+  'runtime/vendor/ultrashape_runtime/__init__.py',
+  'runtime/vendor/ultrashape_runtime/local_runner.py',
+  'runtime/vendor/ultrashape_runtime/pipelines.py',
+  'runtime/vendor/ultrashape_runtime/preprocessors.py',
+  'runtime/vendor/ultrashape_runtime/rembg.py',
+  'runtime/vendor/ultrashape_runtime/surface_loaders.py',
+  'runtime/vendor/ultrashape_runtime/schedulers.py',
+  'runtime/vendor/ultrashape_runtime/utils/__init__.py',
+  'runtime/vendor/ultrashape_runtime/utils/checkpoint.py',
+  'runtime/vendor/ultrashape_runtime/utils/mesh.py',
+  'runtime/vendor/ultrashape_runtime/utils/tensors.py',
+  'runtime/vendor/ultrashape_runtime/models/conditioner_mask.py',
+  'runtime/vendor/ultrashape_runtime/models/denoisers/__init__.py',
+  'runtime/vendor/ultrashape_runtime/models/denoisers/dit_mask.py',
+  'runtime/vendor/ultrashape_runtime/models/denoisers/moe_layers.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/__init__.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/model.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/attention_blocks.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/attention_processors.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/surface_extractors.py',
+  'runtime/vendor/ultrashape_runtime/models/autoencoders/volume_decoders.py',
+  'fixtures/requests/refiner-bundle/request.json',
+  'fixtures/requests/refiner-bundle/assets/reference-image.png',
+  'fixtures/requests/refiner-bundle/assets/coarse-mesh.glb',
+  'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb',
+] as const;
+
 function runSetup(argument: Record<string, unknown>) {
   return spawnSync('python3', [setupPath, JSON.stringify(argument)], {
     cwd: repoRoot,
@@ -93,6 +128,10 @@ function runSetup(argument: Record<string, unknown>) {
       ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
     },
   });
+}
+
+function copyFileOrDirectory(relativePath: string, installDir: string) {
+  cpSync(resolve(repoRoot, relativePath), resolve(installDir, relativePath), { recursive: true });
 }
 
 function runSetupWithEnv(argument: Record<string, unknown>, env: NodeJS.ProcessEnv) {
@@ -261,6 +300,7 @@ describe('UltraShape setup.py contract', () => {
       expect(summary.install_success).toBe(false);
       expect(summary.failure_stage).toBe('weight-validation');
       expect(summary.failure_code).toBe('WEIGHT_ACQUISITION_FAILED');
+      expect(summary.dependencies.required).toContain('diffusers');
       expect(summary.dependencies.required).toContain('cubvh');
       expect(summary.dependencies.conditional).toEqual(['rembg', 'onnxruntime']);
       expect(summary.dependencies.degradable).toEqual(['flash_attn']);
@@ -296,20 +336,24 @@ describe('UltraShape setup.py contract', () => {
         status: string;
         backend: string;
         mvp_scope: string;
+        output_format: string;
         weights_ready: boolean;
         required_imports_ok: boolean;
         missing_required: string[];
         missing_optional: string[];
         expected_weights: string[];
+        required_checkpoint_subtrees: string[];
         install_success: boolean;
         failure_stage: string;
         failure_code: string;
       };
       expect(readiness.backend).toBe('local');
       expect(readiness.mvp_scope).toBe('mc-only');
+      expect(readiness.output_format).toBe('glb');
       expect(readiness.status).toBe('blocked');
       expect(readiness.weights_ready).toBe(false);
       expect(readiness.required_imports_ok).toBe(true);
+      expect(readiness.required_checkpoint_subtrees).toEqual(['vae', 'dit', 'conditioner']);
       expect(readiness.install_success).toBe(false);
       expect(readiness.failure_stage).toBe('weight-validation');
       expect(readiness.failure_code).toBe('WEIGHT_ACQUISITION_FAILED');
@@ -413,6 +457,58 @@ describe('UltraShape setup.py contract', () => {
     }
   });
 
+  it('marks copied extracted payload installs as blocked when ultrashape_runtime import smoke cannot close over the copied root', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ultrashape-copied-root-'));
+    const installDir = join(root, 'modly-UltraShape-1.0-extension');
+    const weightPath = join(root, 'weight-cache', 'models', 'ultrashape', 'ultrashape_v1.pt');
+    mkdirSync(join(root, 'weight-cache', 'models', 'ultrashape'), { recursive: true });
+    writeFileSync(weightPath, 'test-weight');
+
+    for (const relativePath of extractedPayloadPaths) {
+      copyFileOrDirectory(relativePath, installDir);
+    }
+
+    try {
+      const setup = spawnSync('python3', ['setup.py', JSON.stringify({
+        python_exe: 'python3',
+        ext_dir: installDir,
+        gpu_sm: 90,
+        required_weight_path: weightPath,
+      })], {
+        cwd: installDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        },
+      });
+
+      expect(setup.status).not.toBe(0);
+
+      const { summary, readiness } = readSetupArtifacts(installDir);
+      expect(summary.install_success).toBe(false);
+      expect(summary.failure_stage).toBe('runtime-validation');
+      expect(summary.failure_code).toBe('RUNTIME_LAYOUT_INCOMPLETE');
+      expect(summary.missing_required).toEqual([
+        'runtime/ultrashape_runtime/utils/voxelize.py',
+        'import:ultrashape_runtime',
+      ]);
+      expect(readiness.status).toBe('blocked');
+      expect(readiness.install_success).toBe(false);
+      expect(readiness.required_imports_ok).toBe(false);
+      expect(readiness.failure_stage).toBe('runtime-validation');
+      expect(readiness.failure_code).toBe('RUNTIME_LAYOUT_INCOMPLETE');
+      expect(readiness.missing_required).toEqual([
+        'runtime/ultrashape_runtime/utils/voxelize.py',
+        'import:ultrashape_runtime',
+      ]);
+      expect(readiness.missing_optional).toEqual([]);
+      expect(readiness.missing_degradable).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('pins cubvh to the CUDA toolkit derived from the selected torch profile even when host CUDA env points elsewhere', () => {
     const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-cuda-toolkit-'));
     const installDir = join(root, 'extension-root');
@@ -509,10 +605,12 @@ describe('UltraShape setup.py contract', () => {
         weights_ready: boolean;
         required_imports_ok: boolean;
         missing_required: string[];
+        required_checkpoint_subtrees: string[];
       };
       expect(readiness.status).toBe('ready');
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
+      expect(readiness.required_checkpoint_subtrees).toEqual(['vae', 'dit', 'conditioner']);
       expect(readiness.missing_required).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -702,20 +800,20 @@ describe('UltraShape setup.py contract', () => {
         required_weight_path: sourceWeight,
       }, {
         ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
-        ULTRASHAPE_SETUP_TEST_STUB_DEPS_MISSING: 'cubvh',
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS_MISSING: 'diffusers',
       });
 
       expect(outcome.status).not.toBe(0);
 
       const { summary, readiness } = readSetupArtifacts(installDir);
       expect(summary.dependencies).toMatchObject({
-        required: expect.arrayContaining(['cubvh']),
+        required: expect.arrayContaining(['diffusers', 'cubvh']),
         conditional: ['rembg', 'onnxruntime'],
         degradable: ['flash_attn'],
       });
       expect(readiness.status).toBe('blocked');
       expect(readiness.required_imports_ok).toBe(false);
-      expect(readiness.missing_required).toContain('import:cubvh');
+      expect(readiness.missing_required).toContain('import:diffusers');
       expect(readiness.missing_optional).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });

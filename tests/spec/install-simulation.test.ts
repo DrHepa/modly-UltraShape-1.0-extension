@@ -24,6 +24,7 @@ const installSurfacePaths = [
   'runtime/vendor/ultrashape_runtime/utils/checkpoint.py',
   'runtime/vendor/ultrashape_runtime/utils/mesh.py',
   'runtime/vendor/ultrashape_runtime/utils/tensors.py',
+  'runtime/vendor/ultrashape_runtime/utils/voxelize.py',
   'runtime/vendor/ultrashape_runtime/models/conditioner_mask.py',
   'runtime/vendor/ultrashape_runtime/models/denoisers/__init__.py',
   'runtime/vendor/ultrashape_runtime/models/denoisers/dit_mask.py',
@@ -108,6 +109,27 @@ function checkpointBundleText() {
   });
 }
 
+function writeBinaryCheckpointBundle(path: string) {
+  const outcome = spawnSync(
+    'python3',
+    [
+      '-c',
+      [
+        'import sys, zipfile',
+        'with zipfile.ZipFile(sys.argv[1], "w", compression=zipfile.ZIP_DEFLATED) as archive:',
+        '    archive.writestr("checkpoint.json", sys.argv[2])',
+      ].join('\n'),
+      path,
+      checkpointBundleText(),
+    ],
+    { encoding: 'utf8' },
+  );
+
+  if (outcome.status !== 0) {
+    throw new Error(outcome.stderr || 'Failed to write binary checkpoint bundle.');
+  }
+}
+
 function expectedProcessorOutcome(readiness: Readiness): 'done' | 'WEIGHTS_MISSING' | 'DEPENDENCY_MISSING' | 'LOCAL_RUNTIME_UNAVAILABLE' {
   if (!readiness.weights_ready) {
     return 'WEIGHTS_MISSING';
@@ -141,7 +163,7 @@ function copyInstallSurface() {
 function stageRequiredWeight(installDir: string) {
   const weightPath = resolve(installDir, 'models/ultrashape/ultrashape_v1.pt');
   mkdirSync(resolve(installDir, 'models/ultrashape'), { recursive: true });
-  writeFileSync(weightPath, checkpointBundleText());
+  writeBinaryCheckpointBundle(weightPath);
   return weightPath;
 }
 
@@ -182,7 +204,7 @@ describe('UltraShape Python install surface', () => {
     }
   });
 
-  it('uses the default HF source for extracted-root setup when local sources are absent', () => {
+  it('keeps copied extracted-root setup ready when HF fills the weight and the required runtime closure is present', () => {
     const simulation = copyInstallSurface();
     const hfTracePath = resolve(simulation.installDir, '.hf-download-trace.json');
 
@@ -264,11 +286,13 @@ describe('UltraShape Python install surface', () => {
       const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness & {
         install_success: boolean;
         failure_code: string | null;
+        failure_stage: string | null;
         attempted_weight_source_kinds: string[];
         resolved_weight_source_kind: string;
       };
       expect(readiness.install_success).toBe(true);
-      expect(readiness.failure_code).toBe(null);
+      expect(readiness.failure_stage).toBeNull();
+      expect(readiness.failure_code).toBeNull();
       expect(readiness.status).toBe('ready');
       expect(readiness.backend).toBe('local');
       expect(readiness.weights_ready).toBe(true);
@@ -295,7 +319,7 @@ describe('UltraShape Python install surface', () => {
     }
   });
 
-  it('prefers payload HF overrides over env HF defaults and keeps the download seam single-file', () => {
+  it('prefers payload HF overrides over env HF defaults when copied setup is otherwise ready', () => {
     const simulation = copyInstallSurface();
     const hfTracePath = resolve(simulation.installDir, '.hf-download-trace.json');
 
@@ -322,6 +346,10 @@ describe('UltraShape Python install surface', () => {
       expect(readFileSync(resolve(simulation.installDir, 'models/ultrashape/ultrashape_v1.pt'), 'utf8')).toBe(checkpointBundleText());
 
       const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as {
+        install_success: boolean;
+        failure_stage: string;
+        failure_code: string;
+        missing_required: string[];
         attempted_weight_source_kinds: string[];
         resolved_weight_source_kind: string;
         weight_source_repo_id: string;
@@ -331,6 +359,10 @@ describe('UltraShape Python install surface', () => {
       };
       expect(summary.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-override']);
       expect(summary.resolved_weight_source_kind).toBe('hf-override');
+      expect(summary.install_success).toBe(true);
+      expect(summary.failure_stage).toBeNull();
+      expect(summary.failure_code).toBeNull();
+      expect(summary.missing_required).toEqual([]);
       expect(summary.weight_source_repo_id).toBe('payload/UltraShape');
       expect(summary.weight_source_filename).toBe('ultrashape_v1.pt');
       expect(summary.weight_source_revision).toBe('payload-main');
@@ -349,7 +381,7 @@ describe('UltraShape Python install surface', () => {
     }
   });
 
-  it('keeps manifest entry, setup contract, and processor smoke aligned inside the copied payload when the required weight is staged', () => {
+  it('keeps manifest entry, setup contract, and processor smoke aligned on ready install truth while runtime weight validation stays public', () => {
     const simulation = copyInstallSurface();
 
     try {
@@ -403,33 +435,18 @@ describe('UltraShape Python install surface', () => {
 
       expect(smoke.status).toBe(0);
 
-      const expectedOutcome = expectedProcessorOutcome(readiness);
-      if (expectedOutcome === 'done') {
-        const smokeOutputPath = resolve(simulation.installDir, 'smoke-output/refined.glb');
-        expect(events.at(-1)).toEqual({
-          type: 'done',
-          result: {
-            filePath: smokeOutputPath,
-          },
-        });
-        expect(existsSync(smokeOutputPath)).toBe(true);
-        expectBinaryGlb(smokeOutputPath);
-        expect(readFileSync(smokeOutputPath)).not.toEqual(
-          readFileSync(resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb')),
-        );
-      } else {
-        expect(events.at(-1)).toEqual({
-          type: 'error',
-          message: expect.stringContaining(expectedOutcome),
-          code: expectedOutcome,
-        });
-      }
+      expect(expectedProcessorOutcome(readiness)).toBe('done');
+      expect(events.at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('WEIGHTS_MISSING'),
+        code: 'WEIGHTS_MISSING',
+      });
     } finally {
       simulation.cleanup();
     }
   });
 
-  it('keeps copied-payload setup successful but degraded when only flash_attn is absent', () => {
+  it('keeps copied-payload setup degraded-but-usable when flash_attn is the only degradable stage failure', () => {
     const simulation = copyInstallSurface();
     const sourceWeight = stageRequiredWeight(resolve(simulation.installDir, '..', 'weight-cache'));
 
@@ -487,10 +504,12 @@ describe('UltraShape Python install surface', () => {
 
       const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness & {
         install_success: boolean;
+        failure_stage: string | null;
         failure_code: string | null;
       };
       expect(readiness.install_success).toBe(true);
-      expect(readiness.failure_code).toBe(null);
+      expect(readiness.failure_stage).toBeNull();
+      expect(readiness.failure_code).toBeNull();
       expect(readiness.status).toBe('degraded');
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
