@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime, timezone
 from shutil import copy2, copytree, which
 import subprocess
@@ -252,7 +253,10 @@ def merge_native_install_summary(
     return summary
 
 
-def detect_cubvh_prerequisites() -> dict[str, object]:
+def detect_cubvh_prerequisites(profile: dict[str, str]) -> dict[str, object]:
+    expected_cuda_toolkit = resolve_expected_cuda_toolkit(profile)
+    preferred_cuda_root = expected_cuda_toolkit.get('root') if expected_cuda_toolkit.get('matched_profile') else None
+
     if os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS') == '1':
         missing_tokens = {
             token.strip()
@@ -263,7 +267,7 @@ def detect_cubvh_prerequisites() -> dict[str, object]:
             'host': 'linux-arm64',
             'git': 'git' not in missing_tokens,
             'compiler': None if 'compiler' in missing_tokens else 'g++',
-            'cuda': None if 'cuda' in missing_tokens else '/usr/local/cuda',
+            'cuda': None if 'cuda' in missing_tokens else preferred_cuda_root or '/usr/local/cuda',
             'eigen': None if 'eigen' in missing_tokens else '/usr/include/eigen3',
         }
     else:
@@ -272,7 +276,7 @@ def detect_cubvh_prerequisites() -> dict[str, object]:
         compiler = next((candidate for candidate in ('c++', 'g++', 'clang++') if which(candidate)), None)
         cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
         nvcc = which('nvcc')
-        cuda = cuda_home or (str(Path(nvcc).resolve().parent.parent) if nvcc else None)
+        cuda = preferred_cuda_root or cuda_home or (str(Path(nvcc).resolve().parent.parent) if nvcc else None)
         eigen_candidates = []
         env_eigen = os.environ.get('EIGEN3_INCLUDE_DIR')
         if env_eigen:
@@ -302,6 +306,7 @@ def detect_cubvh_prerequisites() -> dict[str, object]:
     return {
         'ok': not missing_prerequisites,
         'detected_prerequisites': detected,
+        'expected_cuda_toolkit': expected_cuda_toolkit,
         'missing_prerequisites': missing_prerequisites,
         'failure_message': None if not missing_prerequisites else CUBVH_PREREQUISITES_FAILURE_MESSAGE,
     }
@@ -316,6 +321,7 @@ def build_cubvh_prerequisite_blockers(prerequisite_probe: dict[str, object]) -> 
             'source': CUBVH_SOURCE,
             'pinned_ref': CUBVH_PINNED_REF,
             'build_isolation': False,
+            'cuda_toolkit': prerequisite_probe['expected_cuda_toolkit'],
             'detected_prerequisites': prerequisite_probe['detected_prerequisites'],
             'missing_prerequisites': prerequisite_probe['missing_prerequisites'],
             'failure_message': prerequisite_probe['failure_message'],
@@ -421,6 +427,79 @@ def normalize_numeric_token(raw: str | None) -> str | None:
     return ''.join(character for character in raw if character.isdigit()) or None
 
 
+def path_exists(path: str) -> bool:
+    test_roots = os.environ.get('ULTRASHAPE_SETUP_TEST_CUDA_ROOTS')
+    if test_roots is not None:
+        return path in {
+            candidate.strip()
+            for candidate in test_roots.split(os.pathsep)
+            if candidate.strip()
+        }
+    return Path(path).exists()
+
+
+def prepend_path_entries(existing: str | None, entries: list[str]) -> str:
+    normalized_entries = [entry for entry in entries if entry]
+    existing_entries = [entry for entry in (existing or '').split(os.pathsep) if entry]
+    combined = []
+
+    for entry in [*normalized_entries, *existing_entries]:
+        if entry not in combined:
+            combined.append(entry)
+
+    return os.pathsep.join(combined)
+
+
+def extract_cuda_tag(torch_requirement: str) -> str | None:
+    match = re.search(r'\+cu(\d+)', torch_requirement)
+    return match.group(1) if match else None
+
+
+def cuda_tag_to_version(cuda_tag: str) -> str | None:
+    if len(cuda_tag) < 2:
+        return None
+    return f'{int(cuda_tag[:-1])}.{cuda_tag[-1]}'
+
+
+def resolve_expected_cuda_toolkit(profile: dict[str, str]) -> dict[str, object]:
+    cuda_tag = extract_cuda_tag(profile.get('torch', ''))
+    expected_version = cuda_tag_to_version(cuda_tag) if cuda_tag else None
+    candidate_roots = [f'/usr/local/cuda-{expected_version}'] if expected_version else []
+    selected_root = next((candidate for candidate in candidate_roots if path_exists(candidate)), None)
+
+    return {
+        'torch_requirement': profile.get('torch'),
+        'cuda_tag': cuda_tag,
+        'expected_version': expected_version,
+        'candidate_roots': candidate_roots,
+        'root': selected_root,
+        'matched_profile': selected_root is not None,
+    }
+
+
+def build_cuda_environment(root: str | None) -> tuple[dict[str, str], dict[str, str]]:
+    environment = os.environ.copy()
+    if not root:
+        return environment, {}
+
+    bin_path = str(Path(root) / 'bin')
+    library_paths = [str(Path(root) / 'lib64'), str(Path(root) / 'lib')]
+
+    environment['CUDA_HOME'] = root
+    environment['CUDA_PATH'] = root
+    environment['PATH'] = prepend_path_entries(environment.get('PATH'), [bin_path])
+    environment['LD_LIBRARY_PATH'] = prepend_path_entries(environment.get('LD_LIBRARY_PATH'), library_paths)
+    environment['LIBRARY_PATH'] = prepend_path_entries(environment.get('LIBRARY_PATH'), library_paths)
+
+    return environment, {
+        'CUDA_HOME': environment['CUDA_HOME'],
+        'CUDA_PATH': environment['CUDA_PATH'],
+        'PATH': environment['PATH'],
+        'LD_LIBRARY_PATH': environment['LD_LIBRARY_PATH'],
+        'LIBRARY_PATH': environment['LIBRARY_PATH'],
+    }
+
+
 def select_torch_profile(context: dict[str, str]) -> dict[str, str]:
     gpu_sm = int(normalize_numeric_token(context['gpu_sm']) or '0')
     cuda_version = int(normalize_numeric_token(context.get('cuda_version')) or '128')
@@ -520,6 +599,7 @@ def build_cubvh_stage_summary(
     attempted: bool,
     status: str,
     commands: list[str],
+    cuda_toolkit: dict[str, object],
     import_smoke_missing: list[str] | None = None,
     failure_message: str | None = None,
 ) -> dict[str, object]:
@@ -531,6 +611,7 @@ def build_cubvh_stage_summary(
         'pinned_ref': CUBVH_PINNED_REF,
         'build_isolation': False,
         'commands': commands,
+        'cuda_toolkit': cuda_toolkit,
         'import_smoke_missing': import_smoke_missing or [],
         'failure_message': failure_message,
     }
@@ -576,10 +657,16 @@ def build_flash_attn_stage_summary(
     }
 
 
-def install_cubvh_stage(venv_dir: Path, ext_dir: str) -> tuple[dict[str, object], dict[str, object] | None]:
+def install_cubvh_stage(venv_dir: Path, ext_dir: str, profile: dict[str, str]) -> tuple[dict[str, object], dict[str, object] | None]:
     venv_python = get_venv_python(venv_dir)
     command = [str(venv_python), '-m', 'pip', 'install', '--no-build-isolation', CUBVH_SOURCE]
     rendered_command = render_command(command)
+    cuda_toolkit = resolve_expected_cuda_toolkit(profile)
+    stage_environment, environment_overrides = build_cuda_environment(cuda_toolkit.get('root'))
+    stage_cuda_toolkit = {
+        **cuda_toolkit,
+        'environment_overrides': environment_overrides,
+    }
 
     if os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS') == '1':
         missing = {
@@ -592,7 +679,7 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: str) -> tuple[dict[str, object]
             site_packages.mkdir(parents=True, exist_ok=True)
             create_stub_package(site_packages, 'cubvh')
     else:
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, env=stage_environment)
 
     import_smoke_missing = run_import_smoke(venv_dir, ext_dir, ['cubvh'])
     if import_smoke_missing:
@@ -600,6 +687,7 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: str) -> tuple[dict[str, object]
             attempted=True,
             status='blocked',
             commands=[rendered_command],
+            cuda_toolkit=stage_cuda_toolkit,
             import_smoke_missing=import_smoke_missing,
             failure_message=CUBVH_IMPORT_FAILURE_MESSAGE,
         )
@@ -610,6 +698,7 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: str) -> tuple[dict[str, object]
             attempted=True,
             status='ready',
             commands=[rendered_command],
+            cuda_toolkit=stage_cuda_toolkit,
         ),
         None,
     )
@@ -1136,7 +1225,7 @@ def main() -> int:
     venv_dir = ensure_venv(context['ext_dir'])
     dependency_install = install_required_dependencies(venv_dir, profile)
     ensure_runtime_layout(context['ext_dir'])
-    cubvh_prerequisites = detect_cubvh_prerequisites()
+    cubvh_prerequisites = detect_cubvh_prerequisites(profile)
     if not cubvh_prerequisites['ok']:
         native_install_override, health_override = build_cubvh_prerequisite_blockers(cubvh_prerequisites)
         print(CUBVH_PREREQUISITES_FAILURE_MESSAGE, file=sys.stderr)
@@ -1153,7 +1242,7 @@ def main() -> int:
             health_override,
         )
         return 1
-    cubvh_stage_summary, cubvh_stage_failure = install_cubvh_stage(venv_dir, context['ext_dir'])
+    cubvh_stage_summary, cubvh_stage_failure = install_cubvh_stage(venv_dir, context['ext_dir'], profile)
     if cubvh_stage_failure is not None:
         native_install_override, health_override = cubvh_stage_failure
         print(CUBVH_IMPORT_FAILURE_MESSAGE, file=sys.stderr)

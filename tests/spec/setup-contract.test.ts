@@ -23,6 +23,15 @@ type NativeInstallStage = {
   pinned_ref?: string;
   build_isolation?: boolean;
   commands?: string[];
+  cuda_toolkit?: {
+    torch_requirement?: string;
+    cuda_tag?: string | null;
+    expected_version?: string | null;
+    candidate_roots?: string[];
+    root?: string | null;
+    matched_profile?: boolean;
+    environment_overrides?: Record<string, string>;
+  };
   missing_prerequisites?: string[];
   detected_prerequisites?: Record<string, unknown>;
   import_smoke_missing?: string[];
@@ -143,7 +152,7 @@ describe('UltraShape setup.py contract', () => {
           host: 'linux-arm64',
           git: true,
           compiler: 'g++',
-          cuda: '/usr/local/cuda',
+          cuda: '/usr/local/cuda-12.8',
           eigen: null,
         },
       },
@@ -399,6 +408,58 @@ describe('UltraShape setup.py contract', () => {
       expect(readiness.required_imports_ok).toBe(true);
       expect(readiness.missing_required).toEqual([]);
       expect(existsSync(weightPath)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('pins cubvh to the CUDA toolkit derived from the selected torch profile even when host CUDA env points elsewhere', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-cuda-toolkit-'));
+    const installDir = join(root, 'extension-root');
+    const weightPath = join(installDir, 'models', 'ultrashape', 'ultrashape_v1.pt');
+    mkdirSync(join(installDir, 'models', 'ultrashape'), { recursive: true });
+    writeFileSync(weightPath, 'test-weight');
+
+    try {
+      const outcome = runSetupWithEnv({
+        python_exe: 'python3',
+        ext_dir: installDir,
+        gpu_sm: 90,
+        cuda_version: 12.8,
+      }, {
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        ULTRASHAPE_SETUP_TEST_CUDA_ROOTS: ['/usr/local/cuda-12.8', '/usr/local/cuda-13.0'].join(':'),
+        CUDA_HOME: '/usr/local/cuda-13.0',
+        CUDA_PATH: '/usr/local/cuda-13.0',
+        PATH: ['/usr/local/cuda-13.0/bin', '/usr/bin'].join(':'),
+        LD_LIBRARY_PATH: '/usr/local/cuda-13.0/lib64',
+        LIBRARY_PATH: '/usr/local/cuda-13.0/lib64',
+      });
+
+      expect(outcome.status).toBe(0);
+
+      const { summary } = readSetupArtifacts(installDir);
+      expect(summary.native_install.cubvh.cuda_toolkit).toMatchObject({
+        torch_requirement: 'torch==2.7.0+cu128',
+        cuda_tag: '128',
+        expected_version: '12.8',
+        candidate_roots: ['/usr/local/cuda-12.8'],
+        root: '/usr/local/cuda-12.8',
+        matched_profile: true,
+      });
+      expect(summary.native_install.cubvh.cuda_toolkit?.environment_overrides).toMatchObject({
+        CUDA_HOME: '/usr/local/cuda-12.8',
+        CUDA_PATH: '/usr/local/cuda-12.8',
+      });
+      expect(summary.native_install.cubvh.cuda_toolkit?.environment_overrides?.PATH).toBe(
+        ['/usr/local/cuda-12.8/bin', '/usr/local/cuda-13.0/bin', '/usr/bin'].join(':'),
+      );
+      expect(summary.native_install.cubvh.cuda_toolkit?.environment_overrides?.LD_LIBRARY_PATH).toBe(
+        ['/usr/local/cuda-12.8/lib64', '/usr/local/cuda-12.8/lib', '/usr/local/cuda-13.0/lib64'].join(':'),
+      );
+      expect(summary.native_install.cubvh.cuda_toolkit?.environment_overrides?.LIBRARY_PATH).toBe(
+        ['/usr/local/cuda-12.8/lib64', '/usr/local/cuda-12.8/lib', '/usr/local/cuda-13.0/lib64'].join(':'),
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
