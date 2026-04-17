@@ -1,7 +1,7 @@
 import json
 import os
 from datetime import datetime, timezone
-from shutil import copy2, copytree
+from shutil import copy2, copytree, which
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +9,7 @@ from venv import EnvBuilder
 
 
 REQUIRED_STRING_KEYS = ('python_exe', 'ext_dir')
-INSTALL_DEPENDENCIES = [
+CORE_DEPENDENCIES = [
     'torch==2.7.0+cu128',
     'torchvision==0.22.0',
     'numpy',
@@ -23,13 +23,13 @@ INSTALL_DEPENDENCIES = [
     'transformers',
     'huggingface_hub',
     'accelerate',
-    'cubvh',
     'rembg',
     'onnxruntime',
     'safetensors',
     'tqdm',
-    'flash_attn',
 ]
+CUBVH_PINNED_REF = '7855c000f95e43742081060d869702b2b2b33d1f'
+CUBVH_SOURCE = f'git+https://github.com/ashawkey/cubvh@{CUBVH_PINNED_REF}'
 REQUIRED_DEPENDENCIES = [
     'torch==2.7.0+cu128',
     'torchvision==0.22.0',
@@ -57,6 +57,11 @@ DEFAULT_WEIGHT_REPO_ID = 'infinith/UltraShape'
 RUNTIME_LAYOUT_VERSION = '1'
 WEIGHT_FAILURE_CODE = 'WEIGHT_ACQUISITION_FAILED'
 IMPORT_FAILURE_CODE = 'REQUIRED_IMPORT_SMOKE_FAILED'
+CUBVH_PREREQUISITES_FAILURE_CODE = 'CUBVH_PREREQUISITES_MISSING'
+CUBVH_PREREQUISITES_FAILURE_MESSAGE = 'cubvh source build requires Linux ARM64 with git, compiler toolchain, CUDA build tooling, and Eigen headers available.'
+CUBVH_IMPORT_FAILURE_CODE = 'CUBVH_IMPORT_SMOKE_FAILED'
+CUBVH_IMPORT_FAILURE_MESSAGE = 'cubvh build completed but import smoke failed; local install cannot continue without cubvh.'
+FLASH_ATTN_FAILURE_MESSAGE = 'flash_attn install failed; continuing with degraded PyTorch SDPA fallback.'
 REQUIRED_IMPORT_MODULES = [
     'torch',
     'torchvision',
@@ -75,6 +80,7 @@ REQUIRED_IMPORT_MODULES = [
     'safetensors',
     'tqdm',
 ]
+CORE_REQUIRED_IMPORT_MODULES = [module for module in REQUIRED_IMPORT_MODULES if module != 'cubvh']
 CONDITIONAL_IMPORT_MODULES = ['rembg', 'onnxruntime']
 DEGRADABLE_IMPORT_MODULES = ['flash_attn']
 PACKAGE_STUBS = {
@@ -184,6 +190,152 @@ HF_NETWORK_ERROR_CLASSES = {
     'ProxyError',
     'ChunkedEncodingError',
 }
+
+
+def build_native_install_contract() -> dict[str, object]:
+    return {
+        'order': ['core', 'cubvh', 'flash_attn'],
+        'cubvh_required': True,
+        'flash_attn_optional': True,
+    }
+
+
+def build_native_install_summary(dependency_install: dict[str, object]) -> dict[str, object]:
+    return {
+        'core': {
+            'status': 'ready',
+            'attempted': True,
+            'commands': list(dependency_install.get('commands', [])),
+            'installed_modules': list(dependency_install.get('installed_required_modules', [])),
+        },
+        'cubvh': {
+            'status': 'pending',
+            'attempted': False,
+            'required': True,
+            'source': CUBVH_SOURCE,
+            'pinned_ref': CUBVH_PINNED_REF,
+            'build_isolation': False,
+        },
+        'flash_attn': {
+            'status': 'pending',
+            'attempted': False,
+            'required': False,
+            'degradable': True,
+        },
+    }
+
+
+def create_stub_package(site_packages: Path, module: str) -> None:
+    package_dir = site_packages / module
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / '__init__.py').write_text(PACKAGE_STUBS[module], encoding='utf8')
+
+
+def render_command(command: list[str]) -> str:
+    return ' '.join(command)
+
+
+def merge_native_install_summary(
+    dependency_install: dict[str, object],
+    native_install_override: dict[str, object] | None = None,
+) -> dict[str, object]:
+    summary = build_native_install_summary(dependency_install)
+    if not native_install_override:
+        return summary
+
+    for stage, stage_override in native_install_override.items():
+        if stage in summary and isinstance(summary[stage], dict) and isinstance(stage_override, dict):
+            summary[stage].update(stage_override)
+        else:
+            summary[stage] = stage_override
+
+    return summary
+
+
+def detect_cubvh_prerequisites() -> dict[str, object]:
+    if os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS') == '1':
+        missing_tokens = {
+            token.strip()
+            for token in os.environ.get('ULTRASHAPE_SETUP_TEST_CUBVH_PREREQ_MISSING', '').split(',')
+            if token.strip()
+        }
+        detected = {
+            'host': 'linux-arm64',
+            'git': 'git' not in missing_tokens,
+            'compiler': None if 'compiler' in missing_tokens else 'g++',
+            'cuda': None if 'cuda' in missing_tokens else '/usr/local/cuda',
+            'eigen': None if 'eigen' in missing_tokens else '/usr/include/eigen3',
+        }
+    else:
+        machine = os.uname().machine.lower()
+        is_linux_arm64 = sys.platform == 'linux' and machine in {'aarch64', 'arm64'}
+        compiler = next((candidate for candidate in ('c++', 'g++', 'clang++') if which(candidate)), None)
+        cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+        nvcc = which('nvcc')
+        cuda = cuda_home or (str(Path(nvcc).resolve().parent.parent) if nvcc else None)
+        eigen_candidates = []
+        env_eigen = os.environ.get('EIGEN3_INCLUDE_DIR')
+        if env_eigen:
+            eigen_candidates.append(Path(env_eigen))
+        eigen_candidates.extend([Path('/usr/include/eigen3'), Path('/usr/local/include/eigen3')])
+        eigen = next((str(candidate) for candidate in eigen_candidates if (candidate / 'Eigen' / 'Core').is_file()), None)
+        detected = {
+            'host': 'linux-arm64' if is_linux_arm64 else f'{sys.platform}-{machine}',
+            'git': which('git') is not None,
+            'compiler': compiler,
+            'cuda': cuda,
+            'eigen': eigen,
+        }
+
+    missing_prerequisites = []
+    if detected['host'] != 'linux-arm64':
+        missing_prerequisites.append('linux-arm64')
+    if not detected['git']:
+        missing_prerequisites.append('git')
+    if not detected['compiler']:
+        missing_prerequisites.append('compiler-toolchain')
+    if not detected['cuda']:
+        missing_prerequisites.append('cuda-build-tooling')
+    if not detected['eigen']:
+        missing_prerequisites.append('eigen-headers')
+
+    return {
+        'ok': not missing_prerequisites,
+        'detected_prerequisites': detected,
+        'missing_prerequisites': missing_prerequisites,
+        'failure_message': None if not missing_prerequisites else CUBVH_PREREQUISITES_FAILURE_MESSAGE,
+    }
+
+
+def build_cubvh_prerequisite_blockers(prerequisite_probe: dict[str, object]) -> tuple[dict[str, object], dict[str, object]]:
+    native_install_override = {
+        'cubvh': {
+            'status': 'blocked',
+            'attempted': False,
+            'required': True,
+            'source': CUBVH_SOURCE,
+            'pinned_ref': CUBVH_PINNED_REF,
+            'build_isolation': False,
+            'detected_prerequisites': prerequisite_probe['detected_prerequisites'],
+            'missing_prerequisites': prerequisite_probe['missing_prerequisites'],
+            'failure_message': prerequisite_probe['failure_message'],
+        },
+    }
+    health_override = {
+        'missing_weights': [],
+        'missing_runtime_files': [],
+        'missing_required': ['native-stage:cubvh'],
+        'missing_optional': [],
+        'missing_conditional': [],
+        'missing_degradable': [],
+        'failure_stage': 'cubvh-prerequisites',
+        'failure_code': CUBVH_PREREQUISITES_FAILURE_CODE,
+        'failure_detail': prerequisite_probe['failure_message'],
+        'install_success': False,
+        'status': 'blocked',
+        'required_import_failures': [],
+    }
+    return native_install_override, health_override
 
 
 def parse_args(argv: list[str]) -> dict[str, object]:
@@ -311,20 +463,16 @@ def install_stub_packages(venv_dir: Path) -> dict[str, object]:
     site_packages.mkdir(parents=True, exist_ok=True)
 
     installed_required = []
-    for module in REQUIRED_IMPORT_MODULES:
+    for module in CORE_REQUIRED_IMPORT_MODULES:
         if module in missing:
             continue
-        package_dir = site_packages / module
-        package_dir.mkdir(parents=True, exist_ok=True)
-        (package_dir / '__init__.py').write_text(PACKAGE_STUBS[module], encoding='utf8')
+        create_stub_package(site_packages, module)
         installed_required.append(module)
 
-    for module in [*CONDITIONAL_IMPORT_MODULES, *DEGRADABLE_IMPORT_MODULES]:
+    for module in CONDITIONAL_IMPORT_MODULES:
         if module in missing:
             continue
-        package_dir = site_packages / module
-        package_dir.mkdir(parents=True, exist_ok=True)
-        (package_dir / '__init__.py').write_text(PACKAGE_STUBS[module], encoding='utf8')
+        create_stub_package(site_packages, module)
 
     return {
         'mode': 'stub',
@@ -350,21 +498,163 @@ def install_required_dependencies(venv_dir: Path, profile: dict[str, str]) -> di
             'https://download.pytorch.org/whl/cu128',
             profile['torch'],
             profile['torchvision'],
-            *[dependency for dependency in INSTALL_DEPENDENCIES if dependency not in {profile['torch'], profile['torchvision']}],
+            *[dependency for dependency in CORE_DEPENDENCIES if dependency not in {profile['torch'], profile['torchvision']}],
         ],
     ]
 
     rendered_commands = []
     for command in pip_commands:
-        rendered_commands.append(' '.join(command))
+        rendered_commands.append(render_command(command))
         subprocess.run(command, check=True)
 
     return {
         'mode': 'pip',
-        'installed_required_modules': [*REQUIRED_IMPORT_MODULES, *CONDITIONAL_IMPORT_MODULES, *DEGRADABLE_IMPORT_MODULES],
+        'installed_required_modules': [*CORE_REQUIRED_IMPORT_MODULES, *CONDITIONAL_IMPORT_MODULES],
         'missing_stubbed_modules': [],
         'commands': rendered_commands,
     }
+
+
+def build_cubvh_stage_summary(
+    *,
+    attempted: bool,
+    status: str,
+    commands: list[str],
+    import_smoke_missing: list[str] | None = None,
+    failure_message: str | None = None,
+) -> dict[str, object]:
+    return {
+        'attempted': attempted,
+        'required': True,
+        'status': status,
+        'source': CUBVH_SOURCE,
+        'pinned_ref': CUBVH_PINNED_REF,
+        'build_isolation': False,
+        'commands': commands,
+        'import_smoke_missing': import_smoke_missing or [],
+        'failure_message': failure_message,
+    }
+
+
+def build_cubvh_import_failure(overrides: dict[str, object]) -> tuple[dict[str, object], dict[str, object]]:
+    return (
+        {'cubvh': overrides},
+        {
+            'missing_weights': [],
+            'missing_runtime_files': [],
+            'missing_required': ['import:cubvh'],
+            'missing_optional': [],
+            'missing_conditional': [],
+            'missing_degradable': [],
+            'failure_stage': 'cubvh-import-smoke',
+            'failure_code': CUBVH_IMPORT_FAILURE_CODE,
+            'failure_detail': CUBVH_IMPORT_FAILURE_MESSAGE,
+            'install_success': False,
+            'status': 'blocked',
+            'required_import_failures': ['cubvh'],
+        },
+    )
+
+
+def build_flash_attn_stage_summary(
+    *,
+    attempted: bool,
+    status: str,
+    commands: list[str],
+    import_smoke_missing: list[str] | None = None,
+    failure_message: str | None = None,
+) -> dict[str, object]:
+    return {
+        'attempted': attempted,
+        'required': False,
+        'degradable': True,
+        'status': status,
+        'commands': commands,
+        'build_isolation': False,
+        'import_smoke_missing': import_smoke_missing or [],
+        'failure_message': failure_message,
+    }
+
+
+def install_cubvh_stage(venv_dir: Path, ext_dir: str) -> tuple[dict[str, object], dict[str, object] | None]:
+    venv_python = get_venv_python(venv_dir)
+    command = [str(venv_python), '-m', 'pip', 'install', '--no-build-isolation', CUBVH_SOURCE]
+    rendered_command = render_command(command)
+
+    if os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS') == '1':
+        missing = {
+            module.strip()
+            for module in os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS_MISSING', '').split(',')
+            if module.strip()
+        }
+        if 'cubvh' not in missing:
+            site_packages = get_venv_site_packages(venv_dir)
+            site_packages.mkdir(parents=True, exist_ok=True)
+            create_stub_package(site_packages, 'cubvh')
+    else:
+        subprocess.run(command, check=True)
+
+    import_smoke_missing = run_import_smoke(venv_dir, ext_dir, ['cubvh'])
+    if import_smoke_missing:
+        stage_summary = build_cubvh_stage_summary(
+            attempted=True,
+            status='blocked',
+            commands=[rendered_command],
+            import_smoke_missing=import_smoke_missing,
+            failure_message=CUBVH_IMPORT_FAILURE_MESSAGE,
+        )
+        return stage_summary, build_cubvh_import_failure(stage_summary)
+
+    return (
+        build_cubvh_stage_summary(
+            attempted=True,
+            status='ready',
+            commands=[rendered_command],
+        ),
+        None,
+    )
+
+
+def install_flash_attn_stage(venv_dir: Path, ext_dir: str) -> dict[str, object]:
+    venv_python = get_venv_python(venv_dir)
+    command = [str(venv_python), '-m', 'pip', 'install', '--no-build-isolation', 'flash-attn']
+    rendered_command = render_command(command)
+
+    if os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS') == '1':
+        fail_mode = os.environ.get('ULTRASHAPE_SETUP_TEST_FLASH_ATTN_STAGE_FAIL')
+        if fail_mode != 'install':
+            site_packages = get_venv_site_packages(venv_dir)
+            site_packages.mkdir(parents=True, exist_ok=True)
+            create_stub_package(site_packages, 'flash_attn')
+    else:
+        try:
+            subprocess.run(command, check=True)
+        except subprocess.CalledProcessError:
+            print(FLASH_ATTN_FAILURE_MESSAGE, file=sys.stderr)
+            return build_flash_attn_stage_summary(
+                attempted=True,
+                status='degraded',
+                commands=[rendered_command],
+                import_smoke_missing=['flash_attn'],
+                failure_message=FLASH_ATTN_FAILURE_MESSAGE,
+            )
+
+    import_smoke_missing = run_import_smoke(venv_dir, ext_dir, ['flash_attn'])
+    if import_smoke_missing:
+        print(FLASH_ATTN_FAILURE_MESSAGE, file=sys.stderr)
+        return build_flash_attn_stage_summary(
+            attempted=True,
+            status='degraded',
+            commands=[rendered_command],
+            import_smoke_missing=import_smoke_missing,
+            failure_message=FLASH_ATTN_FAILURE_MESSAGE,
+        )
+
+    return build_flash_attn_stage_summary(
+        attempted=True,
+        status='ready',
+        commands=[rendered_command],
+    )
 
 
 def copy_required_weight(source_path: Path, target_path: Path) -> bool:
@@ -607,16 +897,42 @@ def acquire_required_weight(ext_dir: str, payload: dict[str, object], venv_dir: 
     return build_result(False, None)
 
 
+def build_unattempted_weight_result(ext_dir: str) -> dict[str, object]:
+    target_path = str(Path(ext_dir) / WEIGHT_RELATIVE_PATH)
+    return {
+        'acquired': False,
+        'target_path': target_path,
+        'attempted_source_kinds': [],
+        'attempted_sources': [],
+        'resolved_source_kind': None,
+        'resolved_source': None,
+        'weight_source_repo_id': None,
+        'weight_source_filename': WEIGHT_FILENAME,
+        'weight_source_revision': None,
+        'weight_source_auth_used': None,
+        'failure_classification': None,
+        'error_class': None,
+        'error_message': None,
+    }
+
+
 def run_import_smoke(venv_dir: Path, ext_dir: str, modules: list[str]) -> list[str]:
     venv_python = get_venv_python(venv_dir)
     script_lines = [
         'import importlib',
         'import json',
+        'import os',
         'import sys',
         f'sys.path.insert(0, {str(Path(ext_dir) / "runtime")!r})',
         f'modules = {modules!r}',
         'missing = []',
         'for module in modules:',
+        '    if module == "cubvh" and os.environ.get("ULTRASHAPE_SETUP_TEST_CUBVH_IMPORT_FAIL") == "1":',
+        '        missing.append(module)',
+        '        continue',
+        '    if module == "flash_attn" and os.environ.get("ULTRASHAPE_SETUP_TEST_FLASH_ATTN_STAGE_FAIL") == "import":',
+        '        missing.append(module)',
+        '        continue',
         '    try:',
         '        importlib.import_module(module)',
         '    except Exception:',
@@ -654,6 +970,7 @@ def build_summary(context: dict[str, str], profile: dict[str, str]) -> dict[str,
             'conditional': CONDITIONAL_DEPENDENCIES,
             'degradable': DEGRADABLE_DEPENDENCIES,
         },
+        'native_install_contract': build_native_install_contract(),
         'runtime_assets': {
             'required_files': REQUIRED_RUNTIME_FILES,
             'required_weights': EXPECTED_WEIGHTS,
@@ -674,7 +991,11 @@ def collect_install_health(
     required_import_failures: list[str],
     conditional_import_failures: list[str],
     degradable_import_failures: list[str],
+    health_override: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    if health_override is not None:
+        return health_override
+
     install_root = Path(ext_dir)
     missing_weights = [weight for weight in EXPECTED_WEIGHTS if not (install_root / weight).is_file()]
     missing_runtime_files = list_missing_runtime_files(ext_dir)
@@ -773,15 +1094,24 @@ def write_summary(
     required_import_failures: list[str],
     conditional_import_failures: list[str],
     degradable_import_failures: list[str],
+    native_install_override: dict[str, object] | None = None,
+    health_override: dict[str, object] | None = None,
 ) -> None:
     summary_path = Path(ext_dir) / '.setup-summary.json'
     readiness_path = Path(ext_dir) / '.runtime-readiness.json'
     profile = select_torch_profile(context)
     ensure_runtime_layout(ext_dir)
     summary = build_summary(context, profile)
-    health = collect_install_health(ext_dir, required_import_failures, conditional_import_failures, degradable_import_failures)
+    health = collect_install_health(
+        ext_dir,
+        required_import_failures,
+        conditional_import_failures,
+        degradable_import_failures,
+        health_override,
+    )
     summary.update({
         'dependency_install': dependency_install,
+        'native_install': merge_native_install_summary(dependency_install, native_install_override),
         'install_success': health['install_success'],
         'failure_stage': health['failure_stage'],
         'failure_code': health['failure_code'],
@@ -806,8 +1136,43 @@ def main() -> int:
     venv_dir = ensure_venv(context['ext_dir'])
     dependency_install = install_required_dependencies(venv_dir, profile)
     ensure_runtime_layout(context['ext_dir'])
+    cubvh_prerequisites = detect_cubvh_prerequisites()
+    if not cubvh_prerequisites['ok']:
+        native_install_override, health_override = build_cubvh_prerequisite_blockers(cubvh_prerequisites)
+        print(CUBVH_PREREQUISITES_FAILURE_MESSAGE, file=sys.stderr)
+        write_summary(
+            context['ext_dir'],
+            context,
+            payload,
+            dependency_install,
+            build_unattempted_weight_result(context['ext_dir']),
+            [],
+            [],
+            [],
+            native_install_override,
+            health_override,
+        )
+        return 1
+    cubvh_stage_summary, cubvh_stage_failure = install_cubvh_stage(venv_dir, context['ext_dir'])
+    if cubvh_stage_failure is not None:
+        native_install_override, health_override = cubvh_stage_failure
+        print(CUBVH_IMPORT_FAILURE_MESSAGE, file=sys.stderr)
+        write_summary(
+            context['ext_dir'],
+            context,
+            payload,
+            dependency_install,
+            build_unattempted_weight_result(context['ext_dir']),
+            [],
+            [],
+            [],
+            native_install_override,
+            health_override,
+        )
+        return 1
+    flash_attn_stage_summary = install_flash_attn_stage(venv_dir, context['ext_dir'])
     weight_result = acquire_required_weight(context['ext_dir'], payload, venv_dir)
-    required_import_failures = run_import_smoke(venv_dir, context['ext_dir'], REQUIRED_IMPORT_MODULES + ['ultrashape_runtime'])
+    required_import_failures = run_import_smoke(venv_dir, context['ext_dir'], CORE_REQUIRED_IMPORT_MODULES + ['ultrashape_runtime'])
     conditional_import_failures = run_import_smoke(venv_dir, context['ext_dir'], CONDITIONAL_IMPORT_MODULES)
     degradable_import_failures = run_import_smoke(venv_dir, context['ext_dir'], DEGRADABLE_IMPORT_MODULES)
     write_summary(
@@ -819,6 +1184,7 @@ def main() -> int:
         required_import_failures,
         conditional_import_failures,
         degradable_import_failures,
+        {'cubvh': cubvh_stage_summary, 'flash_attn': flash_attn_stage_summary},
     )
     return 0
 

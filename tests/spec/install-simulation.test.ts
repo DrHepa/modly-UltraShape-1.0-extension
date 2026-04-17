@@ -60,6 +60,39 @@ type HfTrace = {
   token: string | null;
 };
 
+type NativeStageSummary = {
+  attempted: boolean;
+  status: 'ready' | 'degraded' | 'blocked' | 'pending' | 'skipped';
+  required?: boolean;
+  degradable?: boolean;
+  source?: string;
+  pinned_ref?: string;
+  build_isolation?: boolean;
+  commands?: string[];
+  import_smoke_missing?: string[];
+  failure_message?: string | null;
+};
+
+type SetupSummary = {
+  torch_profile: string;
+  runtime_layout_version: string;
+  install_success: boolean;
+  attempted_weight_source_kinds: string[];
+  resolved_weight_source_kind: string;
+  weight_source_repo_id: string;
+  weight_source_filename: string;
+  native_install_contract: {
+    order: string[];
+    cubvh_required: boolean;
+    flash_attn_optional: boolean;
+  };
+  native_install: {
+    core: NativeStageSummary & { installed_modules?: string[] };
+    cubvh: NativeStageSummary;
+    flash_attn: NativeStageSummary;
+  };
+};
+
 function expectBinaryGlb(path: string) {
   const payload = readFileSync(path);
   expect(payload.subarray(0, 4).toString('ascii')).toBe('glTF');
@@ -183,15 +216,7 @@ describe('UltraShape Python install surface', () => {
       expect(existsSync(resolve(simulation.installDir, 'runtime/ultrashape_runtime/models/autoencoders/surface_extractors.py'))).toBe(true);
       expect(existsSync(resolve(simulation.installDir, 'runtime/.locks'))).toBe(true);
 
-      const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as {
-        torch_profile: string;
-        runtime_layout_version: string;
-        install_success: boolean;
-        attempted_weight_source_kinds: string[];
-        resolved_weight_source_kind: string;
-        weight_source_repo_id: string;
-        weight_source_filename: string;
-      };
+      const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as SetupSummary;
       expect(summary.torch_profile).toBe('linux-arm64-cu128-sm90+');
       expect(summary.runtime_layout_version).toBe('1');
       expect(summary.install_success).toBe(true);
@@ -199,6 +224,42 @@ describe('UltraShape Python install surface', () => {
       expect(summary.resolved_weight_source_kind).toBe('hf-default');
       expect(summary.weight_source_repo_id).toBe('infinith/UltraShape');
       expect(summary.weight_source_filename).toBe('ultrashape_v1.pt');
+      expect(summary.native_install_contract).toEqual({
+        order: ['core', 'cubvh', 'flash_attn'],
+        cubvh_required: true,
+        flash_attn_optional: true,
+      });
+      expect(summary.native_install).toMatchObject({
+        core: {
+          attempted: true,
+          status: 'ready',
+        },
+        cubvh: {
+          attempted: true,
+          required: true,
+          status: 'ready',
+          source: 'git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f',
+          pinned_ref: '7855c000f95e43742081060d869702b2b2b33d1f',
+          build_isolation: false,
+          import_smoke_missing: [],
+          failure_message: null,
+        },
+        flash_attn: {
+          attempted: true,
+          required: false,
+          degradable: true,
+          status: 'ready',
+          build_isolation: false,
+          import_smoke_missing: [],
+          failure_message: null,
+        },
+      });
+      expect(summary.native_install.cubvh.commands).toEqual([
+        expect.stringContaining('--no-build-isolation'),
+      ]);
+      expect(summary.native_install.flash_attn.commands).toEqual([
+        expect.stringContaining('--no-build-isolation flash-attn'),
+      ]);
 
       const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness & {
         install_success: boolean;
@@ -363,6 +424,80 @@ describe('UltraShape Python install surface', () => {
           code: expectedOutcome,
         });
       }
+    } finally {
+      simulation.cleanup();
+    }
+  });
+
+  it('keeps copied-payload setup successful but degraded when only flash_attn is absent', () => {
+    const simulation = copyInstallSurface();
+    const sourceWeight = stageRequiredWeight(resolve(simulation.installDir, '..', 'weight-cache'));
+
+    try {
+      const outcome = spawnSync('python3', ['setup.py', JSON.stringify({
+        python_exe: 'python3',
+        ext_dir: simulation.installDir,
+        gpu_sm: '90',
+        required_weight_path: sourceWeight,
+      })], {
+        cwd: simulation.installDir,
+        encoding: 'utf8',
+        env: buildSetupEnv({
+          ULTRASHAPE_SETUP_TEST_FLASH_ATTN_STAGE_FAIL: 'import',
+        }),
+      });
+
+      expect(outcome.status).toBe(0);
+      expect(`${outcome.stderr}${outcome.stdout}`).toContain(
+        'flash_attn install failed; continuing with degraded PyTorch SDPA fallback.',
+      );
+
+      const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as SetupSummary;
+      expect(summary.install_success).toBe(true);
+      expect(summary.native_install_contract).toEqual({
+        order: ['core', 'cubvh', 'flash_attn'],
+        cubvh_required: true,
+        flash_attn_optional: true,
+      });
+      expect(summary.native_install).toMatchObject({
+        core: {
+          attempted: true,
+          status: 'ready',
+        },
+        cubvh: {
+          attempted: true,
+          required: true,
+          status: 'ready',
+          source: 'git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f',
+          pinned_ref: '7855c000f95e43742081060d869702b2b2b33d1f',
+          build_isolation: false,
+          import_smoke_missing: [],
+          failure_message: null,
+        },
+        flash_attn: {
+          attempted: true,
+          required: false,
+          degradable: true,
+          status: 'degraded',
+          build_isolation: false,
+          import_smoke_missing: ['flash_attn'],
+          failure_message: 'flash_attn install failed; continuing with degraded PyTorch SDPA fallback.',
+        },
+      });
+
+      const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness & {
+        install_success: boolean;
+        failure_code: string | null;
+      };
+      expect(readiness.install_success).toBe(true);
+      expect(readiness.failure_code).toBe(null);
+      expect(readiness.status).toBe('degraded');
+      expect(readiness.weights_ready).toBe(true);
+      expect(readiness.required_imports_ok).toBe(true);
+      expect(readiness.missing_required).toEqual([]);
+      expect(readiness.missing_conditional).toEqual([]);
+      expect(readiness.missing_degradable).toEqual(['flash_attn']);
+      expect(readiness.missing_optional).toEqual(['flash_attn']);
     } finally {
       simulation.cleanup();
     }

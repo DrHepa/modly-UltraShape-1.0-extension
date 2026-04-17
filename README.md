@@ -84,6 +84,15 @@ Smoke validation should accept ONLY:
 
 ## Dependency policy
 
+Native install contract metadata is now staged explicitly in `.setup-summary.json` as `core -> cubvh -> flash_attn`.
+
+- `core` installs the bootstrap/runtime dependency tier before native builds.
+- `cubvh` is the REQUIRED native stage and is pinned to `git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f` with `--no-build-isolation`.
+- `flash_attn` is the OPTIONAL / degradable native stage and may fall back to PyTorch SDPA.
+- `.runtime-readiness.json` remains the authoritative runtime truth: missing `cubvh` blocks the local path, while missing `flash_attn` must surface as `status="degraded"` with `missing_degradable=["flash_attn"]`.
+
+Linux ARM64 prerequisites for the required `cubvh` stage stay local-first and explicit: `git`, a usable C/C++ compiler toolchain, CUDA build tooling, and Eigen headers must already exist on the host. `setup.py` fails fast instead of pretending install success when those prerequisites or the required `cubvh` import smoke are missing.
+
 Required dependency tier for the supported real-refinement path:
 
 - `torch==2.7.0+cu128`
@@ -177,6 +186,8 @@ The faithful smoke from this repo is:
 
 1. validate the extracted repo-root install surface,
 2. run `setup.py` with Modly-style JSON args,
-3. read `.runtime-readiness.json` as authoritative evidence,
-4. invoke `processor.py` with valid fixture assets,
-5. accept either `done` for local-ready installs or the explicit readiness-driven public error.
+3. verify `.setup-summary.json` recorded the staged native metadata (`core -> cubvh -> flash_attn`) truthfully for the copied payload,
+4. read `.runtime-readiness.json` as authoritative evidence,
+5. accept `degraded` only when the remaining gap is degradable (for example `flash_attn` falling back to SDPA),
+6. invoke `processor.py` with valid fixture assets,
+7. accept either `done` for local-ready installs or the explicit readiness-driven public error.

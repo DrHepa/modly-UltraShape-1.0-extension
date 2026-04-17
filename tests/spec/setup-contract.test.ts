@@ -8,6 +8,73 @@ import { describe, expect, it } from 'vitest';
 const repoRoot = process.cwd();
 const setupPath = resolve(repoRoot, 'setup.py');
 
+type NativeInstallContract = {
+  order: string[];
+  cubvh_required: boolean;
+  flash_attn_optional: boolean;
+};
+
+type NativeInstallStage = {
+  attempted: boolean;
+  status: string;
+  required?: boolean;
+  degradable?: boolean;
+  source?: string;
+  pinned_ref?: string;
+  build_isolation?: boolean;
+  commands?: string[];
+  missing_prerequisites?: string[];
+  detected_prerequisites?: Record<string, unknown>;
+  import_smoke_missing?: string[];
+  failure_message?: string | null;
+};
+
+type NativeInstallSummary = {
+  core: NativeInstallStage;
+  cubvh: NativeInstallStage;
+  flash_attn: NativeInstallStage;
+};
+
+type WeightSourceArtifact = {
+  attempted_weight_source_kinds?: string[];
+  attempted_weight_sources?: string[];
+  resolved_weight_source_kind?: string | null;
+  resolved_weight_source?: string | null;
+  weight_source_repo_id?: string | null;
+  weight_source_filename?: string | null;
+  weight_source_revision?: string | null;
+  weight_source_auth_used?: boolean | null;
+  weight_source_failure_classification?: string | null;
+  weight_source_error_class?: string | null;
+  weight_source_error_message?: string | null;
+};
+
+type SetupStatusArtifact = {
+  install_success?: boolean;
+  failure_stage?: string | null;
+  failure_code?: string | null;
+};
+
+type DependencySummary = {
+  required: string[];
+  conditional: string[];
+  degradable: string[];
+};
+
+type SetupSummaryWithNative = SetupStatusArtifact & WeightSourceArtifact & {
+  native_install_contract: NativeInstallContract;
+  native_install: NativeInstallSummary;
+  dependencies?: DependencySummary;
+};
+
+type SetupReadiness = SetupStatusArtifact & WeightSourceArtifact & {
+  status: string;
+  required_imports_ok?: boolean;
+  missing_required?: string[];
+  missing_degradable?: string[];
+  missing_optional?: string[];
+};
+
 function runSetup(argument: Record<string, unknown>) {
   return spawnSync('python3', [setupPath, JSON.stringify(argument)], {
     cwd: repoRoot,
@@ -30,21 +97,132 @@ function runSetupWithEnv(argument: Record<string, unknown>, env: NodeJS.ProcessE
   });
 }
 
-function readSetupArtifacts(installDir: string) {
-  const summary = JSON.parse(readFileSync(join(installDir, '.setup-summary.json'), 'utf8')) as Record<string, unknown>;
-  const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as Record<string, unknown>;
+function readSetupArtifacts<
+  TSummary extends SetupSummaryWithNative = SetupSummaryWithNative,
+  TReadiness extends SetupReadiness = SetupReadiness,
+>(installDir: string) {
+  const summary = JSON.parse(readFileSync(join(installDir, '.setup-summary.json'), 'utf8')) as TSummary;
+  const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as TReadiness;
   return { summary, readiness };
 }
 
 describe('UltraShape setup.py contract', () => {
+  it('fails fast with explicit blocked cubvh metadata when Linux ARM64 prerequisites are missing', () => {
+    const scenarios = [
+      {
+        missing: 'git',
+        expectedMissing: ['git'],
+        expectedDetected: {
+          host: 'linux-arm64',
+          git: false,
+        },
+      },
+      {
+        missing: 'compiler',
+        expectedMissing: ['compiler-toolchain'],
+        expectedDetected: {
+          host: 'linux-arm64',
+          git: true,
+          compiler: null,
+        },
+      },
+      {
+        missing: 'cuda',
+        expectedMissing: ['cuda-build-tooling'],
+        expectedDetected: {
+          host: 'linux-arm64',
+          git: true,
+          compiler: 'g++',
+          cuda: null,
+        },
+      },
+      {
+        missing: 'eigen',
+        expectedMissing: ['eigen-headers'],
+        expectedDetected: {
+          host: 'linux-arm64',
+          git: true,
+          compiler: 'g++',
+          cuda: '/usr/local/cuda',
+          eigen: null,
+        },
+      },
+    ] as const;
+
+    for (const scenario of scenarios) {
+      const root = mkdtempSync(join(tmpdir(), `ultrashape-setup-cubvh-prereq-${scenario.missing}-`));
+      const installDir = join(root, 'extension-root');
+      const sourceWeight = join(root, 'download-cache', 'ultrashape_v1.pt');
+      mkdirSync(join(root, 'download-cache'), { recursive: true });
+      writeFileSync(sourceWeight, 'copied-weight');
+
+      try {
+        const outcome = runSetupWithEnv({
+          python_exe: 'python3',
+          ext_dir: installDir,
+          gpu_sm: 90,
+          cuda_version: 12.8,
+          required_weight_path: sourceWeight,
+        }, {
+          ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+          ULTRASHAPE_SETUP_TEST_CUBVH_PREREQ_MISSING: scenario.missing,
+        });
+
+        expect(outcome.status, `${scenario.missing} should block setup`).not.toBe(0);
+        expect(`${outcome.stderr}${outcome.stdout}`).toContain(
+          'cubvh source build requires Linux ARM64 with git, compiler toolchain, CUDA build tooling, and Eigen headers available.',
+        );
+
+        const { summary, readiness } = readSetupArtifacts(installDir);
+        expect(summary.native_install_contract).toEqual({
+          order: ['core', 'cubvh', 'flash_attn'],
+          cubvh_required: true,
+          flash_attn_optional: true,
+        });
+        expect(summary.native_install).toMatchObject({
+          core: {
+            attempted: true,
+            status: 'ready',
+          },
+          cubvh: {
+            attempted: false,
+            required: true,
+            status: 'blocked',
+            source: 'git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f',
+            pinned_ref: '7855c000f95e43742081060d869702b2b2b33d1f',
+            build_isolation: false,
+            missing_prerequisites: scenario.expectedMissing,
+            detected_prerequisites: scenario.expectedDetected,
+            failure_message: 'cubvh source build requires Linux ARM64 with git, compiler toolchain, CUDA build tooling, and Eigen headers available.',
+          },
+          flash_attn: {
+            attempted: false,
+            status: 'pending',
+          },
+        });
+        expect(readiness.status).toBe('blocked');
+        expect(readiness.install_success).toBe(false);
+        expect(readiness.required_imports_ok).toBe(true);
+        expect(readiness.failure_stage).toBe('cubvh-prerequisites');
+        expect(readiness.failure_code).toBe('CUBVH_PREREQUISITES_MISSING');
+        expect(readiness.missing_required).toEqual(['native-stage:cubvh']);
+        expect(readiness.missing_degradable).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('fails install when the required weight is missing but still writes truthful failure metadata', () => {
     const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-'));
     const installDir = join(root, 'extension-root');
-    const firstRun = runSetup({
+    const firstRun = runSetupWithEnv({
       python_exe: 'python3',
       ext_dir: installDir,
         gpu_sm: 90,
         cuda_version: 12.8,
+    }, {
+      ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
     });
 
     try {
@@ -68,7 +246,7 @@ describe('UltraShape setup.py contract', () => {
           conditional: string[];
           degradable: string[];
         };
-      };
+      } & SetupSummaryWithNative;
       expect(summary.torch_profile).toBe('linux-arm64-cu128-sm90+');
       expect(summary.runtime_layout_version).toBe('1');
       expect(summary.install_success).toBe(false);
@@ -77,6 +255,33 @@ describe('UltraShape setup.py contract', () => {
       expect(summary.dependencies.required).toContain('cubvh');
       expect(summary.dependencies.conditional).toEqual(['rembg', 'onnxruntime']);
       expect(summary.dependencies.degradable).toEqual(['flash_attn']);
+      expect(summary.native_install_contract).toEqual({
+        order: ['core', 'cubvh', 'flash_attn'],
+        cubvh_required: true,
+        flash_attn_optional: true,
+      });
+      expect(summary.native_install).toMatchObject({
+        core: {
+          attempted: true,
+        },
+        cubvh: {
+          attempted: true,
+          required: true,
+          pinned_ref: '7855c000f95e43742081060d869702b2b2b33d1f',
+          source: 'git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f',
+          build_isolation: false,
+          status: 'ready',
+        },
+        flash_attn: {
+          attempted: true,
+          required: false,
+          degradable: true,
+          status: 'ready',
+        },
+      });
+      expect(summary.native_install.cubvh.commands).toEqual([
+        expect.stringContaining('--no-build-isolation'),
+      ]);
 
       const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as {
         status: string;
@@ -106,10 +311,12 @@ describe('UltraShape setup.py contract', () => {
       const sentinel = join(installDir, 'venv', 'sentinel.txt');
       writeFileSync(sentinel, 'keep-me');
 
-      const secondRun = runSetup({
+      const secondRun = runSetupWithEnv({
         python_exe: 'python3',
         ext_dir: installDir,
         gpu_sm: 90,
+      }, {
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
       });
 
       expect(secondRun.status).not.toBe(0);
@@ -129,11 +336,13 @@ describe('UltraShape setup.py contract', () => {
     writeFileSync(weightPath, 'test-weight');
 
     try {
-      const outcome = runSetup({
+      const outcome = runSetupWithEnv({
         python_exe: 'python3',
         ext_dir: installDir,
         gpu_sm: 90,
         cuda_version: 12.8,
+      }, {
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
       });
 
       expect(outcome.status).toBe(0);
@@ -144,12 +353,40 @@ describe('UltraShape setup.py contract', () => {
         attempted_weight_sources: string[];
         resolved_weight_source_kind: string;
         resolved_weight_source: string;
-      };
+      } & SetupSummaryWithNative;
       expect(summary.install_success).toBe(true);
       expect(summary.attempted_weight_source_kinds).toEqual(['ext-dir']);
       expect(summary.attempted_weight_sources).toEqual([weightPath]);
       expect(summary.resolved_weight_source_kind).toBe('ext-dir');
       expect(summary.resolved_weight_source).toBe(weightPath);
+      expect(summary.native_install_contract).toEqual({
+        order: ['core', 'cubvh', 'flash_attn'],
+        cubvh_required: true,
+        flash_attn_optional: true,
+      });
+      expect(summary.native_install).toMatchObject({
+        core: {
+          attempted: true,
+          status: 'ready',
+        },
+        cubvh: {
+          attempted: true,
+          required: true,
+          pinned_ref: '7855c000f95e43742081060d869702b2b2b33d1f',
+          source: 'git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f',
+          build_isolation: false,
+          status: 'ready',
+          commands: [
+            expect.stringContaining('--no-build-isolation'),
+          ],
+        },
+        flash_attn: {
+          attempted: true,
+          required: false,
+          degradable: true,
+          status: 'ready',
+        },
+      });
 
       const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as {
         status: string;
@@ -191,9 +428,20 @@ describe('UltraShape setup.py contract', () => {
       const summary = JSON.parse(readFileSync(join(installDir, '.setup-summary.json'), 'utf8')) as {
         install_success: boolean;
         attempted_weight_sources: string[];
-      };
+      } & SetupSummaryWithNative;
       expect(summary.install_success).toBe(true);
       expect(summary.attempted_weight_sources).toContain(sourceWeight);
+      expect(summary.native_install.cubvh).toMatchObject({
+        attempted: true,
+        required: true,
+        status: 'ready',
+        source: 'git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f',
+        pinned_ref: '7855c000f95e43742081060d869702b2b2b33d1f',
+        build_isolation: false,
+      });
+      expect(summary.native_install.cubvh.commands).toEqual([
+        expect.stringContaining('install --no-build-isolation git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f'),
+      ]);
 
       const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as {
         status: string;
@@ -339,7 +587,7 @@ describe('UltraShape setup.py contract', () => {
     }
   });
 
-  it('succeeds with degraded readiness when only an optional dependency is absent', () => {
+  it('succeeds with degraded readiness when the optional flash_attn stage degrades', () => {
     const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-degraded-'));
     const installDir = join(root, 'extension-root');
     const sourceWeight = join(root, 'download-cache', 'ultrashape_v1.pt');
@@ -355,7 +603,7 @@ describe('UltraShape setup.py contract', () => {
         required_weight_path: sourceWeight,
       }, {
         ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
-        ULTRASHAPE_SETUP_TEST_STUB_DEPS_MISSING: 'flash_attn',
+        ULTRASHAPE_SETUP_TEST_FLASH_ATTN_STAGE_FAIL: 'install',
       });
 
       expect(outcome.status).toBe(0);
@@ -459,6 +707,123 @@ describe('UltraShape setup.py contract', () => {
       expect(readiness.failure_code).toBe('REQUIRED_IMPORT_SMOKE_FAILED');
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails with explicit cubvh import-smoke text when the required native stage cannot be imported after install', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-cubvh-import-smoke-'));
+    const installDir = join(root, 'extension-root');
+    const sourceWeight = join(root, 'download-cache', 'ultrashape_v1.pt');
+    mkdirSync(join(root, 'download-cache'), { recursive: true });
+    writeFileSync(sourceWeight, 'copied-weight');
+
+    try {
+      const outcome = runSetupWithEnv({
+        python_exe: 'python3',
+        ext_dir: installDir,
+        gpu_sm: 90,
+        cuda_version: 12.8,
+        required_weight_path: sourceWeight,
+      }, {
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        ULTRASHAPE_SETUP_TEST_CUBVH_IMPORT_FAIL: '1',
+      });
+
+      expect(outcome.status).not.toBe(0);
+      expect(`${outcome.stderr}${outcome.stdout}`).toContain(
+        'cubvh build completed but import smoke failed; local install cannot continue without cubvh.',
+      );
+
+      const { summary, readiness } = readSetupArtifacts(installDir);
+      expect(summary.native_install.cubvh).toMatchObject({
+        attempted: true,
+        required: true,
+        status: 'blocked',
+        source: 'git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f',
+        pinned_ref: '7855c000f95e43742081060d869702b2b2b33d1f',
+        build_isolation: false,
+        import_smoke_missing: ['cubvh'],
+        failure_message: 'cubvh build completed but import smoke failed; local install cannot continue without cubvh.',
+      });
+      expect(summary.native_install.cubvh.commands).toEqual([
+        expect.stringContaining('install --no-build-isolation git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f'),
+      ]);
+      expect(readiness.status).toBe('blocked');
+      expect(readiness.required_imports_ok).toBe(false);
+      expect(readiness.failure_stage).toBe('cubvh-import-smoke');
+      expect(readiness.missing_required).toEqual(['import:cubvh']);
+      expect(readiness.missing_degradable).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('succeeds in degraded mode with explicit SDPA fallback metadata when flash_attn install or import fails after core and cubvh succeed', () => {
+    const scenarios = [
+      {
+        name: 'install',
+        env: {
+          ULTRASHAPE_SETUP_TEST_FLASH_ATTN_STAGE_FAIL: 'install',
+        },
+      },
+      {
+        name: 'import',
+        env: {
+          ULTRASHAPE_SETUP_TEST_FLASH_ATTN_STAGE_FAIL: 'import',
+        },
+      },
+    ] as const;
+
+    for (const scenario of scenarios) {
+      const root = mkdtempSync(join(tmpdir(), `ultrashape-setup-flash-attn-${scenario.name}-`));
+      const installDir = join(root, 'extension-root');
+      const sourceWeight = join(root, 'download-cache', 'ultrashape_v1.pt');
+      mkdirSync(join(root, 'download-cache'), { recursive: true });
+      writeFileSync(sourceWeight, 'copied-weight');
+
+      try {
+        const outcome = runSetupWithEnv({
+          python_exe: 'python3',
+          ext_dir: installDir,
+          gpu_sm: 90,
+          cuda_version: 12.8,
+          required_weight_path: sourceWeight,
+        }, {
+          ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+          ...scenario.env,
+        });
+
+        expect(outcome.status).toBe(0);
+        expect(`${outcome.stderr}${outcome.stdout}`).toContain(
+          'flash_attn install failed; continuing with degraded PyTorch SDPA fallback.',
+        );
+
+        const { summary, readiness } = readSetupArtifacts(installDir);
+        expect(summary.native_install.cubvh).toMatchObject({
+          attempted: true,
+          required: true,
+          status: 'ready',
+        });
+        expect(summary.native_install.flash_attn).toMatchObject({
+          attempted: true,
+          required: false,
+          degradable: true,
+          status: 'degraded',
+          import_smoke_missing: ['flash_attn'],
+          failure_message: 'flash_attn install failed; continuing with degraded PyTorch SDPA fallback.',
+        });
+        expect(summary.native_install.flash_attn.commands).toEqual([
+          expect.stringContaining('pip install'),
+        ]);
+        expect(readiness.status).toBe('degraded');
+        expect(readiness.install_success).toBe(true);
+        expect(readiness.required_imports_ok).toBe(true);
+        expect(readiness.missing_required).toEqual([]);
+        expect(readiness.missing_degradable).toEqual(['flash_attn']);
+        expect(readiness.missing_optional).toEqual(['flash_attn']);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 
