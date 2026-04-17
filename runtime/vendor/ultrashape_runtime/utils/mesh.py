@@ -219,36 +219,133 @@ def _chunk_header(length: int, chunk_type: int) -> bytes:
     return length.to_bytes(4, 'little') + chunk_type.to_bytes(4, 'little')
 
 
-def _build_binary_glb(source_bytes: bytes) -> bytes:
-    json_chunk = _pad_chunk(b'{"asset":{"version":"2.0"}}')
-    binary_chunk = _pad_chunk(source_bytes or b'\x00\x80\x00\x00')
-    total_length = 12 + 8 + len(json_chunk) + 8 + len(binary_chunk)
+def _base_mesh_faces() -> list[tuple[int, int, int]]:
+    return [
+        (0, 1, 2),
+        (0, 2, 3),
+        (4, 6, 5),
+        (4, 7, 6),
+        (0, 4, 5),
+        (0, 5, 1),
+        (1, 5, 6),
+        (1, 6, 2),
+        (2, 6, 7),
+        (2, 7, 3),
+        (3, 7, 4),
+        (3, 4, 0),
+    ]
 
-    return b''.join(
-        [
-            GLB_MAGIC,
-            GLB_VERSION.to_bytes(4, 'little'),
-            total_length.to_bytes(4, 'little'),
-            _chunk_header(len(json_chunk), JSON_CHUNK_TYPE),
-            json_chunk,
-            _chunk_header(len(binary_chunk), BIN_CHUNK_TYPE),
-            binary_chunk,
-        ]
-    )
+
+def _derived_mesh_geometry(mesh_payload: dict[str, object]) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]]:
+    tokens = bytes_to_unit_floats(_mesh_payload_bytes(mesh_payload), length=24)
+    scale_x, scale_y, scale_z = _extent_scale(mesh_payload)
+    half_extents = (scale_x / 2.0, scale_y / 2.0, scale_z / 2.0)
+    corners = [
+        (-1.0, -1.0, -1.0),
+        (1.0, -1.0, -1.0),
+        (1.0, 1.0, -1.0),
+        (-1.0, 1.0, -1.0),
+        (-1.0, -1.0, 1.0),
+        (1.0, -1.0, 1.0),
+        (1.0, 1.0, 1.0),
+        (-1.0, 1.0, 1.0),
+    ]
+    vertices: list[tuple[float, float, float]] = []
+
+    for index, (sign_x, sign_y, sign_z) in enumerate(corners):
+        token_offset = index * 3
+        axis_tokens = tokens[token_offset : token_offset + 3]
+        offsets = []
+        for axis_token in axis_tokens:
+            offsets.append((axis_token - 0.5) * 0.12)
+        vertex = (
+            round(sign_x * half_extents[0] * (1.0 + offsets[0]), 6),
+            round(sign_y * half_extents[1] * (1.0 + offsets[1]), 6),
+            round(sign_z * half_extents[2] * (1.0 + offsets[2]), 6),
+        )
+        vertices.append(vertex)
+
+    return vertices, _base_mesh_faces()
 
 
-def _serialize_glb_payload(mesh_payload: object) -> bytes:
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _normalize_vertices(raw_vertices: object) -> list[tuple[float, float, float]] | None:
+    if not isinstance(raw_vertices, list) or not raw_vertices:
+        return None
+
+    vertices: list[tuple[float, float, float]] = []
+    for vertex in raw_vertices:
+        if not isinstance(vertex, (list, tuple)) or len(vertex) != 3 or not all(_is_number(axis) for axis in vertex):
+            return None
+        vertices.append((round(float(vertex[0]), 6), round(float(vertex[1]), 6), round(float(vertex[2]), 6)))
+    return vertices
+
+
+def _normalize_faces(raw_faces: object) -> list[tuple[int, int, int]] | None:
+    if not isinstance(raw_faces, list) or not raw_faces:
+        return None
+
+    faces: list[tuple[int, int, int]] = []
+    for face in raw_faces:
+        if not isinstance(face, (list, tuple)) or len(face) != 3 or not all(isinstance(index, int) for index in face):
+            return None
+        faces.append((int(face[0]), int(face[1]), int(face[2])))
+    return faces
+
+
+def build_renderable_mesh_payload(mesh_payload: object) -> dict[str, object]:
     if not isinstance(mesh_payload, dict):
         raise MeshExportError('mesh_payload must be a structured binary-safe mesh payload.')
 
-    payload_bytes = mesh_payload.get('bytes')
+    normalized_payload = dict(mesh_payload)
+    payload_bytes = normalized_payload.get('bytes')
     if not isinstance(payload_bytes, bytes):
         raise MeshExportError('mesh_payload.bytes must be binary data.')
 
-    if mesh_payload.get('is_binary_glb') is True and payload_bytes[:4] == GLB_MAGIC:
+    if normalized_payload.get('is_binary_glb') is True and payload_bytes[:4] == GLB_MAGIC:
+        return normalized_payload
+
+    vertices = _normalize_vertices(normalized_payload.get('vertices'))
+    faces = _normalize_faces(normalized_payload.get('faces'))
+    if vertices is None or faces is None:
+        vertices, faces = _derived_mesh_geometry(normalized_payload)
+
+    normalized_payload['vertices'] = vertices
+    normalized_payload['faces'] = faces
+    normalized_payload['mesh_name'] = str(normalized_payload.get('mesh_name') or normalized_payload.get('kind') or 'refined-mesh')
+    return normalized_payload
+
+
+def _export_trimesh_glb(mesh_payload: dict[str, object]) -> bytes:
+    try:
+        import trimesh  # type: ignore
+    except ModuleNotFoundError as error:  # pragma: no cover - exercised via public error contract
+        raise MeshExportError('Required runtime import is unavailable: trimesh.') from error
+
+    vertices = mesh_payload.get('vertices')
+    faces = mesh_payload.get('faces')
+    if not isinstance(vertices, list) or not isinstance(faces, list):
+        raise MeshExportError('mesh_payload must include renderable vertices and faces before GLB export.')
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh, node_name=str(mesh_payload.get('mesh_name') or 'refined-mesh'))
+    exported = scene.export(file_type='glb')
+    if not isinstance(exported, (bytes, bytearray)):
+        raise MeshExportError('trimesh GLB export must return bytes.')
+    return bytes(exported)
+
+
+def _serialize_glb_payload(mesh_payload: object) -> bytes:
+    normalized_payload = build_renderable_mesh_payload(mesh_payload)
+    payload_bytes = normalized_payload.get('bytes')
+    if normalized_payload.get('is_binary_glb') is True and isinstance(payload_bytes, bytes) and payload_bytes[:4] == GLB_MAGIC:
         return payload_bytes
 
-    return _build_binary_glb(payload_bytes)
+    return _export_trimesh_glb(normalized_payload)
 
 
 def export_refined_glb(*, output_dir: str, output_format: str, mesh_payload: object) -> str:

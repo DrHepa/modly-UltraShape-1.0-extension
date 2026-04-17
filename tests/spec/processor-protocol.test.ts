@@ -28,6 +28,76 @@ function torchCheckpointStubSource() {
   ].join('\n');
 }
 
+function trimeshStubSource() {
+  return [
+    'import json',
+    'import struct',
+    '',
+    'def _pad(payload, pad_byte=b" "):',
+    '    padding = (-len(payload)) % 4',
+    '    return payload + (pad_byte * padding)',
+    '',
+    'class Trimesh:',
+    '    def __init__(self, vertices, faces, process=False):',
+    '        self.vertices = [tuple(float(axis) for axis in vertex) for vertex in vertices]',
+    '        self.faces = [tuple(int(index) for index in face) for face in faces]',
+    '',
+    'class Scene:',
+    '    def __init__(self):',
+    '        self._items = []',
+    '',
+    '    def add_geometry(self, mesh, node_name=None):',
+    '        self._items.append((mesh, node_name or "mesh"))',
+    '',
+    '    def export(self, file_type="glb"):',
+    '        if file_type != "glb":',
+    '            raise ValueError("Stub trimesh exporter supports only glb")',
+    '        if not self._items:',
+    '            raise ValueError("Scene has no geometry")',
+    '        mesh, node_name = self._items[0]',
+    '        vertex_bytes = b"".join(struct.pack("<3f", *vertex) for vertex in mesh.vertices)',
+    '        index_bytes = b"".join(struct.pack("<3I", *face) for face in mesh.faces)',
+    '        binary_blob = _pad(vertex_bytes, b"\\x00") + _pad(index_bytes, b"\\x00")',
+    '        json_doc = {',
+    '            "asset": {"version": "2.0", "generator": "trimesh-test-stub"},',
+    '            "scene": 0,',
+    '            "scenes": [{"nodes": [0]}],',
+    '            "nodes": [{"mesh": 0, "name": node_name}],',
+    '            "meshes": [{"name": node_name, "primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],',
+    '            "buffers": [{"byteLength": len(binary_blob)}],',
+    '            "bufferViews": [',
+    '                {"buffer": 0, "byteOffset": 0, "byteLength": len(vertex_bytes), "target": 34962},',
+    '                {"buffer": 0, "byteOffset": len(_pad(vertex_bytes, b"\\x00")), "byteLength": len(index_bytes), "target": 34963},',
+    '            ],',
+    '            "accessors": [',
+    '                {',
+    '                    "bufferView": 0,',
+    '                    "componentType": 5126,',
+    '                    "count": len(mesh.vertices),',
+    '                    "type": "VEC3",',
+    '                    "min": [min(vertex[index] for vertex in mesh.vertices) for index in range(3)],',
+    '                    "max": [max(vertex[index] for vertex in mesh.vertices) for index in range(3)],',
+    '                },',
+    '                {"bufferView": 1, "componentType": 5125, "count": len(mesh.faces) * 3, "type": "SCALAR"},',
+    '            ],',
+    '        }',
+    '        json_bytes = _pad(json.dumps(json_doc, separators=(",", ":")).encode("utf8"))',
+    '        total_length = 12 + 8 + len(json_bytes) + 8 + len(binary_blob)',
+    '        return b"".join([',
+    '            b"glTF",',
+    '            struct.pack("<I", 2),',
+    '            struct.pack("<I", total_length),',
+    '            struct.pack("<I", len(json_bytes)),',
+    '            struct.pack("<I", 0x4E4F534A),',
+    '            json_bytes,',
+    '            struct.pack("<I", len(binary_blob)),',
+    '            struct.pack("<I", 0x004E4942),',
+    '            binary_blob,',
+    '        ])',
+    '',
+  ].join('\n');
+}
+
 function writeBinaryCheckpointBundle(path: string, payload: Record<string, unknown>) {
   const outcome = spawnSync(
     'python3',
@@ -66,10 +136,34 @@ function createBinaryGlbBytes() {
   ]);
 }
 
-function expectBinaryGlb(path: string) {
+function expectRenderableGlbMesh(path: string) {
   const payload = readFileSync(path);
   expect(payload.subarray(0, 4).toString('ascii')).toBe('glTF');
-  expect(payload.includes(0x80)).toBe(true);
+  const jsonLength = payload.readUInt32LE(12);
+  const jsonChunkType = payload.readUInt32LE(16);
+  expect(jsonChunkType).toBe(0x4e4f534a);
+  const document = JSON.parse(payload.subarray(20, 20 + jsonLength).toString('utf8').trim().replace(/\u0000+$/u, '')) as {
+    asset?: { version?: string };
+    scenes?: unknown[];
+    nodes?: unknown[];
+    meshes?: Array<{ primitives?: Array<{ attributes?: { POSITION?: unknown }; indices?: unknown }> }>;
+    accessors?: unknown[];
+    bufferViews?: unknown[];
+  };
+  expect(document.asset?.version).toBe('2.0');
+  expect(document.scenes?.length ?? 0).toBeGreaterThan(0);
+  expect(document.nodes?.length ?? 0).toBeGreaterThan(0);
+  expect(document.meshes?.length ?? 0).toBeGreaterThan(0);
+  expect(document.bufferViews?.length ?? 0).toBeGreaterThanOrEqual(2);
+  expect(document.accessors?.length ?? 0).toBeGreaterThanOrEqual(2);
+  expect(document.meshes?.[0]?.primitives?.[0]).toEqual(
+    expect.objectContaining({
+      attributes: expect.objectContaining({
+        POSITION: expect.any(Number),
+      }),
+      indices: expect.any(Number),
+    }),
+  );
 }
 
 function getRunnerMetrics(result: Record<string, unknown> | null): Record<string, unknown> {
@@ -104,6 +198,7 @@ function createFixtureWorkspace() {
   writeFileSync(packagedArtifact, 'refined-artifact');
   writeFileSync(join(stubDir, 'cubvh.py'), '__version__ = "0.0-test"\n');
   writeFileSync(join(stubDir, 'torch.py'), torchCheckpointStubSource());
+  writeFileSync(join(stubDir, 'trimesh.py'), trimeshStubSource());
 
   return {
     root,
@@ -597,7 +692,7 @@ describe('UltraShape processor.py protocol', () => {
         }),
       );
       expect(Number(metrics.rms)).toBeGreaterThan(0.01);
-      expectBinaryGlb(join(fixture.outputDir, 'refined.glb'));
+      expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
     } finally {
       fixture.cleanup();
     }

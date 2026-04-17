@@ -7,6 +7,8 @@ try:
 except ImportError:  # pragma: no cover - expected on degraded installs
     cubvh = None
 
+from ...utils.mesh import build_renderable_mesh_payload
+
 
 def preferred_surface_extractor() -> str:
     return 'cubvh.sparse_marching_cubes' if cubvh is not None else 'cubvh.missing'
@@ -47,16 +49,21 @@ def extract_mc_surface(
         + b'\x80\x01'
     )
 
-    return {
-        'extractor': extractor,
-        'preserve_scale': preserve_scale,
-        'payload': {
+    renderable_payload = build_renderable_mesh_payload(
+        {
             'kind': 'refined-mesh',
             'path': mesh_payload.get('path'),
             'bytes': payload_bytes,
             'byte_length': len(payload_bytes),
             'is_binary_glb': False,
-        },
+            'mesh_name': 'refined-surface',
+        }
+    )
+
+    return {
+        'extractor': extractor,
+        'preserve_scale': preserve_scale,
+        'payload': renderable_payload,
         'reference_bytes': reference_asset['byte_length'],
         'payload_bytes': len(payload_bytes),
         'surface_signature': field_signature,
