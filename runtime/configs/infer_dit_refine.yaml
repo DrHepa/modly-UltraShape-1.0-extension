@@ -4,6 +4,7 @@ model:
 runtime:
   backend: local
   readiness_file: .runtime-readiness.json
+  requires_exact_closure: true
 dependencies:
   required:
     imports:
@@ -20,6 +21,7 @@ dependencies:
       - transformers
       - huggingface_hub
       - accelerate
+      - diffusers
       - cubvh
       - safetensors
       - tqdm
@@ -34,19 +36,29 @@ checkpoint:
     - vae
     - dit
     - conditioner
+vae_config:
+  target: ultrashape_runtime.models.autoencoders.model.ShapeVAE
+dit_cfg:
+  target: ultrashape_runtime.models.denoisers.dit_mask.RefineDiT
+conditioner_config:
+  target: ultrashape_runtime.models.conditioner_mask.SingleImageEncoder
 weights:
   primary: models/ultrashape/ultrashape_v1.pt
 preprocess:
   image_processor: ImageProcessorV2
   require_cutout: conditional
+image_processor_cfg:
+  target: ultrashape_runtime.preprocessors.ImageProcessorV2
 conditioning:
   coarse_mesh_encoder: SharpEdgeSurfaceLoader
   voxelizer: voxelize_from_point
 scheduler:
   family: flow-matching
+scheduler_cfg:
+  target: diffusers.FlowMatchEulerDiscreteScheduler
 decoder:
   vae: ShapeVAE
-  volume_decoder: volume-decoder
+  volume_decoder: VanillaVDMVolumeDecoding
 surface:
   extraction: mc
   loader: SharpEdgeSurfaceLoader

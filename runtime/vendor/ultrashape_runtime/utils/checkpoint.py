@@ -95,8 +95,9 @@ def load_checkpoint_subtrees(
         summary_tokens.extend(compact_tokens)
         value_count += subtree_value_count
         bundle[name] = {
+            'state_dict': dict(subtree),
             'tensors': tensors,
-            'representation': 'tensor-summary-v1',
+            'representation': 'checkpoint-subtree-v1',
             'tensor_count': len(tensors),
             'value_count': subtree_value_count,
             'tokens': compact_tokens,
@@ -150,6 +151,27 @@ def checkpoint_signature(checkpoint_state: object) -> int:
     if isinstance(checkpoint_state, Mapping) and isinstance(checkpoint_state.get('signature'), int):
         return int(checkpoint_state['signature'])
     return stable_signature(checkpoint_tokens(checkpoint_state, limit=MAX_TENSOR_SAMPLES))
+
+
+def apply_checkpoint_state(module: object, checkpoint_state: object, *, strict: bool = False) -> dict[str, object]:
+    if not isinstance(checkpoint_state, Mapping):
+        raise CheckpointResolutionError('Checkpoint hydration requires structured checkpoint state.')
+
+    loader = getattr(module, 'load_state_dict', None)
+    if not callable(loader):
+        raise CheckpointResolutionError(f'{module.__class__.__name__} does not support load_state_dict hydration.')
+
+    state_dict = checkpoint_state.get('state_dict')
+    if not isinstance(state_dict, Mapping):
+        raise CheckpointResolutionError('Checkpoint hydration requires a state_dict mapping.')
+
+    loader(dict(state_dict), strict=strict)
+    return {
+        'module': module.__class__.__name__,
+        'load_style': 'load_state_dict',
+        'strict': strict,
+        'signature': checkpoint_signature(checkpoint_state),
+    }
 
 
 def _normalize_checkpoint_subtree(subtree: Mapping[str, object]) -> dict[str, dict[str, object]]:

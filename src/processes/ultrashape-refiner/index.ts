@@ -21,7 +21,10 @@ export async function executeUltraShapeRefiner(
   emit(validatingProgressEvent());
   const validated = validateRefinerRequest(input);
   const normalized = normalizeRefinerRequest(validated);
-  const preflight = preflightRefinerExecution(normalized.requestedBackend ?? 'auto', options.preflight);
+  const preflight = preflightRefinerExecution(normalized.requestedBackend ?? 'auto', {
+    ...options.preflight,
+    requestedOutputFormat: normalized.params.output_format,
+  });
   emit(preflightProgressEvent(preflight));
 
   return runRefinerRuntime(normalized, preflight, options);

@@ -6,7 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-from .pipelines import run_refine_pipeline
+from .pipelines import load_runtime_config, run_refine_pipeline
 
 
 PUBLIC_ERROR_CODE = 'LOCAL_RUNTIME_UNAVAILABLE'
@@ -25,6 +25,9 @@ REQUIRED_FIELDS = {
     'seed',
     'preserve_scale',
 }
+REQUIRED_CONFIG_MARKERS = ('vae_config', 'dit_cfg', 'conditioner_config', 'image_processor_cfg', 'scheduler_cfg')
+REQUIRED_RUNTIME_IMPORTS = ('diffusers', 'cubvh')
+REQUIRED_CHECKPOINT_SUBTREES = ('vae', 'dit', 'conditioner')
 
 
 class LocalRunnerError(Exception):
@@ -56,6 +59,58 @@ def read_job() -> dict[str, object]:
 def ensure_file(path_value: str, field: str) -> None:
     if not Path(path_value).is_file():
         raise LocalRunnerError(f'{field} is not readable: {path_value}.')
+
+
+def _truth_error(missing: list[str]) -> LocalRunnerError:
+    return LocalRunnerError(
+        'Runtime config is missing exact runtime truth markers required for the real-geometry MVP: '
+        f'{", ".join(missing)}.'
+    )
+
+
+def load_runtime_contract(config_path: str) -> dict[str, object]:
+    config = load_runtime_config(config_path)
+    missing: list[str] = []
+
+    runtime = config.get('runtime') if isinstance(config.get('runtime'), dict) else {}
+    model = config.get('model') if isinstance(config.get('model'), dict) else {}
+    export = config.get('export') if isinstance(config.get('export'), dict) else {}
+    checkpoint = config.get('checkpoint') if isinstance(config.get('checkpoint'), dict) else {}
+    dependencies = config.get('dependencies') if isinstance(config.get('dependencies'), dict) else {}
+    required = dependencies.get('required') if isinstance(dependencies.get('required'), dict) else {}
+    required_imports = required.get('imports') if isinstance(required.get('imports'), list) else []
+    required_subtrees = checkpoint.get('required_subtrees') if isinstance(checkpoint.get('required_subtrees'), list) else []
+
+    if runtime.get('requires_exact_closure') is not True:
+        missing.append('runtime.requires_exact_closure=true')
+    if model.get('scope') != 'mc-only':
+        missing.append('model.scope=mc-only')
+    if runtime.get('backend') != 'local':
+        missing.append('runtime.backend=local')
+    if export.get('format') != 'glb':
+        missing.append('export.format=glb')
+
+    for marker in REQUIRED_CONFIG_MARKERS:
+        if not isinstance(config.get(marker), dict):
+            missing.append(marker)
+
+    for module_name in REQUIRED_RUNTIME_IMPORTS:
+        if module_name not in required_imports:
+            missing.append(f'dependencies.required.imports:{module_name}')
+
+    if tuple(required_subtrees) != REQUIRED_CHECKPOINT_SUBTREES:
+        missing.append('checkpoint.required_subtrees=vae,dit,conditioner')
+
+    if missing:
+        raise _truth_error(missing)
+
+    return {
+        'backend': 'local-only',
+        'scope': 'mc-only',
+        'output_format': 'glb-only',
+        'requires_exact_closure': True,
+        'checkpoint_subtrees': list(REQUIRED_CHECKPOINT_SUBTREES),
+    }
 
 
 def run_refine_job(
@@ -91,6 +146,7 @@ def run_refine_job(
         raise LocalRunnerError('preserve_scale must be a boolean.')
 
     Path(ext_dir)
+    runtime_contract = load_runtime_contract(config_path)
     try:
         pipeline_result = run_refine_pipeline(
             reference_image=reference_image,
@@ -117,6 +173,7 @@ def run_refine_job(
         'metrics': pipeline_result['metrics'],
         'fallbacks': pipeline_result['fallbacks'],
         'subtrees_loaded': pipeline_result['subtrees_loaded'],
+        'runtime_contract': runtime_contract,
         'warnings': pipeline_result.get('warnings', []),
     }
 

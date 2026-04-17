@@ -1,5 +1,6 @@
 import type {
   UltraShapeBackendMode,
+  UltraShapeOutputFormat,
   UltraShapePreflightResult,
   UltraShapeRuntimeCapabilities,
 } from './types.js';
@@ -9,6 +10,7 @@ export interface UltraShapePreflightOptions {
   hostPlatform?: NodeJS.Platform;
   hostArch?: string;
   localAvailable?: boolean;
+  requestedOutputFormat?: UltraShapeOutputFormat | 'obj' | 'fbx' | 'ply';
 }
 
 export function detectRuntimeCapabilities(
@@ -36,10 +38,11 @@ export function detectRuntimeCapabilities(
 }
 
 export function preflightRefinerExecution(
-  requestedBackend: UltraShapeBackendMode,
+  requestedBackend: UltraShapeBackendMode | 'remote' | 'hybrid',
   options: UltraShapePreflightOptions = {},
 ): UltraShapePreflightResult {
   const capabilities = detectRuntimeCapabilities(options);
+  ensureMvpOutputFormat(options.requestedOutputFormat);
   const selection = selectBackend(requestedBackend, capabilities);
 
   return {
@@ -51,7 +54,7 @@ export function preflightRefinerExecution(
 }
 
 function selectBackend(
-  requestedBackend: UltraShapeBackendMode,
+  requestedBackend: UltraShapeBackendMode | 'remote' | 'hybrid',
   capabilities: UltraShapeRuntimeCapabilities,
 ): Pick<UltraShapePreflightResult, 'selectedBackend' | 'fallbackApplied' | 'reason'> {
   switch (requestedBackend) {
@@ -67,6 +70,14 @@ function selectBackend(
       throw createProcessError(
         'LOCAL_RUNTIME_UNAVAILABLE',
         'LOCAL_RUNTIME_UNAVAILABLE: Requested local backend is unavailable.',
+        'backend',
+      );
+
+    case 'remote':
+    case 'hybrid':
+      throw createProcessError(
+        'LOCAL_RUNTIME_UNAVAILABLE',
+        'LOCAL_RUNTIME_UNAVAILABLE: UltraShape local execution does not support deferred remote or hybrid backends in this MVP.',
         'backend',
       );
 
@@ -86,4 +97,16 @@ function selectBackend(
         'backend',
       );
   }
+}
+
+function ensureMvpOutputFormat(requestedOutputFormat?: UltraShapePreflightOptions['requestedOutputFormat']): void {
+  if (!requestedOutputFormat || requestedOutputFormat === 'glb') {
+    return;
+  }
+
+  throw createProcessError(
+    'LOCAL_RUNTIME_UNAVAILABLE',
+    'LOCAL_RUNTIME_UNAVAILABLE: UltraShape local execution is glb-only in this MVP.',
+    'output_format',
+  );
 }

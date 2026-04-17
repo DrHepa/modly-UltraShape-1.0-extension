@@ -23,6 +23,64 @@ function torchCheckpointStubSource() {
   ].join('\n');
 }
 
+function diffusersStubSource() {
+  return [
+    '__version__ = "0.0-test"',
+    'import json',
+    'import os',
+    'from pathlib import Path',
+    '',
+    'def _trace(payload):',
+    '    trace_path = os.environ.get("ULTRASHAPE_TEST_DIFFUSERS_TRACE_PATH")',
+    '    if not trace_path:',
+    '        return',
+    '    Path(trace_path).write_text(json.dumps(payload), encoding="utf8")',
+    '',
+    'class FlowMatchEulerDiscreteScheduler:',
+    '    def __init__(self, **config):',
+    '        self.config = dict(config)',
+    '        self.timesteps = []',
+    '        _trace({"event": "init", "config": self.config})',
+    '',
+    '    @classmethod',
+    '    def from_config(cls, config):',
+    '        payload = dict(config) if isinstance(config, dict) else {"value": config}',
+    '        _trace({"event": "from_config", "config": payload})',
+    '        return cls(**payload)',
+    '',
+    '    def set_timesteps(self, step_count):',
+    '        self.timesteps = list(range(int(step_count)))',
+    '        _trace({"event": "set_timesteps", "step_count": int(step_count), "timesteps": self.timesteps})',
+    '',
+  ].join('\n');
+}
+
+function cubvhStubSource() {
+  return [
+    '__version__ = "0.0-test"',
+    'import json',
+    'import os',
+    'from pathlib import Path',
+    '',
+    'def sparse_marching_cubes(*, points, threshold=0.0, preserve_scale=True):',
+    '    trace_path = os.environ.get("ULTRASHAPE_TEST_CUBVH_TRACE_PATH")',
+    '    if trace_path:',
+    '        Path(trace_path).write_text(json.dumps({',
+    '            "points": len(points),',
+    '            "threshold": threshold,',
+    '            "preserve_scale": preserve_scale,',
+    '        }), encoding="utf8")',
+    '    vertices = [tuple(float(axis) for axis in point) for point in points]',
+    '    faces = []',
+    '    for index in range(1, max(len(vertices) - 1, 1)):',
+    '        if index + 1 >= len(vertices):',
+    '            break',
+    '        faces.append((0, index, index + 1))',
+    '    return vertices, faces',
+    '',
+  ].join('\n');
+}
+
 function trimeshStubSource() {
   return [
     'import json',
@@ -150,9 +208,14 @@ function inspectCheckpointBundle(checkpointPath: string, extDir: string, stubDir
 
 function expectUpstreamRuntimeGraph(configText: string) {
   expect(configText).toContain('checkpoint:');
+  expect(configText).toContain('vae_config:');
+  expect(configText).toContain('dit_cfg:');
+  expect(configText).toContain('conditioner_config:');
   expect(configText).toContain('preprocess:');
+  expect(configText).toContain('image_processor_cfg:');
   expect(configText).toContain('conditioning:');
   expect(configText).toContain('scheduler:');
+  expect(configText).toContain('scheduler_cfg:');
   expect(configText).toContain('decoder:');
   expect(configText).toContain('surface:');
   expect(configText).toContain('gate:');
@@ -160,7 +223,9 @@ function expectUpstreamRuntimeGraph(configText: string) {
   expect(configText).toContain('scope: mc-only');
   expect(configText).toContain('backend: local');
   expect(configText).toContain('format: glb');
+  expect(configText).toContain('requires_exact_closure: true');
   expect(configText).toContain('required:');
+  expect(configText).toContain('- diffusers');
   expect(configText).toContain('- cubvh');
   expect(configText).toContain('conditional:');
   expect(configText).toContain('- rembg');
@@ -200,6 +265,16 @@ function readGlbJson(path: string) {
     bufferViews?: unknown[];
     buffers?: unknown[];
   };
+}
+
+function getGlbPositionAccessorCount(path: string) {
+  const document = readGlbJson(path);
+  const primitive = document.meshes?.[0]?.primitives?.[0];
+  const positionAccessorIndex = primitive?.attributes?.POSITION;
+  expect(positionAccessorIndex).toEqual(expect.any(Number));
+  const accessor = document.accessors?.[positionAccessorIndex as number] as { count?: unknown } | undefined;
+  expect(accessor?.count).toEqual(expect.any(Number));
+  return accessor?.count as number;
 }
 
 function expectRenderableGlbMesh(path: string) {
@@ -255,7 +330,8 @@ function createFixtureWorkspace() {
   writeFileSync(coarseMesh, 'mesh');
   writeFileSync(binaryCoarseMesh, createBinaryGlbBytes());
   writeFileSync(packagedArtifact, 'refined-mesh');
-  writeFileSync(join(stubDir, 'cubvh.py'), '__version__ = "0.0-test"\n');
+  writeFileSync(join(stubDir, 'cubvh.py'), cubvhStubSource());
+  writeFileSync(join(stubDir, 'diffusers.py'), diffusersStubSource());
   writeFileSync(join(stubDir, 'torch.py'), torchCheckpointStubSource());
   writeFileSync(join(stubDir, 'trimesh.py'), trimeshStubSource());
   writeCheckpointBundle(checkpoint);
@@ -321,27 +397,55 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
       extent_ratio: [1, 1, 1],
       execution_trace: ['preprocess', 'conditioning', 'scheduler', 'denoise', 'decode', 'extract'],
       preprocess: expect.objectContaining({
+        processor: 'ImageProcessorV2',
         byte_length: expect.any(Number),
         normalized_channels: 4,
+        image_signature: expect.any(Number),
+        mask_signature: expect.any(Number),
       }),
       conditioning: expect.objectContaining({
+        surface_loader: 'SharpEdgeSurfaceLoader',
+        encoder: 'SingleImageEncoder',
+        voxelizer: 'voxelize_from_point',
         voxel_count: expect.any(Number),
         mask_tokens: expect.any(Number),
+        surface_signature: expect.any(Number),
+        voxel_signature: expect.any(Number),
+        image_token_signature: expect.any(Number),
+        checkpoint_signature: expect.any(Number),
+        conditioning_signature: expect.any(Number),
       }),
       scheduler: expect.objectContaining({
-        family: 'flow-matching',
+        family: 'flow-matching-euler-discrete',
+        target: 'diffusers.FlowMatchEulerDiscreteScheduler',
         step_count: expect.any(Number),
+        timestep_signature: expect.any(Number),
       }),
       denoise: expect.objectContaining({
+        model: 'RefineDiT',
         attention: expect.any(String),
+        checkpoint_signature: expect.any(Number),
+        scheduler_signature: expect.any(Number),
         latent_signature: expect.any(Number),
       }),
       decode: expect.objectContaining({
+        vae: 'ShapeVAE',
+        decoder: expect.stringMatching(/VDMVolumeDecoding|VolumeDecoder/u),
+        mesh_signature: expect.any(Number),
         field_density: expect.any(Number),
       }),
       extract: expect.objectContaining({
-        extractor: expect.any(String),
+        extractor: 'cubvh.sparse_marching_cubes',
+        marching_cubes: 'cubvh.sparse_marching_cubes',
+        vertex_count: expect.any(Number),
+        face_count: expect.any(Number),
         payload_bytes: expect.any(Number),
+      }),
+      gate: expect.objectContaining({
+        coarse_vertex_count: expect.any(Number),
+        refined_vertex_count: expect.any(Number),
+        coarse_face_count: expect.any(Number),
+        refined_face_count: expect.any(Number),
       }),
     }),
   );
@@ -375,7 +479,8 @@ function installProcessorRuntime(extDir: string) {
   writeFileSync(join(runtimeDir, 'transformers.py'), '__version__ = "0.0-test"\n');
   writeFileSync(join(runtimeDir, 'huggingface_hub.py'), '__version__ = "0.0-test"\n');
   writeFileSync(join(runtimeDir, 'accelerate.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'cubvh.py'), '__version__ = "0.0-test"\n');
+  writeFileSync(join(runtimeDir, 'cubvh.py'), cubvhStubSource());
+  writeFileSync(join(runtimeDir, 'diffusers.py'), diffusersStubSource());
   writeFileSync(join(runtimeDir, 'safetensors.py'), '__version__ = "0.0-test"\n');
   writeFileSync(join(runtimeDir, 'tqdm.py'), '__version__ = "0.0-test"\n');
   writeFileSync(join(runtimeConfigDir, 'infer_dit_refine.yaml'), readFileSync(runtimeConfigSourcePath, 'utf8'));
@@ -405,14 +510,59 @@ function writeRuntimeConfig(
       `  scope: ${overrides.scope ?? 'mc-only'}`,
       'runtime:',
       `  backend: ${overrides.backend ?? 'local'}`,
+      '  requires_exact_closure: true',
+      'checkpoint:',
+      '  primary: models/ultrashape/ultrashape_v1.pt',
+      '  required_subtrees:',
+      '    - vae',
+      '    - dit',
+      '    - conditioner',
+      'vae_config:',
+      '  target: ultrashape_runtime.models.autoencoders.model.ShapeVAE',
+      'dit_cfg:',
+      '  target: ultrashape_runtime.models.denoisers.dit_mask.RefineDiT',
+      'conditioner_config:',
+      '  target: ultrashape_runtime.models.conditioner_mask.SingleImageEncoder',
+      'image_processor_cfg:',
+      '  target: ultrashape_runtime.preprocessors.ImageProcessorV2',
       'surface:',
       `  extraction: ${overrides.extraction ?? 'mc'}`,
+      'scheduler:',
+      '  family: flow-matching',
+      'scheduler_cfg:',
+      '  target: diffusers.FlowMatchEulerDiscreteScheduler',
       'weights:',
       `  primary: ${overrides.primaryWeight ?? 'models/ultrashape/ultrashape_v1.pt'}`,
+      'export:',
+      '  format: glb',
       'dependencies:',
       '  required:',
       '    imports:',
+      '      - diffusers',
       ...requiredImports.map((entry) => `      - ${entry}`),
+      '      - cubvh',
+      '  conditional:',
+      '    - rembg',
+      '    - onnxruntime',
+      '  degradable:',
+      '    - flash_attn',
+      '',
+    ].join('\n'),
+  );
+}
+
+function writeSyntheticSuccessConfig(path: string) {
+  writeFileSync(
+    path,
+    [
+      'model:',
+      '  scope: mc-only',
+      'runtime:',
+      '  backend: local',
+      'surface:',
+      '  extraction: mc',
+      'weights:',
+      '  primary: models/ultrashape/ultrashape_v1.pt',
       '',
     ].join('\n'),
   );
@@ -696,11 +846,19 @@ describe('UltraShape runtime flow', () => {
           metrics: expect.any(Object),
           fallbacks: ['flash_attn->sdpa'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
+          runtime_contract: {
+            backend: 'local-only',
+            scope: 'mc-only',
+            output_format: 'glb-only',
+            requires_exact_closure: true,
+            checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
+          },
           warnings: [],
         },
       });
       expectRealClosureMetrics(getRunnerMetrics(outcome));
       expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
+      expect(getGlbPositionAccessorCount(join(fixture.outputDir, 'refined.glb'))).toBeGreaterThan(8);
     } finally {
       fixture.cleanup();
     }
@@ -736,11 +894,19 @@ describe('UltraShape runtime flow', () => {
           metrics: expect.any(Object),
           fallbacks: ['flash_attn->sdpa'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
+          runtime_contract: {
+            backend: 'local-only',
+            scope: 'mc-only',
+            output_format: 'glb-only',
+            requires_exact_closure: true,
+            checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
+          },
           warnings: [],
         },
       });
       expectRealClosureMetrics(getRunnerMetrics(outcome));
       expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
+      expect(getGlbPositionAccessorCount(join(fixture.outputDir, 'refined.glb'))).toBeGreaterThan(8);
     } finally {
       fixture.cleanup();
     }
@@ -773,6 +939,37 @@ describe('UltraShape runtime flow', () => {
         ok: false,
         error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
         error_message: expect.stringContaining('mc-only'),
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects shorthand synthetic-success configs that omit the exact runtime truth markers', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeSyntheticSuccessConfig(fixture.configPath);
+
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: null,
+        preserve_scale: true,
+      });
+
+      expect(outcome).toEqual({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        error_message: expect.stringContaining('exact runtime truth'),
       });
     } finally {
       fixture.cleanup();
@@ -938,9 +1135,12 @@ describe('UltraShape runtime flow', () => {
       );
       expect(vae).toEqual(
         expect.objectContaining({
-          representation: 'tensor-summary-v1',
+          representation: 'checkpoint-subtree-v1',
           value_count: 16,
           tokens: expect.any(Array),
+          state_dict: expect.objectContaining({
+            tensors: expect.any(Object),
+          }),
         }),
       );
       expect(latentBasis).toEqual(
@@ -1109,6 +1309,257 @@ describe('UltraShape runtime flow', () => {
     }
   });
 
+  it('changes mesh-conditioned downstream metadata when only the coarse mesh changes', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const firstOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+
+      const secondOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.binaryCoarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+
+      const firstMetrics = getRunnerMetrics(firstOutcome);
+      const secondMetrics = getRunnerMetrics(secondOutcome);
+
+      expect(firstMetrics.preprocess).toEqual(secondMetrics.preprocess);
+      expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
+      expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
+      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
+      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('changes image-conditioned downstream metadata when only the reference image changes', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const firstOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+
+      writeFileSync(fixture.referenceImage, 'image-with-real-preprocess-drift');
+
+      const secondOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+
+      const firstMetrics = getRunnerMetrics(firstOutcome);
+      const secondMetrics = getRunnerMetrics(secondOutcome);
+
+      expect(firstMetrics.preprocess).not.toEqual(secondMetrics.preprocess);
+      expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
+      expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
+      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
+      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('publishes checkpoint-backed image conditioning metadata from SingleImageEncoder', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+
+      expect(getRunnerMetrics(outcome).conditioning).toEqual(
+        expect.objectContaining({
+          encoder: 'SingleImageEncoder',
+          image_token_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+          conditioning_signature: expect.any(Number),
+        }),
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('uses FlowMatchEulerDiscreteScheduler-guided RefineDiT denoising instead of step-agnostic placeholders', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const firstOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 12,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+      const secondOutputDir = join(fixture.root, 'output-steps-30');
+      mkdirSync(secondOutputDir);
+      const secondOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: secondOutputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+      const firstMetrics = getRunnerMetrics(firstOutcome);
+      const secondMetrics = getRunnerMetrics(secondOutcome);
+
+      expect(firstMetrics.scheduler).toEqual(
+        expect.objectContaining({
+          family: 'flow-matching-euler-discrete',
+          target: 'diffusers.FlowMatchEulerDiscreteScheduler',
+          timestep_signature: expect.any(Number),
+        }),
+      );
+      expect(firstMetrics.denoise).toEqual(
+        expect.objectContaining({
+          model: 'RefineDiT',
+          scheduler_signature: expect.any(Number),
+        }),
+      );
+      expect(firstMetrics.scheduler).not.toEqual(secondMetrics.scheduler);
+      expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
+      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
+      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('hydrates checkpoint-backed modules and invokes real diffusers/cubvh seams in the supported path', () => {
+    const fixture = createFixtureWorkspace();
+    const diffusersTracePath = join(fixture.root, 'diffusers-trace.json');
+    const cubvhTracePath = join(fixture.root, 'cubvh-trace.json');
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const outcome = runLocalRunner(
+        {
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: fixture.outputDir,
+          output_format: 'glb',
+          checkpoint: null,
+          config_path: fixture.configPath,
+          ext_dir: fixture.root,
+          backend: 'local',
+          steps: 30,
+          guidance_scale: 5.5,
+          seed: 7,
+          preserve_scale: true,
+        },
+        {
+          env: {
+            ULTRASHAPE_TEST_DIFFUSERS_TRACE_PATH: diffusersTracePath,
+            ULTRASHAPE_TEST_CUBVH_TRACE_PATH: cubvhTracePath,
+          },
+        },
+      );
+
+      expect(outcome?.ok).toBe(true);
+      const metrics = getRunnerMetrics(outcome);
+      expect(metrics.checkpoint).toEqual(
+        expect.objectContaining({
+          load_style: 'load_state_dict',
+          hydrated_modules: ['conditioner', 'dit', 'vae'],
+        }),
+      );
+      expect(JSON.parse(readFileSync(diffusersTracePath, 'utf8'))).toEqual(
+        expect.objectContaining({
+          event: 'set_timesteps',
+          step_count: 30,
+        }),
+      );
+      expect(JSON.parse(readFileSync(cubvhTracePath, 'utf8'))).toEqual(
+        expect.objectContaining({
+          points: expect.any(Number),
+          preserve_scale: true,
+        }),
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it('derives staged closure metrics from checkpoint tensor values, not subtree key presence alone', () => {
     const fixture = createFixtureWorkspace();
 
@@ -1155,6 +1606,65 @@ describe('UltraShape runtime flow', () => {
 
       expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
       expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
+      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
+      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('changes checkpoint-backed refine metrics and output bytes when only checkpoint subtree content changes', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+      writeCheckpointBundle(fixture.checkpoint, 'a');
+
+      const firstOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+      writeCheckpointBundle(fixture.checkpoint, 'b');
+
+      const secondOutputDir = join(fixture.root, 'output-checkpoint-b');
+      mkdirSync(secondOutputDir);
+      const secondOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: secondOutputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+      const firstMetrics = getRunnerMetrics(firstOutcome);
+      const secondMetrics = getRunnerMetrics(secondOutcome);
+
+      expect(firstMetrics.conditioning).toEqual(
+        expect.objectContaining({
+          checkpoint_signature: expect.any(Number),
+        }),
+      );
+      expect(firstMetrics.denoise).toEqual(
+        expect.objectContaining({
+          checkpoint_signature: expect.any(Number),
+        }),
+      );
       expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
       expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
     } finally {
@@ -1269,6 +1779,13 @@ describe('UltraShape runtime flow', () => {
           }),
           fallbacks: ['flash_attn->sdpa'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
+          runtime_contract: {
+            backend: 'local-only',
+            scope: 'mc-only',
+            output_format: 'glb-only',
+            requires_exact_closure: true,
+            checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
+          },
           warnings: [],
         },
       });

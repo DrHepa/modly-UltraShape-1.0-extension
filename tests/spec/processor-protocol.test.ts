@@ -5,6 +5,8 @@ import { join, resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { preflightRefinerExecution } from '../../src/processes/ultrashape-refiner/preflight.js';
+
 const repoRoot = process.cwd();
 const processorPath = resolve(repoRoot, 'processor.py');
 const manifestPath = resolve(repoRoot, 'manifest.json');
@@ -24,6 +26,40 @@ function torchCheckpointStubSource() {
     'def load(path, map_location=None, weights_only=False):',
     '    with zipfile.ZipFile(path, "r") as archive:',
     '        return json.loads(archive.read("checkpoint.json").decode("utf8"))',
+    '',
+  ].join('\n');
+}
+
+function diffusersStubSource() {
+  return [
+    '__version__ = "0.0-test"',
+    'class FlowMatchEulerDiscreteScheduler:',
+    '    def __init__(self, **config):',
+    '        self.config = dict(config)',
+    '        self.timesteps = []',
+    '',
+    '    @classmethod',
+    '    def from_config(cls, config):',
+    '        payload = dict(config) if isinstance(config, dict) else {"value": config}',
+    '        return cls(**payload)',
+    '',
+    '    def set_timesteps(self, step_count):',
+    '        self.timesteps = list(range(int(step_count)))',
+    '',
+  ].join('\n');
+}
+
+function cubvhStubSource() {
+  return [
+    '__version__ = "0.0-test"',
+    'def sparse_marching_cubes(*, points, threshold=0.0, preserve_scale=True):',
+    '    vertices = [tuple(float(axis) for axis in point) for point in points]',
+    '    faces = []',
+    '    for index in range(1, max(len(vertices) - 1, 1)):',
+    '        if index + 1 >= len(vertices):',
+    '            break',
+    '        faces.append((0, index, index + 1))',
+    '    return vertices, faces',
     '',
   ].join('\n');
 }
@@ -196,7 +232,7 @@ function createFixtureWorkspace() {
   writeFileSync(namedCoarseMesh, createBinaryGlbBytes());
   writeFileSync(fallbackCoarseMesh, 'fallback-mesh');
   writeFileSync(packagedArtifact, 'refined-artifact');
-  writeFileSync(join(stubDir, 'cubvh.py'), '__version__ = "0.0-test"\n');
+  writeFileSync(join(stubDir, 'cubvh.py'), cubvhStubSource());
   writeFileSync(join(stubDir, 'torch.py'), torchCheckpointStubSource());
   writeFileSync(join(stubDir, 'trimesh.py'), trimeshStubSource());
 
@@ -412,6 +448,32 @@ function runLocalRunner(
 }
 
 describe('UltraShape processor.py protocol', () => {
+  it('maps deferred backend requests to LOCAL_RUNTIME_UNAVAILABLE under the truthful local-only contract', () => {
+    for (const backend of ['remote', 'hybrid'] as const) {
+      expect(() => preflightRefinerExecution(backend as never)).toThrowError(
+        expect.objectContaining({
+          code: 'LOCAL_RUNTIME_UNAVAILABLE',
+          message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
+        }),
+      );
+    }
+  });
+
+  it('maps deferred output formats to LOCAL_RUNTIME_UNAVAILABLE under the truthful glb-only contract', () => {
+    for (const outputFormat of ['obj', 'fbx', 'ply'] as const) {
+      expect(() =>
+        preflightRefinerExecution('auto', {
+          requestedOutputFormat: outputFormat,
+        }),
+      ).toThrowError(
+        expect.objectContaining({
+          code: 'LOCAL_RUNTIME_UNAVAILABLE',
+          message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
+        }),
+      );
+    }
+  });
+
   it('treats named reference_image and coarse_mesh inputs as the primary manifest contract and rejects non-glb output requests for the local-only MVP', () => {
     expect(manifest.nodes[0]?.inputs).toEqual([
       {
@@ -617,7 +679,40 @@ describe('UltraShape processor.py protocol', () => {
     const configPath = join(fixture.root, 'runtime-config.yaml');
     const checkpointPath = join(fixture.root, 'ultrashape_v1.pt');
 
-    writeFileSync(configPath, 'scope: mc-only\n');
+    writeFileSync(
+      configPath,
+      [
+        'model:',
+        '  scope: mc-only',
+        'runtime:',
+        '  backend: local',
+        '  requires_exact_closure: true',
+        'export:',
+        '  format: glb',
+        'checkpoint:',
+        '  required_subtrees:',
+        '    - vae',
+        '    - dit',
+        '    - conditioner',
+        'dependencies:',
+        '  required:',
+        '    imports:',
+        '      - diffusers',
+        '      - cubvh',
+        'vae_config:',
+        '  enabled: true',
+        'dit_cfg:',
+        '  enabled: true',
+        'conditioner_config:',
+        '  enabled: true',
+        'image_processor_cfg:',
+        '  enabled: true',
+        'scheduler_cfg:',
+        '  family: flow-matching',
+        '',
+      ].join('\n'),
+    );
+    writeFileSync(join(fixture.root, 'py-stubs', 'diffusers.py'), diffusersStubSource());
     writeBinaryCheckpointBundle(checkpointPath, checkpointBundlePayload());
 
     try {
@@ -647,15 +742,22 @@ describe('UltraShape processor.py protocol', () => {
       expect(outcome.status).toBe(0);
       expect(outcome.result).toEqual({
         ok: true,
-        result: {
+        result: expect.objectContaining({
           file_path: join(fixture.outputDir, 'refined.glb'),
           format: 'glb',
           backend: 'local',
           metrics: expect.any(Object),
           fallbacks: ['flash_attn->sdpa'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
+          runtime_contract: {
+            backend: 'local-only',
+            scope: 'mc-only',
+            output_format: 'glb-only',
+            requires_exact_closure: true,
+            checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
+          },
           warnings: [],
-        },
+        }),
       });
       const metrics = getRunnerMetrics(outcome.result);
 
@@ -675,7 +777,7 @@ describe('UltraShape processor.py protocol', () => {
             mask_tokens: expect.any(Number),
           }),
           scheduler: expect.objectContaining({
-            family: 'flow-matching',
+            family: 'flow-matching-euler-discrete',
             step_count: 30,
           }),
           denoise: expect.objectContaining({

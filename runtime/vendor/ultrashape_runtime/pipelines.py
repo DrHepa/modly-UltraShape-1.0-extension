@@ -9,12 +9,12 @@ from pathlib import Path
 from .models.autoencoders.model import ShapeVAE
 from .models.autoencoders.surface_extractors import extract_surface
 from .models.autoencoders.volume_decoders import decode_volume
-from .models.conditioner_mask import build_conditioning_mask
-from .models.denoisers.dit_mask import denoise_conditioned_latents
-from .preprocessors import normalize_reference_asset
+from .models.conditioner_mask import SingleImageEncoder
+from .models.denoisers.dit_mask import RefineDiT
+from .preprocessors import ImageProcessorV2, normalize_reference_asset
 from .schedulers import build_flow_matching_schedule
-from .surface_loaders import load_coarse_surface
-from .utils.checkpoint import load_checkpoint_subtrees
+from .surface_loaders import SharpEdgeSurfaceLoader, load_coarse_surface
+from .utils.checkpoint import apply_checkpoint_state, load_checkpoint_subtrees
 from .utils.mesh import evaluate_geometric_gate, export_refined_glb
 
 
@@ -176,6 +176,8 @@ def run_refine_pipeline(
 
     checkpoint_config = config.get('checkpoint') if isinstance(config.get('checkpoint'), dict) else {}
     weights = config.get('weights') if isinstance(config.get('weights'), dict) else {}
+    image_processor = ImageProcessorV2()
+    surface_loader = SharpEdgeSurfaceLoader()
     reference_asset = normalize_reference_asset(reference_image)
     coarse_surface = load_coarse_surface(coarse_mesh)
     checkpoint_bundle = load_checkpoint_subtrees(
@@ -185,19 +187,23 @@ def run_refine_pipeline(
         checkpoint_config.get('required_subtrees') if isinstance(checkpoint_config.get('required_subtrees'), list) else None,
     )
     checkpoint_state = checkpoint_bundle['bundle'] if isinstance(checkpoint_bundle.get('bundle'), dict) else {}
-    conditioning = build_conditioning_mask(
+    conditioner = SingleImageEncoder()
+    conditioner_hydration = apply_checkpoint_state(conditioner, checkpoint_state.get('conditioner'))
+    conditioning = conditioner.build(
         reference_asset=reference_asset,
         coarse_surface=coarse_surface,
-        checkpoint_state=checkpoint_state.get('conditioner'),
     )
     schedule = build_flow_matching_schedule(steps=steps, guidance_scale=guidance_scale)
-    denoised = denoise_conditioned_latents(
+    denoiser = RefineDiT()
+    denoiser_hydration = apply_checkpoint_state(denoiser, checkpoint_state.get('dit'))
+    denoised = denoiser.denoise(
         conditioning=conditioning,
         schedule=schedule,
-        checkpoint_state=checkpoint_state.get('dit'),
         seed=seed,
     )
-    decoded_latents = ShapeVAE(checkpoint_state=checkpoint_state.get('vae')).decode_latents(denoised, reference_asset)
+    vae = ShapeVAE()
+    vae_hydration = apply_checkpoint_state(vae, checkpoint_state.get('vae'))
+    decoded_latents = vae.decode_latents(denoised, reference_asset)
     decoded_volume = decode_volume(decoded_latents)
     refined_surface = extract_surface(
         extraction=extraction,
@@ -241,33 +247,72 @@ def run_refine_pipeline(
             'topology_changed': gate_metrics['topology_changed'],
             'extent_ratio': gate_metrics['extent_ratio'],
             'execution_trace': ['preprocess', 'conditioning', 'scheduler', 'denoise', 'decode', 'extract'],
-            'checkpoint': checkpoint_bundle.get('summary'),
+            'checkpoint': {
+                **(checkpoint_bundle.get('summary') if isinstance(checkpoint_bundle.get('summary'), dict) else {}),
+                'load_style': 'load_state_dict',
+                'hydrated_modules': ['conditioner', 'dit', 'vae'],
+                'strict': False,
+                'hydration': [conditioner_hydration, denoiser_hydration, vae_hydration],
+            },
             'preprocess': {
+                'processor': image_processor.__class__.__name__,
                 'byte_length': reference_asset['byte_length'],
                 'normalized_channels': reference_asset['normalized_channels'],
+                'image_signature': reference_asset['image_signature'],
+                'mask_signature': reference_asset['mask_signature'],
                 'signature': reference_asset['signature'],
             },
             'conditioning': {
+                'surface_loader': surface_loader.__class__.__name__,
+                'encoder': conditioning['encoder'],
+                'voxelizer': coarse_surface['voxels']['voxelizer'],
                 'voxel_count': conditioning['voxel_count'],
                 'mask_tokens': conditioning['mask_tokens'],
+                'surface_signature': coarse_surface['mesh']['signature'],
+                'voxel_signature': coarse_surface['voxels']['voxel_signature'],
+                'image_token_signature': conditioning['image_token_signature'],
+                'mask_token_signature': conditioning['mask_token_signature'],
+                'checkpoint_signature': conditioning['checkpoint_signature'],
+                'conditioning_signature': conditioning['conditioning_signature'],
+                'state_hydrated': conditioning['state_hydrated'],
                 'signature': conditioning['signature'],
             },
             'scheduler': {
                 'family': schedule['family'],
+                'target': schedule['target'],
                 'step_count': schedule['step_count'],
+                'guidance_scale': schedule['guidance_scale'],
+                'timestep_signature': schedule['timestep_signature'],
             },
             'denoise': {
+                'model': denoised['model'],
                 'attention': denoised['attention'],
+                'checkpoint_signature': denoised['checkpoint_signature'],
+                'scheduler_signature': denoised['scheduler_signature'],
                 'latent_signature': denoised['latent_signature'],
+                'state_hydrated': denoised['state_hydrated'],
             },
             'decode': {
+                'vae': decoded_latents['vae'],
+                'decoder': decoded_volume['decoder'],
+                'mesh_signature': decoded_volume['mesh_signature'],
                 'field_density': decoded_volume['field_density'],
                 'field_signature': decoded_volume['field_signature'],
+                'state_hydrated': decoded_latents['state_hydrated'],
             },
             'extract': {
                 'extractor': refined_surface['extractor'],
+                'marching_cubes': refined_surface['marching_cubes'],
+                'vertex_count': refined_surface['vertex_count'],
+                'face_count': refined_surface['face_count'],
                 'payload_bytes': len(refined_payload['bytes']),
                 'surface_signature': refined_surface['surface_signature'],
+            },
+            'gate': {
+                'coarse_vertex_count': gate_metrics['coarse_vertex_count'],
+                'refined_vertex_count': gate_metrics['refined_vertex_count'],
+                'coarse_face_count': gate_metrics['coarse_face_count'],
+                'refined_face_count': gate_metrics['refined_face_count'],
             },
         },
         'fallbacks': ['flash_attn->sdpa'] if denoised['attention'] == 'sdpa' else [],
