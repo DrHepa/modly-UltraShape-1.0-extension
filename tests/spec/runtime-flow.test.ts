@@ -10,6 +10,42 @@ const processorPath = resolve(repoRoot, 'processor.py');
 const runtimeVendorPath = resolve(repoRoot, 'runtime', 'vendor');
 const runtimeConfigSourcePath = resolve(repoRoot, 'runtime', 'configs', 'infer_dit_refine.yaml');
 
+function torchCheckpointStubSource() {
+  return [
+    '__version__ = "0.0-test"',
+    'import json',
+    'import zipfile',
+    '',
+    'def load(path, map_location=None, weights_only=False):',
+    '    with zipfile.ZipFile(path, "r") as archive:',
+    '        return json.loads(archive.read("checkpoint.json").decode("utf8"))',
+    '',
+  ].join('\n');
+}
+
+function writeBinaryCheckpointBundle(path: string, payload: Record<string, unknown>) {
+  const outcome = spawnSync(
+    'python3',
+    [
+      '-c',
+      [
+        'import sys, json, zipfile',
+        'path = sys.argv[1]',
+        'payload = sys.argv[2]',
+        'with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:',
+        '    archive.writestr("checkpoint.json", payload)',
+      ].join('\n'),
+      path,
+      JSON.stringify(payload),
+    ],
+    { encoding: 'utf8' },
+  );
+
+  if (outcome.status !== 0) {
+    throw new Error(outcome.stderr || 'Failed to write binary checkpoint bundle.');
+  }
+}
+
 function expectUpstreamRuntimeGraph(configText: string) {
   expect(configText).toContain('checkpoint:');
   expect(configText).toContain('preprocess:');
@@ -87,6 +123,7 @@ function createFixtureWorkspace() {
   writeFileSync(binaryCoarseMesh, createBinaryGlbBytes());
   writeFileSync(packagedArtifact, 'refined-mesh');
   writeFileSync(join(stubDir, 'cubvh.py'), '__version__ = "0.0-test"\n');
+  writeFileSync(join(stubDir, 'torch.py'), torchCheckpointStubSource());
   writeCheckpointBundle(checkpoint);
 
   return {
@@ -138,10 +175,7 @@ function checkpointBundlePayload(variant: 'a' | 'b' = 'a') {
 }
 
 function writeCheckpointBundle(path: string, variant: 'a' | 'b' = 'a') {
-  writeFileSync(
-    path,
-    JSON.stringify(checkpointBundlePayload(variant)),
-  );
+  writeBinaryCheckpointBundle(path, checkpointBundlePayload(variant));
 }
 
 function expectRealClosureMetrics(metrics: Record<string, unknown>) {
@@ -192,7 +226,7 @@ function installProcessorRuntime(extDir: string) {
   mkdirSync(modelsDir, { recursive: true });
 
   cpSync(resolve(repoRoot, 'runtime', 'vendor', 'ultrashape_runtime'), runtimePackageDir, { recursive: true });
-  writeFileSync(join(runtimeDir, 'torch.py'), '__version__ = "0.0-test"\n');
+  writeFileSync(join(runtimeDir, 'torch.py'), torchCheckpointStubSource());
   writeFileSync(join(runtimeDir, 'torchvision.py'), '__version__ = "0.0-test"\n');
   writeFileSync(join(runtimeDir, 'numpy.py'), '__version__ = "0.0-test"\n');
   writeFileSync(join(runtimeDir, 'trimesh.py'), '__version__ = "0.0-test"\n');
@@ -680,14 +714,10 @@ describe('UltraShape runtime flow', () => {
 
     try {
       writeRuntimeConfig(fixture.configPath);
-      writeFileSync(
-        fixture.checkpoint,
-        JSON.stringify({
-          format: 'ultrashape-checkpoint-bundle/v1',
-          vae: { weights: 'fixture-vae' },
-          dit: { weights: 'fixture-dit' },
-        }),
-      );
+      writeBinaryCheckpointBundle(fixture.checkpoint, {
+        vae: { weights: 'fixture-vae' },
+        dit: { weights: 'fixture-dit' },
+      });
 
       const outcome = runLocalRunner({
         reference_image: fixture.referenceImage,
@@ -719,15 +749,11 @@ describe('UltraShape runtime flow', () => {
 
     try {
       writeRuntimeConfig(fixture.configPath);
-      writeFileSync(
-        fixture.checkpoint,
-        JSON.stringify({
-          format: 'ultrashape-checkpoint-bundle/v1',
-          vae: { weights: 'fixture-vae' },
-          dit: { weights: 'fixture-dit' },
-          conditioner: { weights: 'fixture-conditioner' },
-        }),
-      );
+      writeBinaryCheckpointBundle(fixture.checkpoint, {
+        vae: { weights: 'fixture-vae' },
+        dit: { weights: 'fixture-dit' },
+        conditioner: { weights: 'fixture-conditioner' },
+      });
 
       const outcome = runLocalRunner({
         reference_image: fixture.referenceImage,

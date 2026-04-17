@@ -15,6 +15,42 @@ const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
   }>;
 };
 
+function torchCheckpointStubSource() {
+  return [
+    '__version__ = "0.0-test"',
+    'import json',
+    'import zipfile',
+    '',
+    'def load(path, map_location=None, weights_only=False):',
+    '    with zipfile.ZipFile(path, "r") as archive:',
+    '        return json.loads(archive.read("checkpoint.json").decode("utf8"))',
+    '',
+  ].join('\n');
+}
+
+function writeBinaryCheckpointBundle(path: string, payload: Record<string, unknown>) {
+  const outcome = spawnSync(
+    'python3',
+    [
+      '-c',
+      [
+        'import sys, json, zipfile',
+        'path = sys.argv[1]',
+        'payload = sys.argv[2]',
+        'with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:',
+        '    archive.writestr("checkpoint.json", payload)',
+      ].join('\n'),
+      path,
+      JSON.stringify(payload),
+    ],
+    { encoding: 'utf8' },
+  );
+
+  if (outcome.status !== 0) {
+    throw new Error(outcome.stderr || 'Failed to write binary checkpoint bundle.');
+  }
+}
+
 function createBinaryGlbBytes() {
   const jsonChunk = Buffer.from('{"asset":{"version":"2.0"}}   ', 'utf8');
   const binaryChunk = Buffer.from([0x00, 0x80, 0x00, 0x00]);
@@ -67,6 +103,7 @@ function createFixtureWorkspace() {
   writeFileSync(fallbackCoarseMesh, 'fallback-mesh');
   writeFileSync(packagedArtifact, 'refined-artifact');
   writeFileSync(join(stubDir, 'cubvh.py'), '__version__ = "0.0-test"\n');
+  writeFileSync(join(stubDir, 'torch.py'), torchCheckpointStubSource());
 
   return {
     root,
@@ -179,7 +216,6 @@ function installFakeRunnerExtension(root: string) {
 
 function checkpointBundlePayload() {
   return {
-    format: 'ultrashape-checkpoint-bundle/v1',
     vae: {
       tensors: {
         latent_basis: [0.11, 0.33, 0.55, 0.77],
@@ -487,10 +523,7 @@ describe('UltraShape processor.py protocol', () => {
     const checkpointPath = join(fixture.root, 'ultrashape_v1.pt');
 
     writeFileSync(configPath, 'scope: mc-only\n');
-    writeFileSync(
-      checkpointPath,
-      JSON.stringify(checkpointBundlePayload()),
-    );
+    writeBinaryCheckpointBundle(checkpointPath, checkpointBundlePayload());
 
     try {
       const outcome = runLocalRunner(
