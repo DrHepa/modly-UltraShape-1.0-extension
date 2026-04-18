@@ -100,8 +100,6 @@ describe('UltraShape refiner manifest', () => {
         options: [
           { value: 'auto', label: 'auto' },
           { value: 'local', label: 'local' },
-          { value: 'remote', label: 'remote' },
-          { value: 'hybrid', label: 'hybrid' },
         ],
       },
       {
@@ -127,12 +125,7 @@ describe('UltraShape refiner manifest', () => {
         label: 'Output Format',
         type: 'select',
         default: 'glb',
-        options: [
-          { value: 'glb', label: 'glb' },
-          { value: 'obj', label: 'obj' },
-          { value: 'fbx', label: 'fbx' },
-          { value: 'ply', label: 'ply' },
-        ],
+        options: [{ value: 'glb', label: 'glb' }],
       },
     ]);
 
@@ -147,7 +140,7 @@ describe('UltraShape refiner manifest', () => {
     expect(manifest.testing_fallback_only.temporary).toBe(true);
     expect(manifest.testing_fallback_only.non_native).toBe(true);
     expect(manifest.testing_fallback_only.semantic_contract).toBe(
-      'reference_image + coarse_mesh -> refined_mesh',
+      'reference_image + coarse_mesh -> refined.glb',
     );
     expect(manifest.testing_fallback_only.bundle_schema).toEqual({
       reference_image: 'path',
@@ -165,7 +158,7 @@ describe('UltraShape refiner manifest', () => {
       preserve_scale: {
         location: 'runtime-only default',
         default: true,
-        reason: 'Deferred because the current UI does not faithfully support the required boolean control.',
+        reason: 'Runtime-only because the local MVP keeps preserve-scale enforced instead of advertising extra UI branches.',
       },
     });
     expect(manifest.testing_fallback_only.fallback_input_contract).toEqual({
@@ -178,7 +171,7 @@ describe('UltraShape refiner manifest', () => {
         coarse_mesh: 'params.coarse_mesh',
       },
       rationale:
-        'Temporary fallback seam only until Modly supplies native multi-input process routing for both semantic ids.',
+        'Temporary local-only fallback seam only until Modly supplies native multi-input process routing for both semantic ids.',
     });
     expect(manifest.testing_fallback_only.draft_manifest_seam.reason).toContain(
       'may not yet express the ideal multi-input process contract',

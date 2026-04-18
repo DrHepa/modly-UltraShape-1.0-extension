@@ -204,9 +204,9 @@ function validateBackend(value: unknown): UltraShapeBackendMode {
 }
 
 function validateOutputFormat(value: unknown): UltraShapeOutputFormat {
-  const allowed: UltraShapeOutputFormat[] = ['glb', 'obj', 'fbx', 'ply'];
+  const allowed: UltraShapeOutputFormat[] = ['glb'];
   if (typeof value !== 'string' || !allowed.includes(value as UltraShapeOutputFormat)) {
-    throw createProcessError('INVALID_PARAMS', 'output_format must be glb, obj, fbx, or ply.', 'output_format');
+    throw createProcessError('LOCAL_RUNTIME_UNAVAILABLE', 'output_format must be glb.', 'output_format');
   }
 
   return value as UltraShapeOutputFormat;
@@ -278,6 +278,6 @@ export function createProcessError(
   const error = new Error(message) as UltraShapeProcessError;
   error.code = code;
   error.field = field;
-  error.recoverable = code !== 'LOCAL_RUNTIME_UNAVAILABLE';
+  error.recoverable = code !== 'LOCAL_RUNTIME_UNAVAILABLE' && code !== 'CANCELLED';
   return error;
 }

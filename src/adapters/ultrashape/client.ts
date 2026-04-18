@@ -20,8 +20,6 @@ export interface UltraShapeExecutionArtifact {
 export interface UltraShapeExecutionRequest {
   request: UltraShapeNormalizedRequest;
   backend: UltraShapeAdapterBackend;
-  /** `compatibility-fallback` only exists for temporary legacy payload support. */
-  contract?: 'named-inputs' | 'compatibility-fallback';
   signal?: AbortSignal;
   onUpdate?: (update: UltraShapeAdapterUpdate) => void;
 }

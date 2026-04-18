@@ -94,7 +94,7 @@ describe('UltraShape request contract', () => {
       expect(events.at(-1)).toEqual({
         type: 'error',
         message: expect.stringContaining('coarse_mesh'),
-        code: 'MISSING_INPUT',
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
       });
     } finally {
       fixture.cleanup();
@@ -144,10 +144,10 @@ describe('UltraShape request contract', () => {
           coarse_mesh: fixture.coarseMesh,
           output_dir: fixture.outputDir,
           params: {
-            output_format: 'stl' as never,
+            output_format: 'obj' as never,
           },
         }),
-      ).toThrowError(/output_format/);
+      ).toThrowError(/output_format must be glb/i);
     } finally {
       fixture.cleanup();
     }
@@ -162,13 +162,13 @@ describe('UltraShape request contract', () => {
         coarse_mesh: { path: fixture.coarseMesh, kind: 'mesh' },
         output_dir: fixture.outputDir,
         checkpoint: null,
-        params: {
-          backend: 'local',
-          steps: 40,
-          guidance_scale: 6,
-          preserve_scale: false,
-          output_format: 'obj',
-        },
+          params: {
+            backend: 'local',
+            steps: 40,
+            guidance_scale: 6,
+            preserve_scale: false,
+            output_format: 'glb',
+          },
         correlation_id: 'native-case',
       });
 
@@ -177,13 +177,13 @@ describe('UltraShape request contract', () => {
         coarse_mesh: fixture.coarseMesh,
         output_dir: fixture.outputDir,
         checkpoint: null,
-        params: {
-          backend: 'local',
-          steps: 40,
-          guidance_scale: 6,
-          preserve_scale: false,
-          output_format: 'obj',
-        },
+          params: {
+            backend: 'local',
+            steps: 40,
+            guidance_scale: 6,
+            preserve_scale: false,
+            output_format: 'glb',
+          },
         correlation_id: 'fallback-case',
       });
 

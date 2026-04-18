@@ -1,6 +1,6 @@
 export type UltraShapeAssetKind = 'image' | 'mesh';
 export type UltraShapeBackendMode = 'auto' | 'local';
-export type UltraShapeOutputFormat = 'glb' | 'obj' | 'fbx' | 'ply';
+export type UltraShapeOutputFormat = 'glb';
 export type UltraShapeProgressStage =
   | 'validating'
   | 'preflight'

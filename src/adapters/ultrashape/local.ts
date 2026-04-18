@@ -10,7 +10,7 @@ export class UltraShapeLocalAdapter implements UltraShapeRuntimeAdapter {
   async run(_request: UltraShapeExecutionRequest): Promise<never> {
     throw createProcessError(
       'LOCAL_RUNTIME_UNAVAILABLE',
-      'LOCAL_RUNTIME_UNAVAILABLE: The TypeScript compatibility adapter does not execute UltraShape locally; use the repo-root processor.py runtime boundary.',
+      'LOCAL_RUNTIME_UNAVAILABLE: The TypeScript adapter is only a local runtime seam; use the repo-root processor.py boundary.',
       'backend',
     );
   }

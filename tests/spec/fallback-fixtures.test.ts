@@ -31,7 +31,9 @@ describe('UltraShape fallback fixtures and docs', () => {
   });
 
   it('documents the semantic contract, temporary fallback, and deferred future seam', () => {
-    expect(readme).toContain(manifest.testing_fallback_only.semantic_contract);
+    expect(manifest.testing_fallback_only.semantic_contract).toBe('reference_image + coarse_mesh -> refined.glb');
+    expect(readme).toContain('local-only');
+    expect(readme).toContain('glb-only');
     expect(readme).toContain('temporary `params.coarse_mesh` seam');
     expect(readme).toContain('root `manifest.json` + `setup.py` + `processor.py`');
     expect(readme).toContain('Hunyuan is the recommended and currently validated upstream source, but it is NOT required');

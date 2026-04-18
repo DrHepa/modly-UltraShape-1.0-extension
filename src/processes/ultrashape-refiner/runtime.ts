@@ -62,7 +62,7 @@ export async function runRefinerRuntime(
     const refinedMeshPath = packageArtifact(
       artifact.path,
       request.outputDir,
-      artifact.format ?? request.params.output_format,
+      resolveArtifactFormat(artifact.format, request.params.output_format),
     );
 
     const result: UltraShapeRefinerResult = {
@@ -71,7 +71,7 @@ export async function runRefinerRuntime(
         kind: 'mesh',
       },
       backendUsed: preflight.selectedBackend,
-      outputFormat: artifact.format ?? request.params.output_format,
+      outputFormat: resolveArtifactFormat(artifact.format, request.params.output_format),
       warnings: artifact.warnings,
     };
 
@@ -116,6 +116,22 @@ function packageArtifact(sourcePath: string, outputDir: string, outputFormat: Ul
   }
 
   return destinationPath;
+}
+
+function resolveArtifactFormat(
+  artifactFormat: UltraShapeRefinerResult['outputFormat'] | undefined,
+  requestedFormat: UltraShapeRefinerResult['outputFormat'],
+): UltraShapeRefinerResult['outputFormat'] {
+  const resolvedFormat = artifactFormat ?? requestedFormat;
+  if (resolvedFormat !== 'glb') {
+    throw createProcessError(
+      'LOCAL_RUNTIME_UNAVAILABLE',
+      'LOCAL_RUNTIME_UNAVAILABLE: UltraShape runtime artifacts must be glb for this MVP.',
+      'output_format',
+    );
+  }
+
+  return 'glb';
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

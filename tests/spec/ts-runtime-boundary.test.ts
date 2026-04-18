@@ -67,14 +67,37 @@ describe('UltraShape TypeScript runtime boundary', () => {
           run: vi.fn(async () => ({
             path: fixture.artifactPath,
             format: 'glb' as const,
-            warnings: ['compatibility seam still supported'],
+            warnings: ['local-only runtime seam'],
           })),
         },
       });
 
       expect(result.backendUsed).toBe('local');
       expect(result.refinedMesh.path).toBe(join(fixture.outputDir, 'refined.glb'));
-      expect(result.warnings).toEqual(['compatibility seam still supported']);
+      expect(result.outputFormat).toBe('glb');
+      expect(result.warnings).toEqual(['local-only runtime seam']);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects non-glb local adapter artifacts because the runtime boundary is glb-only', async () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      await expect(
+        runRefinerRuntime(createRequest(fixture.outputDir), createPreflight('local'), {
+          localAdapter: {
+            backend: 'local',
+            run: vi.fn(async () => ({
+              path: fixture.artifactPath,
+              format: 'obj' as never,
+            })),
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
     } finally {
       fixture.cleanup();
     }

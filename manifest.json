@@ -31,12 +31,10 @@
           "label": "Backend",
           "type": "select",
           "default": "auto",
-          "options": [
-            { "value": "auto", "label": "auto" },
-            { "value": "local", "label": "local" },
-            { "value": "remote", "label": "remote" },
-            { "value": "hybrid", "label": "hybrid" }
-          ]
+        "options": [
+          { "value": "auto", "label": "auto" },
+          { "value": "local", "label": "local" }
+        ]
         },
         {
           "id": "steps",
@@ -59,15 +57,10 @@
         {
           "id": "output_format",
           "label": "Output Format",
-          "type": "select",
-          "default": "glb",
-          "options": [
-            { "value": "glb", "label": "glb" },
-            { "value": "obj", "label": "obj" },
-            { "value": "fbx", "label": "fbx" },
-            { "value": "ply", "label": "ply" }
-          ]
-        }
+        "type": "select",
+        "default": "glb",
+        "options": [{ "value": "glb", "label": "glb" }]
+      }
       ]
     }
   ],
@@ -75,7 +68,7 @@
     "status": "temporary_non_native",
     "temporary": true,
     "non_native": true,
-    "semantic_contract": "reference_image + coarse_mesh -> refined_mesh",
+    "semantic_contract": "reference_image + coarse_mesh -> refined.glb",
     "bundle_schema": {
       "reference_image": "path",
       "coarse_mesh": "path",
@@ -92,7 +85,7 @@
       "preserve_scale": {
         "location": "runtime-only default",
         "default": true,
-        "reason": "Deferred because the current UI does not faithfully support the required boolean control."
+        "reason": "Runtime-only because the local MVP keeps preserve-scale enforced instead of advertising extra UI branches."
       }
     },
     "fallback_input_contract": {
@@ -104,11 +97,17 @@
         "reference_image": "input.filePath",
         "coarse_mesh": "params.coarse_mesh"
       },
-      "rationale": "Temporary fallback seam only until Modly supplies native multi-input process routing for both semantic ids."
+      "rationale": "Temporary local-only fallback seam only until Modly supplies native multi-input process routing for both semantic ids."
     },
     "draft_manifest_seam": {
       "reason": "Current Modly manifest schema may not yet express the ideal multi-input process contract directly.",
       "forward_compatible_intent": "Preserve final semantic ids and ports now so native core support can adopt them without renaming the contract."
+    },
+    "supported_execution": {
+      "backend_modes": ["auto", "local"],
+      "resolved_backend": "local",
+      "output_formats": ["glb"],
+      "remote_hybrid_supported": false
     }
   }
 }
