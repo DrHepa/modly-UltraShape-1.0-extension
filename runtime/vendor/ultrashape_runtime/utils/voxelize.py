@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import struct
 
-from .tensors import clamp_unit, stable_signature
+from . import clamp_unit, stable_signature
 
 
 GLB_MAGIC = b'glTF'
@@ -261,4 +261,5 @@ def voxelize_from_point(mesh_payload: dict[str, object], *, resolution: int = 12
         'bounds': bounds,
         'tokens': [round(value, 6) for value in voxel_tokens[:8]],
         'voxel_signature': voxel_signature,
+        'occupied_ratio': clamp_unit(len(occupied) / max(len(points), 1)),
     }

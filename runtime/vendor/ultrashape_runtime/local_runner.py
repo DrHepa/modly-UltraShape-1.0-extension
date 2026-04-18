@@ -25,12 +25,6 @@ REQUIRED_FIELDS = {
     'seed',
     'preserve_scale',
 }
-REQUIRED_CONFIG_MARKERS = ('vae_config', 'dit_cfg', 'conditioner_config', 'image_processor_cfg', 'scheduler_cfg')
-REQUIRED_RUNTIME_IMPORTS = ('diffusers', 'cubvh')
-REQUIRED_CHECKPOINT_SUBTREES = ('vae', 'dit', 'conditioner')
-REQUIRED_PUBLIC_BACKEND_MODES = ('auto', 'local')
-REQUIRED_PUBLIC_OUTPUT_FORMATS = ('glb',)
-REQUIRED_PUBLIC_ERROR_CODES = ('DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE')
 
 
 class LocalRunnerError(Exception):
@@ -41,6 +35,28 @@ class LocalRunnerError(Exception):
 
 def normalize_public_error_code(code: object) -> str:
     return str(code) if code in PUBLIC_ERROR_CODES else PUBLIC_ERROR_CODE
+
+
+def collapse_public_message(code: str, message: object) -> str:
+    text = str(message).strip() or 'UltraShape local runner reported an execution failure.'
+
+    for prefix in [
+        'GEOMETRIC_GATE_REJECTED:',
+        'PIPELINE_UNAVAILABLE:',
+        'PIPELINE_DEPENDENCY_ERROR:',
+        'SURFACE_EXTRACTION_ERROR:',
+        'SURFACE_LOAD_ERROR:',
+        'REFERENCE_PREPROCESS_ERROR:',
+        'MESH_EXPORT_ERROR:',
+    ]:
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+
+    if text.startswith(f'{code}:'):
+        return text
+
+    return text
 
 
 def read_job() -> dict[str, object]:
@@ -59,74 +75,6 @@ def read_job() -> dict[str, object]:
     return payload
 
 
-def ensure_file(path_value: str, field: str) -> None:
-    if not Path(path_value).is_file():
-        raise LocalRunnerError(f'{field} is not readable: {path_value}.')
-
-
-def _truth_error(missing: list[str]) -> LocalRunnerError:
-    return LocalRunnerError(
-        'Runtime config is missing exact runtime truth markers required for the real-geometry MVP: '
-        f'{", ".join(missing)}.'
-    )
-
-
-def load_runtime_contract(config_path: str) -> dict[str, object]:
-    config = load_runtime_config(config_path)
-    missing: list[str] = []
-
-    runtime = config.get('runtime') if isinstance(config.get('runtime'), dict) else {}
-    model = config.get('model') if isinstance(config.get('model'), dict) else {}
-    export = config.get('export') if isinstance(config.get('export'), dict) else {}
-    checkpoint = config.get('checkpoint') if isinstance(config.get('checkpoint'), dict) else {}
-    public_contract = config.get('public_contract') if isinstance(config.get('public_contract'), dict) else {}
-    dependencies = config.get('dependencies') if isinstance(config.get('dependencies'), dict) else {}
-    required = dependencies.get('required') if isinstance(dependencies.get('required'), dict) else {}
-    required_imports = required.get('imports') if isinstance(required.get('imports'), list) else []
-    required_subtrees = checkpoint.get('required_subtrees') if isinstance(checkpoint.get('required_subtrees'), list) else []
-    public_backend_modes = public_contract.get('backend_modes') if isinstance(public_contract.get('backend_modes'), list) else []
-    public_output_formats = public_contract.get('success_output_formats') if isinstance(public_contract.get('success_output_formats'), list) else []
-    public_error_codes = public_contract.get('public_error_codes') if isinstance(public_contract.get('public_error_codes'), list) else []
-
-    if runtime.get('requires_exact_closure') is not True:
-        missing.append('runtime.requires_exact_closure=true')
-    if model.get('scope') != 'mc-only':
-        missing.append('model.scope=mc-only')
-    if runtime.get('backend') != 'local':
-        missing.append('runtime.backend=local')
-    if export.get('format') != 'glb':
-        missing.append('export.format=glb')
-    if tuple(public_backend_modes) != REQUIRED_PUBLIC_BACKEND_MODES:
-        missing.append('public_contract.backend_modes=auto,local')
-    if tuple(public_output_formats) != REQUIRED_PUBLIC_OUTPUT_FORMATS:
-        missing.append('public_contract.success_output_formats=glb')
-    if tuple(public_error_codes) != REQUIRED_PUBLIC_ERROR_CODES:
-        missing.append('public_contract.public_error_codes=DEPENDENCY_MISSING,WEIGHTS_MISSING,LOCAL_RUNTIME_UNAVAILABLE')
-
-    for marker in REQUIRED_CONFIG_MARKERS:
-        if not isinstance(config.get(marker), dict):
-            missing.append(marker)
-
-    for module_name in REQUIRED_RUNTIME_IMPORTS:
-        if module_name not in required_imports:
-            missing.append(f'dependencies.required.imports:{module_name}')
-
-    if tuple(required_subtrees) != REQUIRED_CHECKPOINT_SUBTREES:
-        missing.append('checkpoint.required_subtrees=vae,dit,conditioner')
-
-    if missing:
-        raise _truth_error(missing)
-
-    return {
-        'backend': 'local-only',
-        'scope': 'mc-only',
-        'output_format': 'glb-only',
-        'requires_exact_closure': True,
-        'checkpoint_subtrees': list(REQUIRED_CHECKPOINT_SUBTREES),
-        'public_error_codes': list(REQUIRED_PUBLIC_ERROR_CODES),
-    }
-
-
 def run_refine_job(
     *,
     reference_image: str,
@@ -142,10 +90,6 @@ def run_refine_job(
     seed: int | None,
     preserve_scale: bool,
 ) -> dict[str, object]:
-    ensure_file(reference_image, 'reference_image')
-    ensure_file(coarse_mesh, 'coarse_mesh')
-    ensure_file(config_path, 'config_path')
-
     if backend != 'local':
         raise LocalRunnerError('UltraShape local runner is local-only in this MVP.')
     if output_format != 'glb':
@@ -160,7 +104,7 @@ def run_refine_job(
         raise LocalRunnerError('preserve_scale must be a boolean.')
 
     Path(ext_dir)
-    runtime_contract = load_runtime_contract(config_path)
+    load_runtime_config(config_path)
     try:
         pipeline_result = run_refine_pipeline(
             reference_image=reference_image,
@@ -178,7 +122,7 @@ def run_refine_job(
         )
     except Exception as error:
         code = normalize_public_error_code(getattr(error, 'code', PUBLIC_ERROR_CODE))
-        raise LocalRunnerError(str(error), code=code) from error
+        raise LocalRunnerError(collapse_public_message(code, error), code=code) from error
 
     return {
         'file_path': pipeline_result['file_path'],
@@ -187,7 +131,6 @@ def run_refine_job(
         'metrics': pipeline_result['metrics'],
         'fallbacks': pipeline_result['fallbacks'],
         'subtrees_loaded': pipeline_result['subtrees_loaded'],
-        'runtime_contract': runtime_contract,
         'warnings': pipeline_result.get('warnings', []),
     }
 
@@ -206,7 +149,7 @@ def main() -> int:
                 {
                     'ok': False,
                     'error_code': code,
-                    'error_message': str(error),
+                    'error_message': collapse_public_message(code, error),
                 }
             )
         )

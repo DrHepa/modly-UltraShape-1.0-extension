@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ...utils.tensors import clamp_unit, stable_signature
+from ...utils import clamp_unit, stable_signature
 
 CORNER_DIRECTIONS = (
     (-1.0, -1.0, -1.0),
@@ -129,6 +129,8 @@ class VanillaVDMVolumeDecoding:
             'field_signature': stable_signature(dense_field + flattened_coords[:64]),
             'mesh_signature': stable_signature(flattened_coords[:128]),
             'cell_count': len(coords),
+            'corner_count': len(corners),
+            'occupied_cell_count': len(voxel_coords),
             'grid_resolution': max(int(resolution), 1),
         }
 

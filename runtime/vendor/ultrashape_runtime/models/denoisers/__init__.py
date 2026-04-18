@@ -1,6 +1,3 @@
-"""Denoiser exports for the vendored runtime subset."""
+"""Denoiser package marker for the rewrite staging window."""
 
-from .dit_mask import flash_attn_available
-from .moe_layers import moe_enabled
-
-__all__ = ['flash_attn_available', 'moe_enabled']
+__all__: list[str] = []

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .utils.tensors import stable_signature
+from .utils import stable_signature
 from .utils.voxelize import mesh_geometry_from_glb, sample_surface_points, voxelize_from_point
 
 
@@ -46,6 +46,11 @@ def _read_glb_payload(surface_path: Path) -> dict[str, object]:
         'signature': surface_signature,
         'surface_points': surface_points,
         'surface_point_count': len(surface_points),
+        'evidence': {
+            'vertex_count': len(vertices),
+            'face_count': len(faces),
+            'surface_point_count': len(surface_points),
+        },
     }
 
 

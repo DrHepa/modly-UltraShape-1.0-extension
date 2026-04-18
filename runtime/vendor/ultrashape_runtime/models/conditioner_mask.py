@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..utils.checkpoint import checkpoint_signature, checkpoint_tensor_count, checkpoint_tokens, checkpoint_value_count
-from ..utils.tensors import blend_sequences, clamp_unit, stable_signature
+from ..utils import blend_sequences, clamp_unit, stable_signature
 
 
 class SingleImageEncoder:
@@ -29,11 +29,18 @@ class SingleImageEncoder:
         voxels = coarse_surface.get('voxels') if isinstance(coarse_surface.get('voxels'), dict) else {}
         voxel_values = voxels.get('voxel_values') if isinstance(voxels.get('voxel_values'), list) else []
         voxel_tokens = [value / 12.0 for value in voxel_values] if voxel_values else []
+        bounds = mesh.get('bounds') if isinstance(mesh.get('bounds'), dict) else {}
+        extents = bounds.get('extents') if isinstance(bounds.get('extents'), tuple) else (0.0, 0.0, 0.0)
         checkpoint_reference = self.checkpoint_state if self.checkpoint_state is not None else self.state_dict
         checkpoint_signal = checkpoint_tokens(checkpoint_reference)
         encoded_tokens = blend_sequences(image_tokens, mesh_tokens, voxel_tokens, checkpoint_signal)[:8]
         conditioning_strength = clamp_unit(sum(encoded_tokens) / len(encoded_tokens) if encoded_tokens else 0.0)
         checkpoint_state_signature = checkpoint_signature(checkpoint_reference)
+        image_mean = clamp_unit(sum(float(value) for value in image_values) / len(image_values) if image_values else 0.0)
+        mesh_extent_sum = round(sum(float(axis) for axis in extents), 6)
+        occupied_ratio = clamp_unit(
+            float(voxels.get('voxel_count', 0)) / max(float(reference_asset.get('pixel_count', 0)) + len(voxel_values), 1.0)
+        )
 
         return {
             'encoder': self.__class__.__name__,
@@ -47,6 +54,10 @@ class SingleImageEncoder:
             'checkpoint_tensor_count': checkpoint_tensor_count(checkpoint_reference),
             'checkpoint_value_count': checkpoint_value_count(checkpoint_reference),
             'conditioning_signature': stable_signature(encoded_tokens),
+            'conditioning_mean': conditioning_strength,
+            'image_mean': image_mean,
+            'mesh_extent_sum': mesh_extent_sum,
+            'occupied_ratio': occupied_ratio,
             'signature': stable_signature(encoded_tokens),
             'state_hydrated': self.hydrated,
             'hydration': dict(self.hydration) if isinstance(self.hydration, dict) else None,

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 from .models.autoencoders.model import ShapeVAE
-from .models.autoencoders.surface_extractors import extract_surface
+from .models.autoencoders.surface_extractors import evaluate_geometric_gate, export_refined_glb, extract_surface
 from .models.autoencoders.volume_decoders import decode_volume
 from .models.conditioner_mask import SingleImageEncoder
 from .models.denoisers.dit_mask import RefineDiT
@@ -15,7 +15,6 @@ from .preprocessors import ImageProcessorV2
 from .schedulers import build_flow_matching_schedule
 from .surface_loaders import SharpEdgeSurfaceLoader
 from .utils.checkpoint import apply_checkpoint_state, load_checkpoint_subtrees
-from .utils.mesh import evaluate_geometric_gate, export_refined_glb
 
 
 class PipelineDependencyError(Exception):
@@ -246,6 +245,15 @@ def run_refine_pipeline(
         raise PipelineUnavailableError(f'Expected refined.glb output was not generated: {output_path}.')
 
     exported_payload_bytes = Path(output_path).stat().st_size
+    stage_evidence = {
+        'coarse_vertex_count': gate_metrics['coarse_vertex_count'],
+        'refined_vertex_count': gate_metrics['refined_vertex_count'],
+        'coarse_face_count': gate_metrics['coarse_face_count'],
+        'refined_face_count': gate_metrics['refined_face_count'],
+        'coarse_geometry_changed': bool(gate_metrics['coarse_signature'] != gate_metrics['refined_signature']),
+        'image_dependency_proven': bool(reference_asset.get('image_features') != reference_asset.get('mask_features')),
+        'checkpoint_dependency_proven': bool(conditioning.get('checkpoint_tensor_count', 0) and conditioning.get('checkpoint_signature', 0)),
+    }
 
     return {
         'file_path': output_path,
@@ -274,6 +282,9 @@ def run_refine_pipeline(
                 'image_tensor_shape': reference_asset['image_tensor_shape'],
                 'image_feature_count': len(reference_asset['image_features']),
                 'mask_feature_count': len(reference_asset['mask_features']),
+                'mean_intensity': reference_asset['mean_intensity'],
+                'mask_coverage': reference_asset['mask_coverage'],
+                'cutout_applied': reference_asset['cutout_applied'],
                 'image_signature': reference_asset['image_signature'],
                 'mask_signature': reference_asset['mask_signature'],
                 'signature': reference_asset['signature'],
@@ -289,6 +300,9 @@ def run_refine_pipeline(
                 'voxel_count': conditioning['voxel_count'],
                 'voxel_resolution': coarse_surface['voxels']['resolution'],
                 'mask_tokens': conditioning['mask_tokens'],
+                'image_mean': conditioning['image_mean'],
+                'mesh_extent_sum': conditioning['mesh_extent_sum'],
+                'occupied_ratio': conditioning['occupied_ratio'],
                 'surface_signature': coarse_surface['mesh']['signature'],
                 'voxel_signature': coarse_surface['voxels']['voxel_signature'],
                 'image_token_signature': conditioning['image_token_signature'],
@@ -297,6 +311,7 @@ def run_refine_pipeline(
                 'checkpoint_tensor_count': conditioning['checkpoint_tensor_count'],
                 'checkpoint_value_count': conditioning['checkpoint_value_count'],
                 'conditioning_signature': conditioning['conditioning_signature'],
+                'conditioning_mean': conditioning['conditioning_mean'],
                 'state_hydrated': conditioning['state_hydrated'],
                 'hydration': conditioning['hydration'],
                 'signature': conditioning['signature'],
@@ -318,6 +333,8 @@ def run_refine_pipeline(
                 'scheduler_signature': denoised['scheduler_signature'],
                 'conditioning_signature': denoised['conditioning_signature'],
                 'latent_signature': denoised['latent_signature'],
+                'latent_count': denoised['latent_count'],
+                'latent_mean': denoised['latent_mean'],
                 'timestep_count': denoised['timestep_count'],
                 'state_hydrated': denoised['state_hydrated'],
                 'hydration': denoised['hydration'],
@@ -329,6 +346,8 @@ def run_refine_pipeline(
                 'field_density': decoded_volume['field_density'],
                 'field_signature': decoded_volume['field_signature'],
                 'cell_count': decoded_volume['cell_count'],
+                'corner_count': decoded_volume['corner_count'],
+                'occupied_cell_count': decoded_volume['occupied_cell_count'],
                 'grid_resolution': decoded_volume['grid_resolution'],
                 'state_hydrated': decoded_latents['state_hydrated'],
             },
@@ -338,6 +357,7 @@ def run_refine_pipeline(
                 'vertex_count': refined_surface['vertex_count'],
                 'face_count': refined_surface['face_count'],
                 'payload_bytes': exported_payload_bytes,
+                'source_cell_count': refined_surface['source_cell_count'],
                 'surface_signature': refined_surface['surface_signature'],
             },
             'gate': {
@@ -353,6 +373,7 @@ def run_refine_pipeline(
                 'coarse_face_count': gate_metrics['coarse_face_count'],
                 'refined_face_count': gate_metrics['refined_face_count'],
             },
+            'stage_evidence': stage_evidence,
         },
         'fallbacks': ['flash_attn->sdpa'] if denoised['attention'] == 'sdpa' else [],
         'subtrees_loaded': checkpoint_bundle['subtrees_loaded'],

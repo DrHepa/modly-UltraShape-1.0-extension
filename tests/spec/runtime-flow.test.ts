@@ -536,6 +536,58 @@ function getGlbPositionAccessorCount(path: string) {
   return accessor?.count as number;
 }
 
+function getGlbPositions(path: string) {
+  const payload = readFileSync(path);
+  const document = readGlbJson(path);
+  const primitive = document.meshes?.[0]?.primitives?.[0];
+  const positionAccessorIndex = primitive?.attributes?.POSITION;
+  expect(positionAccessorIndex).toEqual(expect.any(Number));
+
+  const accessor = document.accessors?.[positionAccessorIndex as number] as
+    | { bufferView?: unknown; byteOffset?: unknown; count?: unknown; componentType?: unknown; type?: unknown }
+    | undefined;
+  expect(accessor).toEqual(
+    expect.objectContaining({
+      bufferView: expect.any(Number),
+      count: expect.any(Number),
+      componentType: 5126,
+      type: 'VEC3',
+    }),
+  );
+
+  const bufferView = document.bufferViews?.[accessor?.bufferView as number] as
+    | { byteOffset?: unknown; byteLength?: unknown; byteStride?: unknown }
+    | undefined;
+  expect(bufferView).toEqual(
+    expect.objectContaining({
+      byteOffset: expect.any(Number),
+      byteLength: expect.any(Number),
+    }),
+  );
+
+  const jsonLength = payload.readUInt32LE(12);
+  const binChunkHeaderOffset = 20 + jsonLength;
+  const binChunkLength = payload.readUInt32LE(binChunkHeaderOffset);
+  const binChunkType = payload.readUInt32LE(binChunkHeaderOffset + 4);
+  expect(binChunkType).toBe(0x004e4942);
+  const binary = payload.subarray(binChunkHeaderOffset + 8, binChunkHeaderOffset + 8 + binChunkLength);
+
+  const positions: Array<[number, number, number]> = [];
+  const count = Number(accessor?.count ?? 0);
+  const offset = Number(bufferView?.byteOffset ?? 0) + Number(accessor?.byteOffset ?? 0);
+  const stride = Number(bufferView?.byteStride ?? 12) || 12;
+  for (let index = 0; index < count; index += 1) {
+    const start = offset + (index * stride);
+    positions.push([
+      Number(binary.readFloatLE(start).toFixed(6)),
+      Number(binary.readFloatLE(start + 4).toFixed(6)),
+      Number(binary.readFloatLE(start + 8).toFixed(6)),
+    ]);
+  }
+
+  return positions;
+ }
+
 function expectRenderableGlbMesh(path: string) {
   const document = readGlbJson(path);
   expect(document.asset?.version).toBe('2.0');
@@ -670,8 +722,9 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
         image_tensor_shape: [1, 2, 2, 4],
         image_feature_count: expect.any(Number),
         mask_feature_count: expect.any(Number),
-        image_signature: expect.any(Number),
-        mask_signature: expect.any(Number),
+        mean_intensity: expect.any(Number),
+        mask_coverage: expect.any(Number),
+        cutout_applied: expect.any(Boolean),
       }),
       conditioning: expect.objectContaining({
         surface_loader: 'SharpEdgeSurfaceLoader',
@@ -683,32 +736,35 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
         voxel_count: expect.any(Number),
         voxel_resolution: expect.any(Number),
         mask_tokens: expect.any(Number),
-        surface_signature: expect.any(Number),
-        voxel_signature: expect.any(Number),
-        image_token_signature: expect.any(Number),
+        image_mean: expect.any(Number),
+        mesh_extent_sum: expect.any(Number),
+        occupied_ratio: expect.any(Number),
         checkpoint_signature: expect.any(Number),
-        conditioning_signature: expect.any(Number),
+        conditioning_mean: expect.any(Number),
       }),
       scheduler: expect.objectContaining({
         family: 'flow-matching-euler-discrete',
         target: 'diffusers.FlowMatchEulerDiscreteScheduler',
         step_count: expect.any(Number),
-        timestep_signature: expect.any(Number),
+        timestep_count: expect.any(Number),
+        sigma_start: expect.any(Number),
+        sigma_end: expect.any(Number),
       }),
       denoise: expect.objectContaining({
         model: 'RefineDiT',
         attention: expect.any(String),
         checkpoint_signature: expect.any(Number),
-        scheduler_signature: expect.any(Number),
-        latent_signature: expect.any(Number),
+        latent_count: expect.any(Number),
+        latent_mean: expect.any(Number),
       }),
       decode: expect.objectContaining({
         vae: 'ShapeVAE',
         decoder: expect.stringMatching(/VDMVolumeDecoding|VolumeDecoder/u),
-        mesh_signature: expect.any(Number),
         field_density: expect.any(Number),
         cell_count: expect.any(Number),
         grid_resolution: expect.any(Number),
+        corner_count: expect.any(Number),
+        occupied_cell_count: expect.any(Number),
       }),
       extract: expect.objectContaining({
         extractor: 'cubvh.sparse_marching_cubes',
@@ -716,12 +772,16 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
         vertex_count: expect.any(Number),
         face_count: expect.any(Number),
         payload_bytes: expect.any(Number),
+        source_cell_count: expect.any(Number),
       }),
-      gate: expect.objectContaining({
+      stage_evidence: expect.objectContaining({
         coarse_vertex_count: expect.any(Number),
         refined_vertex_count: expect.any(Number),
         coarse_face_count: expect.any(Number),
         refined_face_count: expect.any(Number),
+        coarse_geometry_changed: true,
+        image_dependency_proven: true,
+        checkpoint_dependency_proven: true,
       }),
     }),
   );
@@ -936,7 +996,11 @@ function runLocalRunner(payload: Record<string, unknown>, options: { env?: NodeJ
     },
   });
 
-  return outcome.stdout ? (JSON.parse(outcome.stdout) as Record<string, unknown>) : null;
+  if (!outcome.stdout) {
+    throw new Error('Expected local_runner to emit a JSON result.');
+  }
+
+  return JSON.parse(outcome.stdout) as Record<string, unknown>;
 }
 
 function runPythonSnippet(source: string, args: string[] = [], pythonPathEntries: string[] = []) {
@@ -1155,17 +1219,12 @@ describe('UltraShape runtime flow', () => {
           metrics: expect.any(Object),
           fallbacks: ['flash_attn->sdpa'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
-          runtime_contract: {
-            backend: 'local-only',
-            scope: 'mc-only',
-            output_format: 'glb-only',
-            requires_exact_closure: true,
-            checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
-            public_error_codes: ['DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'],
-          },
           warnings: [],
         },
       });
+      const result = outcome.result;
+      expect(result).not.toBeNull();
+      expect((result as Record<string, unknown>)).not.toHaveProperty('runtime_contract');
       expectRealClosureMetrics(getRunnerMetrics(outcome));
       expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
       expect(getGlbPositionAccessorCount(join(fixture.outputDir, 'refined.glb'))).toBeGreaterThan(8);
@@ -1204,17 +1263,12 @@ describe('UltraShape runtime flow', () => {
           metrics: expect.any(Object),
           fallbacks: ['flash_attn->sdpa'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
-          runtime_contract: {
-            backend: 'local-only',
-            scope: 'mc-only',
-            output_format: 'glb-only',
-            requires_exact_closure: true,
-            checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
-            public_error_codes: ['DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'],
-          },
           warnings: [],
         },
       });
+      const result = outcome.result;
+      expect(result).not.toBeNull();
+      expect((result as Record<string, unknown>)).not.toHaveProperty('runtime_contract');
       expectRealClosureMetrics(getRunnerMetrics(outcome));
       expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
       expect(getGlbPositionAccessorCount(join(fixture.outputDir, 'refined.glb'))).toBeGreaterThan(8);
@@ -1256,7 +1310,7 @@ describe('UltraShape runtime flow', () => {
     }
   });
 
-  it('rejects shorthand synthetic-success configs that omit the exact runtime truth markers', () => {
+  it('treats shorthand configs as pipeline input instead of re-authorizing a synthetic runtime contract in the adapter', () => {
     const fixture = createFixtureWorkspace();
 
     try {
@@ -1278,10 +1332,20 @@ describe('UltraShape runtime flow', () => {
       });
 
       expect(outcome).toEqual({
-        ok: false,
-        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('exact runtime truth'),
+        ok: true,
+        result: {
+          file_path: join(fixture.outputDir, 'refined.glb'),
+          format: 'glb',
+          backend: 'local',
+          metrics: expect.any(Object),
+          fallbacks: ['flash_attn->sdpa'],
+          subtrees_loaded: ['vae', 'dit', 'conditioner'],
+          warnings: [],
+        },
       });
+      const result = outcome.result;
+      expect(result).not.toBeNull();
+      expect((result as Record<string, unknown>)).not.toHaveProperty('runtime_contract');
     } finally {
       fixture.cleanup();
     }
@@ -1590,13 +1654,16 @@ describe('UltraShape runtime flow', () => {
         seed: 7,
         preserve_scale: true,
       });
+      const firstPositions = getGlbPositions(join(fixture.outputDir, 'refined.glb'));
 
       writeFileSync(fixture.referenceImage, createReferenceImageBytes('b'));
+      const secondOutputDir = join(fixture.root, 'output-variant-both');
+      mkdirSync(secondOutputDir);
 
       const secondOutcome = runLocalRunner({
         reference_image: fixture.referenceImage,
         coarse_mesh: fixture.binaryCoarseMesh,
-        output_dir: fixture.outputDir,
+        output_dir: secondOutputDir,
         output_format: 'glb',
         checkpoint: null,
         config_path: fixture.configPath,
@@ -1610,6 +1677,7 @@ describe('UltraShape runtime flow', () => {
 
       const firstMetrics = getRunnerMetrics(firstOutcome);
       const secondMetrics = getRunnerMetrics(secondOutcome);
+      const secondPositions = getGlbPositions(join(secondOutputDir, 'refined.glb'));
 
       expect(firstMetrics.preprocess).toEqual(
         expect.objectContaining({
@@ -1629,6 +1697,7 @@ describe('UltraShape runtime flow', () => {
       expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
       expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
       expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
+      expect(firstPositions).not.toEqual(secondPositions);
     } finally {
       fixture.cleanup();
     }
@@ -1654,11 +1723,14 @@ describe('UltraShape runtime flow', () => {
         seed: 7,
         preserve_scale: true,
       });
+      const firstPositions = getGlbPositions(join(fixture.outputDir, 'refined.glb'));
+      const secondOutputDir = join(fixture.root, 'output-mesh-b');
+      mkdirSync(secondOutputDir);
 
       const secondOutcome = runLocalRunner({
         reference_image: fixture.referenceImage,
         coarse_mesh: fixture.binaryCoarseMesh,
-        output_dir: fixture.outputDir,
+        output_dir: secondOutputDir,
         output_format: 'glb',
         checkpoint: null,
         config_path: fixture.configPath,
@@ -1672,6 +1744,7 @@ describe('UltraShape runtime flow', () => {
 
       const firstMetrics = getRunnerMetrics(firstOutcome);
       const secondMetrics = getRunnerMetrics(secondOutcome);
+      const secondPositions = getGlbPositions(join(secondOutputDir, 'refined.glb'));
 
       expect(firstMetrics.preprocess).toEqual(secondMetrics.preprocess);
       expect(firstMetrics.conditioning).toEqual(
@@ -1707,6 +1780,7 @@ describe('UltraShape runtime flow', () => {
       expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
       expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
       expect(firstMetrics.gate).not.toEqual(secondMetrics.gate);
+      expect(firstPositions).not.toEqual(secondPositions);
     } finally {
       fixture.cleanup();
     }
@@ -2021,7 +2095,7 @@ describe('UltraShape runtime flow', () => {
       const outcome = runPythonSnippet(
         [
           'import json',
-          'from ultrashape_runtime.utils.mesh import build_renderable_mesh_payload',
+          'from ultrashape_runtime.models.autoencoders.surface_extractors import build_renderable_mesh_payload',
           'try:',
           '    build_renderable_mesh_payload({',
           '        "kind": "refined-mesh",',
@@ -2209,6 +2283,9 @@ describe('UltraShape runtime flow', () => {
         error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
         error_message: expect.stringContaining('passthrough-like'),
       });
+      const errorMessage = outcome.error_message;
+      expect(errorMessage).not.toBeNull();
+      expect(String(errorMessage)).not.toContain('GEOMETRIC_GATE_REJECTED');
       expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
     } finally {
       fixture.cleanup();
@@ -2288,17 +2365,12 @@ describe('UltraShape runtime flow', () => {
           }),
           fallbacks: ['flash_attn->sdpa'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
-          runtime_contract: {
-            backend: 'local-only',
-            scope: 'mc-only',
-            output_format: 'glb-only',
-            requires_exact_closure: true,
-            checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
-            public_error_codes: ['DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'],
-          },
           warnings: [],
         },
       });
+      const acceptedResult = accepted.result;
+      expect(acceptedResult).not.toBeNull();
+      expect((acceptedResult as Record<string, unknown>)).not.toHaveProperty('runtime_contract');
       expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
     } finally {
       fixture.cleanup();

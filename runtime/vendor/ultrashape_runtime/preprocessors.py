@@ -7,7 +7,7 @@ import zlib
 from pathlib import Path
 
 from .rembg import maybe_apply_cutout, payload_has_cutout_alpha
-from .utils.tensors import blend_sequences, bytes_to_unit_floats, clamp_unit, stable_signature
+from .utils import blend_sequences, bytes_to_unit_floats, clamp_unit, stable_signature
 
 
 PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
@@ -52,6 +52,11 @@ class ImageProcessorV2:
             'mask_coverage': image_data['mask_coverage'],
             'cutout_applied': cutout_applied,
             'had_cutout_alpha': payload_has_cutout_alpha(content),
+            'evidence': {
+                'mean_intensity': image_data['mean_intensity'],
+                'mask_coverage': image_data['mask_coverage'],
+                'cutout_applied': cutout_applied,
+            },
         }
 
 

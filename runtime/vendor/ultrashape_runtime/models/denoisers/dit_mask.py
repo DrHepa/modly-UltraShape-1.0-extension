@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from ...utils.checkpoint import checkpoint_signature, checkpoint_tokens
-from ...utils.tensors import clamp_unit, stable_signature
-from .moe_layers import moe_enabled
+from ...utils import clamp_unit, stable_signature
+from .moe_layers import mix_expert_sequences, moe_enabled
 
 try:
     import flash_attn  # type: ignore # pragma: no cover
@@ -46,18 +46,21 @@ class RefineDiT:
         attention = 'flash_attn' if flash_attn_available() else 'sdpa'
         checkpoint_reference = self.checkpoint_state if self.checkpoint_state is not None else self.state_dict
         checkpoint_values = checkpoint_tokens(checkpoint_reference)
+        expert_tokens = mix_expert_sequences(conditioning_tokens, checkpoint_values, timesteps)
         checkpoint_state_signature = checkpoint_signature(checkpoint_reference)
         latents: list[float] = []
 
         for index, token in enumerate(conditioning_tokens[:8]):
             schedule_value = timesteps[index % len(timesteps)] if timesteps else 0.0
             checkpoint_value = checkpoint_values[index % len(checkpoint_values)] if checkpoint_values else 0.0
+            expert_value = expert_tokens[index % len(expert_tokens)] if expert_tokens else 0.0
             latent = clamp_unit(
                 (token * 0.31)
                 + (schedule_value * 0.19)
                 + (guidance_scale / 60.0)
                 + (((seed_value + index) % 11) / 150.0)
                 + (checkpoint_value * 0.17)
+                + (expert_value * 0.11)
                 + ((checkpoint_state_signature % 17) / 500.0)
                 + ((schedule_signature % 19) / 700.0)
                 + ((conditioning_signature % 23) / 800.0)
@@ -68,6 +71,8 @@ class RefineDiT:
             'model': self.__class__.__name__,
             'attention': attention,
             'latents': latents,
+            'latent_count': len(latents),
+            'latent_mean': clamp_unit(sum(latents) / len(latents) if latents else 0.0),
             'latent_signature': stable_signature(latents),
             'checkpoint_signature': checkpoint_state_signature,
             'scheduler_signature': schedule_signature,

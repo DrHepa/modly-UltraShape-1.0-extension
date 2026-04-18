@@ -7,7 +7,7 @@ try:
 except ImportError:  # pragma: no cover - dependency classification handled above the seam
     FlowMatchEulerDiscreteScheduler = None
 
-from .utils.tensors import clamp_unit, stable_signature
+from .utils import clamp_unit, stable_signature
 
 
 class SchedulerDependencyError(Exception):
@@ -52,4 +52,9 @@ def build_flow_matching_schedule(*, steps: int, guidance_scale: float) -> dict[s
         'timestep_signature': stable_signature(timesteps),
         'sigma_start': clamp_unit(1.0 - (1.0 / max(steps, 1))),
         'sigma_end': clamp_unit(1.0 / max(steps, 1)),
+        'evidence': {
+            'timestep_count': len(timesteps),
+            'sigma_start': clamp_unit(1.0 - (1.0 / max(steps, 1))),
+            'sigma_end': clamp_unit(1.0 / max(steps, 1)),
+        },
     }

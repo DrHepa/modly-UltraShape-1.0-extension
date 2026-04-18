@@ -6,7 +6,6 @@ import { deflateSync } from 'node:zlib';
 
 import { describe, expect, it } from 'vitest';
 
-import { preflightRefinerExecution } from '../../src/processes/ultrashape-refiner/preflight.js';
 
 const repoRoot = process.cwd();
 const processorPath = resolve(repoRoot, 'processor.py');
@@ -627,29 +626,63 @@ function runLocalRunner(
 }
 
 describe('UltraShape processor.py protocol', () => {
-  it('maps deferred backend requests to LOCAL_RUNTIME_UNAVAILABLE under the truthful local-only contract', () => {
-    for (const backend of ['remote', 'hybrid'] as const) {
-      expect(() => preflightRefinerExecution(backend as never)).toThrowError(
-        expect.objectContaining({
+  it('rejects deferred backend requests as invalid processor params under the local-only shell', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      for (const backend of ['remote', 'hybrid'] as const) {
+        const outcome = runProcessor({
+          input: {
+            inputs: {
+              reference_image: { filePath: fixture.referenceImage },
+              coarse_mesh: { filePath: fixture.namedCoarseMesh },
+            },
+          },
+          params: {
+            backend,
+          },
+          workspaceDir: fixture.outputDir,
+        });
+
+        expect(outcome.status).toBe(0);
+        expect(outcome.events.at(-1)).toEqual({
+          type: 'error',
+          message: expect.stringContaining('backend must be auto or local'),
           code: 'LOCAL_RUNTIME_UNAVAILABLE',
-          message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
-        }),
-      );
+        });
+      }
+    } finally {
+      fixture.cleanup();
     }
   });
 
-  it('maps deferred output formats to LOCAL_RUNTIME_UNAVAILABLE under the truthful glb-only contract', () => {
-    for (const outputFormat of ['obj', 'fbx', 'ply'] as const) {
-      expect(() =>
-        preflightRefinerExecution('auto', {
-          requestedOutputFormat: outputFormat,
-        }),
-      ).toThrowError(
-        expect.objectContaining({
+  it('rejects non-glb output formats as invalid processor params under the glb-only shell', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      for (const outputFormat of ['obj', 'fbx', 'ply'] as const) {
+        const outcome = runProcessor({
+          input: {
+            inputs: {
+              reference_image: { filePath: fixture.referenceImage },
+              coarse_mesh: { filePath: fixture.namedCoarseMesh },
+            },
+          },
+          params: {
+            output_format: outputFormat,
+          },
+          workspaceDir: fixture.outputDir,
+        });
+
+        expect(outcome.status).toBe(0);
+        expect(outcome.events.at(-1)).toEqual({
+          type: 'error',
+          message: expect.stringContaining('output_format must be glb'),
           code: 'LOCAL_RUNTIME_UNAVAILABLE',
-          message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
-        }),
-      );
+        });
+      }
+    } finally {
+      fixture.cleanup();
     }
   });
 
@@ -936,17 +969,10 @@ describe('UltraShape processor.py protocol', () => {
           metrics: expect.any(Object),
           fallbacks: ['flash_attn->sdpa'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
-          runtime_contract: {
-            backend: 'local-only',
-            scope: 'mc-only',
-            output_format: 'glb-only',
-            requires_exact_closure: true,
-            checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
-            public_error_codes: ['DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'],
-          },
           warnings: [],
         }),
       });
+      expect((outcome.result?.result as Record<string, unknown>) ?? {}).not.toHaveProperty('runtime_contract');
       const metrics = getRunnerMetrics(outcome.result);
 
       expect(metrics).toEqual(
@@ -1485,6 +1511,7 @@ describe('UltraShape processor.py protocol', () => {
         message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
         code: 'LOCAL_RUNTIME_UNAVAILABLE',
       });
+      expect(String(outcome.events.at(-1)?.message ?? '')).not.toContain('GEOMETRIC_GATE_REJECTED');
       expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
     } finally {
       fixture.cleanup();

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ...utils.checkpoint import checkpoint_signature, checkpoint_tokens
-from ...utils.tensors import blend_sequences, clamp_unit, stable_signature
+from ...utils import blend_sequences, clamp_unit, stable_signature
 
 
 def _numeric_sequence(candidate: object) -> list[float]:
@@ -108,6 +108,11 @@ class ShapeVAE:
                 'mesh_signature': int(mesh.get('signature', 0)) if isinstance(mesh.get('signature'), int) else 0,
                 'reference_signature': int(reference_asset.get('signature', 0)) if isinstance(reference_asset.get('signature'), int) else 0,
                 'conditioning_signature': int(conditioning.get('conditioning_signature', 0)) if isinstance(conditioning, dict) and isinstance(conditioning.get('conditioning_signature'), int) else 0,
+            },
+            'evidence': {
+                'decoded_count': len(decoded),
+                'mesh_seed_count': len(mesh_seed),
+                'volume_token_count': len(volume_tokens),
             },
             'state_hydrated': self.hydrated,
         }

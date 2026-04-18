@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from .tensors import clamp_unit, stable_signature
+from . import clamp_unit, stable_signature
 
 REQUIRED_SUBTREES = ('vae', 'dit', 'conditioner')
 MAX_TENSOR_SAMPLES = 8
@@ -102,6 +102,10 @@ def load_checkpoint_subtrees(
             'value_count': subtree_value_count,
             'tokens': compact_tokens,
             'signature': stable_signature(compact_tokens),
+            'evidence': {
+                'tensor_count': len(tensors),
+                'value_count': subtree_value_count,
+            },
         }
 
     return {

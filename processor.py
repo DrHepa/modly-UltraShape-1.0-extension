@@ -38,12 +38,31 @@ def emit_progress(percent: int, label: str) -> None:
     emit({'type': 'progress', 'percent': percent, 'label': label})
 
 
+def collapse_public_message(code: str, message: object) -> str:
+    text = str(message).strip() or 'UltraShape local runtime reported an execution failure.'
+
+    for prefix in [
+        'GEOMETRIC_GATE_REJECTED:',
+        'PIPELINE_UNAVAILABLE:',
+        'PIPELINE_DEPENDENCY_ERROR:',
+        'SURFACE_EXTRACTION_ERROR:',
+        'SURFACE_LOAD_ERROR:',
+        'REFERENCE_PREPROCESS_ERROR:',
+        'MESH_EXPORT_ERROR:',
+    ]:
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+
+    return text
+
+
 def emit_error(error: Exception) -> None:
     code = getattr(error, 'code', 'LOCAL_RUNTIME_UNAVAILABLE')
     if code not in PUBLIC_ERROR_CODES:
         code = 'LOCAL_RUNTIME_UNAVAILABLE'
 
-    message = str(error)
+    message = collapse_public_message(code, error)
     if not message.startswith(f'{code}:'):
         message = f'{code}: {message}'
 
@@ -299,6 +318,7 @@ def run_local_runtime(
             code = 'LOCAL_RUNTIME_UNAVAILABLE'
         if not isinstance(message, str) or not message.strip():
             message = 'Local runtime runner reported an unknown execution failure.'
+        message = collapse_public_message(code, message)
         raise ProcessorError(code, message)
 
     result = envelope.get('result')

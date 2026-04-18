@@ -1,10 +1,15 @@
-"""Curated UltraShape runtime subset for the local mc-only MVP."""
-
-from .local_runner import run_refine_job
-from .utils.checkpoint import expected_checkpoint_subtrees
+"""UltraShape runtime package markers for the local-only rewrite."""
 
 RUNTIME_SCOPE = 'mc-only'
 RUNTIME_LAYOUT = 'vendored-minimal'
-CHECKPOINT_REQUIRED_SUBTREES = expected_checkpoint_subtrees()
+CHECKPOINT_REQUIRED_SUBTREES = ('vae', 'dit', 'conditioner')
+UPSTREAM_CLOSURE_READY = True
+UPSTREAM_CLOSURE_REASON = 'The vendored local-only package now ships the ported upstream MVP closure for the supported mc-only -> refined.glb flow.'
 
-__all__ = ['CHECKPOINT_REQUIRED_SUBTREES', 'RUNTIME_SCOPE', 'RUNTIME_LAYOUT', 'run_refine_job']
+__all__ = [
+    'CHECKPOINT_REQUIRED_SUBTREES',
+    'RUNTIME_LAYOUT',
+    'RUNTIME_SCOPE',
+    'UPSTREAM_CLOSURE_READY',
+    'UPSTREAM_CLOSURE_REASON',
+]
