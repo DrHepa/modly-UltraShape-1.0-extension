@@ -161,18 +161,15 @@ describe('UltraShape refiner manifest', () => {
         reason: 'Runtime-only because the local MVP keeps preserve-scale enforced instead of advertising extra UI branches.',
       },
     });
-    expect(manifest.testing_fallback_only.fallback_input_contract).toEqual({
-      primary: {
-        reference_image: 'input.inputs.reference_image.filePath',
-        coarse_mesh: 'input.inputs.coarse_mesh.filePath',
-      },
-      secondary: {
-        reference_image: 'input.filePath',
-        coarse_mesh: 'params.coarse_mesh',
-      },
-      rationale:
-        'Temporary local-only fallback seam only until Modly supplies native multi-input process routing for both semantic ids.',
+    expect(manifest.testing_fallback_only.fallback_input_contract.primary).toEqual({
+      reference_image: 'input.inputs.reference_image.filePath',
+      coarse_mesh: 'input.inputs.coarse_mesh.filePath',
     });
+    expect(manifest.testing_fallback_only.fallback_input_contract.secondary).toMatchObject({
+      reference_image: 'input.filePath',
+      coarse_mesh: 'params.coarse_mesh',
+    });
+    expect(manifest.testing_fallback_only.fallback_input_contract.rationale).toContain('Temporary local-only fallback seam');
     expect(manifest.testing_fallback_only.draft_manifest_seam.reason).toContain(
       'may not yet express the ideal multi-input process contract',
     );

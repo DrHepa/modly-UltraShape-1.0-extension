@@ -5,10 +5,6 @@ import { join, resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { normalizeRefinerRequest } from '../../src/processes/ultrashape-refiner/normalize.js';
-import { preflightRefinerExecution } from '../../src/processes/ultrashape-refiner/preflight.js';
-import { validateRefinerRequest } from '../../src/processes/ultrashape-refiner/validate.js';
-
 const processorPath = resolve(process.cwd(), 'processor.py');
 
 function createFixtureWorkspace() {
@@ -29,6 +25,14 @@ function createFixtureWorkspace() {
     coarseMesh,
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
+}
+
+function parseEvents(stdout: string) {
+  return stdout
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 describe('UltraShape request contract', () => {
@@ -53,11 +57,7 @@ describe('UltraShape request contract', () => {
           })}\n${JSON.stringify({ should_be_ignored: true })}\n`,
       });
 
-      const events = outcome.stdout
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const events = parseEvents(outcome.stdout);
 
       expect(outcome.status).toBe(0);
       expect(events.at(-1)).toEqual({
@@ -84,11 +84,7 @@ describe('UltraShape request contract', () => {
         })}\n`,
       });
 
-      const events = outcome.stdout
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const events = parseEvents(outcome.stdout);
 
       expect(outcome.status).toBe(0);
       expect(events.at(-1)).toEqual({
@@ -101,23 +97,46 @@ describe('UltraShape request contract', () => {
     }
   });
 
-  it('rejects missing assets with field-specific errors', () => {
+  it('rejects missing named inputs with field-specific public errors', () => {
     const fixture = createFixtureWorkspace();
 
     try {
-      expect(() =>
-        validateRefinerRequest({
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-        } as never),
-      ).toThrowError(/reference_image/);
+      const missingReference = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input: `${JSON.stringify({
+          input: {
+            inputs: {
+              coarse_mesh: { filePath: fixture.coarseMesh },
+            },
+          },
+          workspaceDir: fixture.outputDir,
+        })}\n`,
+      });
+      const missingCoarse = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input: `${JSON.stringify({
+          input: {
+            filePath: fixture.referenceImage,
+          },
+          workspaceDir: fixture.outputDir,
+        })}\n`,
+      });
 
-      expect(() =>
-        validateRefinerRequest({
-          reference_image: fixture.referenceImage,
-          output_dir: fixture.outputDir,
-        } as never),
-      ).toThrowError(/coarse_mesh/);
+      expect(missingReference.status).toBe(0);
+      expect(parseEvents(missingReference.stdout).at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('reference_image'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
+
+      expect(missingCoarse.status).toBe(0);
+      expect(parseEvents(missingCoarse.stdout).at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('coarse_mesh'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
     } finally {
       fixture.cleanup();
     }
@@ -127,41 +146,71 @@ describe('UltraShape request contract', () => {
     const fixture = createFixtureWorkspace();
 
     try {
-      expect(() =>
-        validateRefinerRequest({
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
+      const invalidSteps = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input: `${JSON.stringify({
+          input: {
+            inputs: {
+              reference_image: { filePath: fixture.referenceImage },
+              coarse_mesh: { filePath: fixture.coarseMesh },
+            },
+          },
           params: {
             steps: 0,
           },
-        }),
-      ).toThrowError(/steps/);
-
-      expect(() =>
-        validateRefinerRequest({
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          params: {
-            output_format: 'obj' as never,
+          workspaceDir: fixture.outputDir,
+        })}\n`,
+      });
+      const invalidOutput = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input: `${JSON.stringify({
+          input: {
+            inputs: {
+              reference_image: { filePath: fixture.referenceImage },
+              coarse_mesh: { filePath: fixture.coarseMesh },
+            },
           },
-        }),
-      ).toThrowError(/output_format must be glb/i);
+          params: {
+            output_format: 'obj',
+          },
+          workspaceDir: fixture.outputDir,
+        })}\n`,
+      });
+
+      expect(invalidSteps.status).toBe(0);
+      expect(parseEvents(invalidSteps.stdout).at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('steps must be a positive integer'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
+
+      expect(invalidOutput.status).toBe(0);
+      expect(parseEvents(invalidOutput.stdout).at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('output_format must be glb'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
     } finally {
       fixture.cleanup();
     }
   });
 
-  it('keeps named-contract and fallback normalization semantically aligned', () => {
+  it('accepts both named-input and temporary fallback payload shapes up to runtime readiness checks', () => {
     const fixture = createFixtureWorkspace();
 
     try {
-      const native = normalizeRefinerRequest({
-        reference_image: { path: fixture.referenceImage, kind: 'image' },
-        coarse_mesh: { path: fixture.coarseMesh, kind: 'mesh' },
-        output_dir: fixture.outputDir,
-        checkpoint: null,
+      const namedOutcome = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input: `${JSON.stringify({
+          input: {
+            inputs: {
+              reference_image: { filePath: fixture.referenceImage },
+              coarse_mesh: { filePath: fixture.coarseMesh },
+            },
+          },
           params: {
             backend: 'local',
             steps: 40,
@@ -169,74 +218,96 @@ describe('UltraShape request contract', () => {
             preserve_scale: false,
             output_format: 'glb',
           },
-        correlation_id: 'native-case',
+          workspaceDir: fixture.outputDir,
+        })}\n`,
       });
-
-      const fallback = normalizeRefinerRequest({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        checkpoint: null,
+      const fallbackOutcome = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input: `${JSON.stringify({
+          input: {
+            filePath: fixture.referenceImage,
+          },
           params: {
+            coarse_mesh: fixture.coarseMesh,
             backend: 'local',
             steps: 40,
             guidance_scale: 6,
             preserve_scale: false,
             output_format: 'glb',
           },
-        correlation_id: 'fallback-case',
+          workspaceDir: fixture.outputDir,
+        })}\n`,
       });
 
-      expect(native.referenceImage).toEqual(fallback.referenceImage);
-      expect(native.coarseMesh).toEqual(fallback.coarseMesh);
-      expect(native.outputDir).toBe(fallback.outputDir);
-      expect(native.params).toEqual(fallback.params);
-      expect(native.requestedBackend).toBe('local');
-      expect(fallback.requestedBackend).toBe('local');
+      expect(namedOutcome.status).toBe(0);
+      expect(parseEvents(namedOutcome.stdout).at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
+
+      expect(fallbackOutcome.status).toBe(0);
+      expect(parseEvents(fallbackOutcome.stdout).at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
     } finally {
       fixture.cleanup();
     }
   });
 
-  it('stays local-first on Linux ARM64 when the local runtime is available', () => {
-    const result = preflightRefinerExecution('auto', {
-      hostPlatform: 'linux',
-      hostArch: 'arm64',
-      localAvailable: true,
-    });
-
-    expect(result.localSupported).toBe(true);
-    expect(result.recommendedBackend).toBe('local');
-    expect(result.selectedBackend).toBe('local');
-    expect(result.fallbackApplied).toBe(false);
-    expect(result.reason).toContain('local');
-  });
-
-  it('rejects remote and hybrid backend values at validation time because only the local runtime is in scope', () => {
+  it('rejects remote and hybrid backend values at the public processor boundary', () => {
     const fixture = createFixtureWorkspace();
 
     try {
-      expect(() =>
-        validateRefinerRequest({
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          params: {
-            backend: 'remote' as never,
+      const remoteOutcome = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input: `${JSON.stringify({
+          input: {
+            inputs: {
+              reference_image: { filePath: fixture.referenceImage },
+              coarse_mesh: { filePath: fixture.coarseMesh },
+            },
           },
-        }),
-      ).toThrowError(/backend must be auto or local/);
+          params: {
+            backend: 'remote',
+          },
+          workspaceDir: fixture.outputDir,
+        })}\n`,
+      });
+      const hybridOutcome = spawnSync('python3', [processorPath], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        input: `${JSON.stringify({
+          input: {
+            inputs: {
+              reference_image: { filePath: fixture.referenceImage },
+              coarse_mesh: { filePath: fixture.coarseMesh },
+            },
+          },
+          params: {
+            backend: 'hybrid',
+          },
+          workspaceDir: fixture.outputDir,
+        })}\n`,
+      });
 
-      expect(() =>
-        validateRefinerRequest({
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          params: {
-            backend: 'hybrid' as never,
-          },
-        }),
-      ).toThrowError(/backend must be auto or local/);
+      expect(remoteOutcome.status).toBe(0);
+      expect(parseEvents(remoteOutcome.stdout).at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('backend must be auto or local'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
+
+      expect(hybridOutcome.status).toBe(0);
+      expect(parseEvents(hybridOutcome.stdout).at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('backend must be auto or local'),
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
     } finally {
       fixture.cleanup();
     }

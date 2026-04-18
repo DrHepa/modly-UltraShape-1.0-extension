@@ -1,24 +1,39 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import * as adapterBoundary from '../../src/adapters/ultrashape/client.js';
-import { UltraShapeLocalAdapter } from '../../src/adapters/ultrashape/local.js';
-
 const repoRoot = process.cwd();
 
-const runtimePaths = [
-  'src/processes/ultrashape-refiner/index.ts',
-  'src/processes/ultrashape-refiner/validate.ts',
-  'src/processes/ultrashape-refiner/normalize.ts',
-  'src/processes/ultrashape-refiner/runtime.ts',
-  'src/processes/ultrashape-refiner/progress.ts',
-  'src/adapters/ultrashape/client.ts',
-  'src/adapters/ultrashape/local.ts',
-];
+function listFiles(root: string): string[] {
+  if (!existsSync(root)) {
+    return [];
+  }
 
-const configAndDocsPaths = ['manifest.json', 'processor.py', 'setup.py', 'README.md'];
+  const pending = [root];
+  const files: string[] = [];
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) {
+      continue;
+    }
+
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const nextPath = resolve(current, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(nextPath);
+        continue;
+      }
+
+      files.push(nextPath);
+    }
+  }
+
+  return files;
+}
+
+const shellPaths = ['manifest.json', 'processor.py', 'setup.py', 'README.md'];
 
 const vendoredRuntimePaths = [
   'runtime/configs/infer_dit_refine.yaml',
@@ -31,8 +46,7 @@ const vendoredRuntimePaths = [
   'runtime/vendor/ultrashape_runtime/schedulers.py',
   'runtime/vendor/ultrashape_runtime/utils/__init__.py',
   'runtime/vendor/ultrashape_runtime/utils/checkpoint.py',
-  'runtime/vendor/ultrashape_runtime/utils/mesh.py',
-  'runtime/vendor/ultrashape_runtime/utils/tensors.py',
+  'runtime/vendor/ultrashape_runtime/utils/voxelize.py',
   'runtime/vendor/ultrashape_runtime/models/conditioner_mask.py',
   'runtime/vendor/ultrashape_runtime/models/denoisers/__init__.py',
   'runtime/vendor/ultrashape_runtime/models/denoisers/dit_mask.py',
@@ -61,10 +75,9 @@ const testPaths = [
 ];
 
 describe('UltraShape repository structure contract', () => {
-  it('keeps runtime, config/docs, fixtures, and tests separated by path and role', () => {
+  it('keeps shell, vendored runtime, fixtures, and active specs separated by path and role', () => {
     for (const filePath of [
-      ...runtimePaths,
-      ...configAndDocsPaths,
+      ...shellPaths,
       ...vendoredRuntimePaths,
       ...fixturePaths,
       ...testPaths,
@@ -72,16 +85,9 @@ describe('UltraShape repository structure contract', () => {
       expect(existsSync(resolve(repoRoot, filePath)), `${filePath} should exist`).toBe(true);
     }
 
-    for (const filePath of runtimePaths) {
+    for (const filePath of shellPaths) {
       expect(
-        filePath.startsWith('src/') ||
-          filePath.startsWith('runtime/modly/'),
-      ).toBe(true);
-    }
-
-    for (const filePath of configAndDocsPaths) {
-      expect(
-        filePath.startsWith('src/') || filePath.startsWith('adapters/') || filePath.startsWith('fixtures/') || filePath.startsWith('tests/'),
+        filePath.startsWith('adapters/') || filePath.startsWith('fixtures/') || filePath.startsWith('tests/'),
       ).toBe(false);
     }
 
@@ -94,11 +100,15 @@ describe('UltraShape repository structure contract', () => {
     }
   });
 
-  it('keeps the local-only TypeScript compatibility adapter inside src/', () => {
-    expect(typeof adapterBoundary).toBe('object');
-    expect(UltraShapeLocalAdapter).toBeTypeOf('function');
-    expect(existsSync(resolve(repoRoot, 'src/adapters/ultrashape/remote.ts'))).toBe(false);
-    expect(existsSync(resolve(repoRoot, 'adapters/ultrashape/client.ts'))).toBe(false);
+  it('keeps only the repo-root shell and the upstream runtime closure on disk', () => {
+    expect(listFiles(resolve(repoRoot, 'src'))).toEqual([]);
+    expect(existsSync(resolve(repoRoot, 'tests/spec/ts-runtime-boundary.test.ts'))).toBe(false);
+
+    expect(
+      readdirSync(resolve(repoRoot, 'runtime/vendor/ultrashape_runtime/utils'))
+        .filter((entry) => entry !== '__pycache__')
+        .sort(),
+    ).toEqual(['__init__.py', 'checkpoint.py', 'voxelize.py']);
   });
 
   it('keeps the repo-root Python boundary as the only active install surface', () => {

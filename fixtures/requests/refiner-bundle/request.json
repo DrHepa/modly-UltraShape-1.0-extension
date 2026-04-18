@@ -1,4 +1,8 @@
 {
+  "_fixture": {
+    "authority": "documentation_only",
+    "temporary": true
+  },
   "reference_image": "./assets/reference-image.png",
   "coarse_mesh": "./assets/coarse-mesh.glb",
   "output_dir": "./expected/output",

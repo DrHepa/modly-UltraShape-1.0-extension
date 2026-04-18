@@ -68,6 +68,8 @@
     "status": "temporary_non_native",
     "temporary": true,
     "non_native": true,
+    "authority": "documentation_only",
+    "removal_condition": "Remove this metadata when Modly ships native multi-input routing for both semantic ids.",
     "semantic_contract": "reference_image + coarse_mesh -> refined.glb",
     "bundle_schema": {
       "reference_image": "path",
