@@ -169,16 +169,10 @@ class MCSurfaceExtractor:
         if len(vertices) < 9 or len(faces) < 8:
             raise SurfaceExtractionError('marching-cubes extraction did not produce enough geometry evidence.')
 
-        payload_bytes = (
-            f'ultrashape:{self.extractor}:{field_signature}:{surface_signature}:{len(vertices)}:{len(faces)}'.encode('utf8')
-        )
         renderable_payload = build_renderable_mesh_payload(
             {
                 'kind': 'refined-mesh',
                 'path': mesh_payload.get('path'),
-                'bytes': payload_bytes,
-                'byte_length': len(payload_bytes),
-                'is_binary_glb': False,
                 'mesh_name': 'refined-surface',
                 'vertices': vertices,
                 'faces': faces,
@@ -191,7 +185,7 @@ class MCSurfaceExtractor:
             'preserve_scale': preserve_scale,
             'payload': renderable_payload,
             'reference_bytes': reference_asset['byte_length'],
-            'payload_bytes': len(payload_bytes),
+            'payload_bytes': 0,
             'surface_signature': surface_signature,
             'vertex_count': len(vertices),
             'face_count': len(faces),

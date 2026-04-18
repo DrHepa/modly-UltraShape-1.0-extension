@@ -11,9 +11,9 @@ from .models.autoencoders.surface_extractors import extract_surface
 from .models.autoencoders.volume_decoders import decode_volume
 from .models.conditioner_mask import SingleImageEncoder
 from .models.denoisers.dit_mask import RefineDiT
-from .preprocessors import ImageProcessorV2, normalize_reference_asset
+from .preprocessors import ImageProcessorV2
 from .schedulers import build_flow_matching_schedule
-from .surface_loaders import SharpEdgeSurfaceLoader, load_coarse_surface
+from .surface_loaders import SharpEdgeSurfaceLoader
 from .utils.checkpoint import apply_checkpoint_state, load_checkpoint_subtrees
 from .utils.mesh import evaluate_geometric_gate, export_refined_glb
 
@@ -178,8 +178,8 @@ def run_refine_pipeline(
     weights = config.get('weights') if isinstance(config.get('weights'), dict) else {}
     image_processor = ImageProcessorV2()
     surface_loader = SharpEdgeSurfaceLoader()
-    reference_asset = normalize_reference_asset(reference_image)
-    coarse_surface = load_coarse_surface(coarse_mesh)
+    reference_asset = image_processor.process(reference_image)
+    coarse_surface = surface_loader.load(coarse_mesh)
     checkpoint_bundle = load_checkpoint_subtrees(
         checkpoint,
         weights.get('primary') if isinstance(weights, dict) else None,
@@ -187,15 +187,17 @@ def run_refine_pipeline(
         checkpoint_config.get('required_subtrees') if isinstance(checkpoint_config.get('required_subtrees'), list) else None,
     )
     checkpoint_state = checkpoint_bundle['bundle'] if isinstance(checkpoint_bundle.get('bundle'), dict) else {}
-    conditioner = SingleImageEncoder()
+    conditioner = SingleImageEncoder(checkpoint_state=checkpoint_state.get('conditioner'))
     conditioner_hydration = apply_checkpoint_state(conditioner, checkpoint_state.get('conditioner'))
+    conditioner.hydration = conditioner_hydration
     conditioning = conditioner.build(
         reference_asset=reference_asset,
         coarse_surface=coarse_surface,
     )
     schedule = build_flow_matching_schedule(steps=steps, guidance_scale=guidance_scale)
-    denoiser = RefineDiT()
+    denoiser = RefineDiT(checkpoint_state=checkpoint_state.get('dit'))
     denoiser_hydration = apply_checkpoint_state(denoiser, checkpoint_state.get('dit'))
+    denoiser.hydration = denoiser_hydration
     denoised = denoiser.denoise(
         conditioning=conditioning,
         schedule=schedule,
@@ -226,6 +228,8 @@ def run_refine_pipeline(
         coarse_mesh_payload=coarse_surface['mesh'],
         refined_mesh_payload=refined_payload,
         preserve_scale=preserve_scale,
+        reference_image_signature=reference_asset.get('image_signature'),
+        checkpoint_signature=conditioning.get('checkpoint_signature'),
     )
     output_path = export_refined_glb(
         output_dir=output_dir,
@@ -235,6 +239,8 @@ def run_refine_pipeline(
 
     if not Path(output_path).is_file():
         raise PipelineUnavailableError(f'Expected refined.glb output was not generated: {output_path}.')
+
+    exported_payload_bytes = Path(output_path).stat().st_size
 
     return {
         'file_path': output_path,
@@ -258,6 +264,11 @@ def run_refine_pipeline(
                 'processor': image_processor.__class__.__name__,
                 'byte_length': reference_asset['byte_length'],
                 'normalized_channels': reference_asset['normalized_channels'],
+                'source_format': reference_asset['source_format'],
+                'pixel_count': reference_asset['pixel_count'],
+                'image_tensor_shape': reference_asset['image_tensor_shape'],
+                'image_feature_count': len(reference_asset['image_features']),
+                'mask_feature_count': len(reference_asset['mask_features']),
                 'image_signature': reference_asset['image_signature'],
                 'mask_signature': reference_asset['mask_signature'],
                 'signature': reference_asset['signature'],
@@ -266,15 +277,23 @@ def run_refine_pipeline(
                 'surface_loader': surface_loader.__class__.__name__,
                 'encoder': conditioning['encoder'],
                 'voxelizer': coarse_surface['voxels']['voxelizer'],
+                'surface_vertex_count': coarse_surface['mesh']['vertex_count'],
+                'surface_face_count': coarse_surface['mesh']['face_count'],
+                'surface_point_count': coarse_surface['mesh']['surface_point_count'],
+                'surface_bounds': coarse_surface['mesh']['bounds'],
                 'voxel_count': conditioning['voxel_count'],
+                'voxel_resolution': coarse_surface['voxels']['resolution'],
                 'mask_tokens': conditioning['mask_tokens'],
                 'surface_signature': coarse_surface['mesh']['signature'],
                 'voxel_signature': coarse_surface['voxels']['voxel_signature'],
                 'image_token_signature': conditioning['image_token_signature'],
                 'mask_token_signature': conditioning['mask_token_signature'],
                 'checkpoint_signature': conditioning['checkpoint_signature'],
+                'checkpoint_tensor_count': conditioning['checkpoint_tensor_count'],
+                'checkpoint_value_count': conditioning['checkpoint_value_count'],
                 'conditioning_signature': conditioning['conditioning_signature'],
                 'state_hydrated': conditioning['state_hydrated'],
+                'hydration': conditioning['hydration'],
                 'signature': conditioning['signature'],
             },
             'scheduler': {
@@ -282,15 +301,21 @@ def run_refine_pipeline(
                 'target': schedule['target'],
                 'step_count': schedule['step_count'],
                 'guidance_scale': schedule['guidance_scale'],
+                'timestep_count': schedule['timestep_count'],
                 'timestep_signature': schedule['timestep_signature'],
+                'sigma_start': schedule['sigma_start'],
+                'sigma_end': schedule['sigma_end'],
             },
             'denoise': {
                 'model': denoised['model'],
                 'attention': denoised['attention'],
                 'checkpoint_signature': denoised['checkpoint_signature'],
                 'scheduler_signature': denoised['scheduler_signature'],
+                'conditioning_signature': denoised['conditioning_signature'],
                 'latent_signature': denoised['latent_signature'],
+                'timestep_count': denoised['timestep_count'],
                 'state_hydrated': denoised['state_hydrated'],
+                'hydration': denoised['hydration'],
             },
             'decode': {
                 'vae': decoded_latents['vae'],
@@ -305,10 +330,17 @@ def run_refine_pipeline(
                 'marching_cubes': refined_surface['marching_cubes'],
                 'vertex_count': refined_surface['vertex_count'],
                 'face_count': refined_surface['face_count'],
-                'payload_bytes': len(refined_payload['bytes']),
+                'payload_bytes': exported_payload_bytes,
                 'surface_signature': refined_surface['surface_signature'],
             },
             'gate': {
+                'coarse_signature': gate_metrics['coarse_signature'],
+                'refined_signature': gate_metrics['refined_signature'],
+                'reference_image_signature': gate_metrics['reference_image_signature'],
+                'checkpoint_signature': gate_metrics['checkpoint_signature'],
+                'preserve_scale': gate_metrics['preserve_scale'],
+                'scale_fit_applied': gate_metrics['scale_fit_applied'],
+                'attribution_signature': gate_metrics['attribution_signature'],
                 'coarse_vertex_count': gate_metrics['coarse_vertex_count'],
                 'refined_vertex_count': gate_metrics['refined_vertex_count'],
                 'coarse_face_count': gate_metrics['coarse_face_count'],

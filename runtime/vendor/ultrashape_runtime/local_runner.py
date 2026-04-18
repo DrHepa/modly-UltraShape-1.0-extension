@@ -28,6 +28,9 @@ REQUIRED_FIELDS = {
 REQUIRED_CONFIG_MARKERS = ('vae_config', 'dit_cfg', 'conditioner_config', 'image_processor_cfg', 'scheduler_cfg')
 REQUIRED_RUNTIME_IMPORTS = ('diffusers', 'cubvh')
 REQUIRED_CHECKPOINT_SUBTREES = ('vae', 'dit', 'conditioner')
+REQUIRED_PUBLIC_BACKEND_MODES = ('auto', 'local')
+REQUIRED_PUBLIC_OUTPUT_FORMATS = ('glb',)
+REQUIRED_PUBLIC_ERROR_CODES = ('DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE')
 
 
 class LocalRunnerError(Exception):
@@ -76,10 +79,14 @@ def load_runtime_contract(config_path: str) -> dict[str, object]:
     model = config.get('model') if isinstance(config.get('model'), dict) else {}
     export = config.get('export') if isinstance(config.get('export'), dict) else {}
     checkpoint = config.get('checkpoint') if isinstance(config.get('checkpoint'), dict) else {}
+    public_contract = config.get('public_contract') if isinstance(config.get('public_contract'), dict) else {}
     dependencies = config.get('dependencies') if isinstance(config.get('dependencies'), dict) else {}
     required = dependencies.get('required') if isinstance(dependencies.get('required'), dict) else {}
     required_imports = required.get('imports') if isinstance(required.get('imports'), list) else []
     required_subtrees = checkpoint.get('required_subtrees') if isinstance(checkpoint.get('required_subtrees'), list) else []
+    public_backend_modes = public_contract.get('backend_modes') if isinstance(public_contract.get('backend_modes'), list) else []
+    public_output_formats = public_contract.get('success_output_formats') if isinstance(public_contract.get('success_output_formats'), list) else []
+    public_error_codes = public_contract.get('public_error_codes') if isinstance(public_contract.get('public_error_codes'), list) else []
 
     if runtime.get('requires_exact_closure') is not True:
         missing.append('runtime.requires_exact_closure=true')
@@ -89,6 +96,12 @@ def load_runtime_contract(config_path: str) -> dict[str, object]:
         missing.append('runtime.backend=local')
     if export.get('format') != 'glb':
         missing.append('export.format=glb')
+    if tuple(public_backend_modes) != REQUIRED_PUBLIC_BACKEND_MODES:
+        missing.append('public_contract.backend_modes=auto,local')
+    if tuple(public_output_formats) != REQUIRED_PUBLIC_OUTPUT_FORMATS:
+        missing.append('public_contract.success_output_formats=glb')
+    if tuple(public_error_codes) != REQUIRED_PUBLIC_ERROR_CODES:
+        missing.append('public_contract.public_error_codes=DEPENDENCY_MISSING,WEIGHTS_MISSING,LOCAL_RUNTIME_UNAVAILABLE')
 
     for marker in REQUIRED_CONFIG_MARKERS:
         if not isinstance(config.get(marker), dict):
@@ -110,6 +123,7 @@ def load_runtime_contract(config_path: str) -> dict[str, object]:
         'output_format': 'glb-only',
         'requires_exact_closure': True,
         'checkpoint_subtrees': list(REQUIRED_CHECKPOINT_SUBTREES),
+        'public_error_codes': list(REQUIRED_PUBLIC_ERROR_CODES),
     }
 
 

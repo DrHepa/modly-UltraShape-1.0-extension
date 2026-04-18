@@ -21,10 +21,12 @@ class RefineDiT:
 
     def __init__(self, checkpoint_state: object = None):
         self.checkpoint_state = checkpoint_state
+        self.state_dict: dict[str, object] | None = None
+        self.hydration: dict[str, object] | None = None
         self.hydrated = checkpoint_state is not None
 
     def load_state_dict(self, state_dict: dict[str, object], strict: bool = False) -> dict[str, object]:
-        self.checkpoint_state = state_dict
+        self.state_dict = dict(state_dict)
         self.hydrated = True
         return {'missing_keys': [], 'unexpected_keys': [], 'strict': strict}
 
@@ -42,8 +44,9 @@ class RefineDiT:
         conditioning_signature = int(conditioning.get('conditioning_signature', conditioning.get('signature', 0))) if isinstance(conditioning.get('conditioning_signature', conditioning.get('signature', 0)), int) else 0
         seed_value = 0 if seed is None else seed
         attention = 'flash_attn' if flash_attn_available() else 'sdpa'
-        checkpoint_values = checkpoint_tokens(self.checkpoint_state)
-        checkpoint_state_signature = checkpoint_signature(self.checkpoint_state)
+        checkpoint_reference = self.checkpoint_state if self.checkpoint_state is not None else self.state_dict
+        checkpoint_values = checkpoint_tokens(checkpoint_reference)
+        checkpoint_state_signature = checkpoint_signature(checkpoint_reference)
         latents: list[float] = []
 
         for index, token in enumerate(conditioning_tokens[:8]):
@@ -68,8 +71,11 @@ class RefineDiT:
             'latent_signature': stable_signature(latents),
             'checkpoint_signature': checkpoint_state_signature,
             'scheduler_signature': schedule_signature,
+            'conditioning_signature': conditioning_signature,
+            'timestep_count': len(timesteps),
             'moe_enabled': moe_enabled(),
             'state_hydrated': self.hydrated,
+            'hydration': dict(self.hydration) if isinstance(self.hydration, dict) else None,
         }
 
 

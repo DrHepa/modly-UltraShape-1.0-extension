@@ -5,6 +5,16 @@ runtime:
   backend: local
   readiness_file: .runtime-readiness.json
   requires_exact_closure: true
+public_contract:
+  backend_modes:
+    - auto
+    - local
+  success_output_formats:
+    - glb
+  public_error_codes:
+    - DEPENDENCY_MISSING
+    - WEIGHTS_MISSING
+    - LOCAL_RUNTIME_UNAVAILABLE
 dependencies:
   required:
     imports:

@@ -2,6 +2,7 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, wr
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { deflateSync } from 'node:zlib';
 
 import { describe, expect, it } from 'vitest';
 
@@ -22,6 +23,33 @@ function torchCheckpointStubSource() {
     '__version__ = "0.0-test"',
     'import json',
     'import zipfile',
+    '',
+    'int32 = "int32"',
+    'float32 = "float32"',
+    '',
+    'class Tensor:',
+    '    def __init__(self, values, dtype=None):',
+    '        self._values = values',
+    '        self.dtype = dtype',
+    '',
+    '    def int(self):',
+    '        return Tensor([[int(value) for value in row] for row in self._values], int32)',
+    '',
+    '    def float(self):',
+    '        return Tensor([[float(value) for value in row] for row in self._values], float32)',
+    '',
+    '    def __iter__(self):',
+    '        return iter(self._values)',
+    '',
+    '    def __len__(self):',
+    '        return len(self._values)',
+    '',
+    '    def __getitem__(self, index):',
+    '        return self._values[index]',
+    '',
+    'def tensor(values, dtype=None):',
+    '    normalized = [list(row) for row in values]',
+    '    return Tensor(normalized, dtype)',
     '',
     'def load(path, map_location=None, weights_only=False):',
     '    with zipfile.ZipFile(path, "r") as archive:',
@@ -165,17 +193,153 @@ function writeBinaryCheckpointBundle(path: string, payload: Record<string, unkno
 }
 
 function createBinaryGlbBytes() {
-  const jsonChunk = Buffer.from('{"asset":{"version":"2.0"}}   ', 'utf8');
-  const binaryChunk = Buffer.from([0x00, 0x80, 0x00, 0x00]);
-  const totalLength = 12 + 8 + jsonChunk.length + 8 + binaryChunk.length;
+  const vertices: Array<[number, number, number]> = [
+    [-0.9, -0.7, -0.5],
+    [0.8, -0.6, -0.4],
+    [0.9, 0.7, -0.3],
+    [-0.8, 0.8, -0.2],
+    [-0.6, -0.5, 0.7],
+    [0.7, -0.4, 0.9],
+    [0.6, 0.5, 0.8],
+    [-0.7, 0.6, 0.6],
+  ];
+  const faces: Array<[number, number, number]> = [
+    [0, 1, 2],
+    [0, 2, 3],
+    [4, 6, 5],
+    [4, 7, 6],
+    [0, 4, 5],
+    [0, 5, 1],
+    [1, 5, 6],
+    [1, 6, 2],
+    [2, 6, 7],
+    [2, 7, 3],
+    [3, 7, 4],
+    [3, 4, 0],
+  ];
+  const vertexBytes = Buffer.alloc(vertices.length * 12);
+  vertices.forEach((vertex, index) => {
+    vertexBytes.writeFloatLE(vertex[0], index * 12);
+    vertexBytes.writeFloatLE(vertex[1], (index * 12) + 4);
+    vertexBytes.writeFloatLE(vertex[2], (index * 12) + 8);
+  });
+
+  const indexBytes = Buffer.alloc(faces.length * 12);
+  faces.forEach((face, index) => {
+    indexBytes.writeUInt32LE(face[0], index * 12);
+    indexBytes.writeUInt32LE(face[1], (index * 12) + 4);
+    indexBytes.writeUInt32LE(face[2], (index * 12) + 8);
+  });
+
+  const paddedVertexBytes = Buffer.concat([vertexBytes, Buffer.alloc((4 - (vertexBytes.length % 4)) % 4)]);
+  const paddedIndexBytes = Buffer.concat([indexBytes, Buffer.alloc((4 - (indexBytes.length % 4)) % 4)]);
+  const binaryChunk = Buffer.concat([paddedVertexBytes, paddedIndexBytes]);
+  const jsonChunk = Buffer.from(
+    JSON.stringify({
+      asset: { version: '2.0', generator: 'processor-protocol-test-fixture' },
+      scene: 0,
+      scenes: [{ nodes: [0] }],
+      nodes: [{ mesh: 0, name: 'coarse-mesh' }],
+      meshes: [{ name: 'coarse-mesh', primitives: [{ attributes: { POSITION: 0 }, indices: 1 }] }],
+      buffers: [{ byteLength: binaryChunk.length }],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: vertexBytes.length, target: 34962 },
+        { buffer: 0, byteOffset: paddedVertexBytes.length, byteLength: indexBytes.length, target: 34963 },
+      ],
+      accessors: [
+        {
+          bufferView: 0,
+          componentType: 5126,
+          count: vertices.length,
+          type: 'VEC3',
+          min: [-0.9, -0.7, -0.5],
+          max: [0.9, 0.8, 0.9],
+        },
+        { bufferView: 1, componentType: 5125, count: faces.length * 3, type: 'SCALAR' },
+      ],
+    }),
+    'utf8',
+  );
+  const paddedJsonChunk = Buffer.concat([jsonChunk, Buffer.alloc((4 - (jsonChunk.length % 4)) % 4, 0x20)]);
+  const totalLength = 12 + 8 + paddedJsonChunk.length + 8 + binaryChunk.length;
 
   return Buffer.concat([
     Buffer.from('glTF', 'ascii'),
     Buffer.from(Uint32Array.of(2, totalLength).buffer),
-    Buffer.from(Uint32Array.of(jsonChunk.length, 0x4e4f534a).buffer),
-    jsonChunk,
+    Buffer.from(Uint32Array.of(paddedJsonChunk.length, 0x4e4f534a).buffer),
+    paddedJsonChunk,
     Buffer.from(Uint32Array.of(binaryChunk.length, 0x004e4942).buffer),
     binaryChunk,
+  ]);
+}
+
+function makeCrc32Table() {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+}
+
+const crc32Table = makeCrc32Table();
+
+function crc32(buffer: Buffer) {
+  let value = 0xffffffff;
+  for (const byte of buffer) {
+    value = crc32Table[(value ^ byte) & 0xff] ^ (value >>> 8);
+  }
+  return (value ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer) {
+  const typeBuffer = Buffer.from(type, 'ascii');
+  const lengthBuffer = Buffer.alloc(4);
+  lengthBuffer.writeUInt32BE(data.length, 0);
+  const checksumBuffer = Buffer.alloc(4);
+  checksumBuffer.writeUInt32BE(crc32(Buffer.concat([typeBuffer, data])), 0);
+  return Buffer.concat([lengthBuffer, typeBuffer, data, checksumBuffer]);
+}
+
+function createReferenceImageBytes() {
+  const pixels = [
+    [255, 32, 32, 255],
+    [32, 255, 32, 255],
+    [32, 32, 255, 255],
+    [240, 220, 48, 160],
+  ];
+  const width = 2;
+  const height = 2;
+  const scanlines: Buffer[] = [];
+
+  for (let rowIndex = 0; rowIndex < height; rowIndex += 1) {
+    const row = Buffer.alloc(1 + width * 4);
+    row[0] = 0;
+    for (let columnIndex = 0; columnIndex < width; columnIndex += 1) {
+      const pixel = pixels[(rowIndex * width) + columnIndex] ?? [0, 0, 0, 255];
+      const offset = 1 + (columnIndex * 4);
+      row[offset + 0] = pixel[0] ?? 0;
+      row[offset + 1] = pixel[1] ?? 0;
+      row[offset + 2] = pixel[2] ?? 0;
+      row[offset + 3] = pixel[3] ?? 255;
+    }
+    scanlines.push(row);
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(Buffer.concat(scanlines))),
+    pngChunk('IEND', Buffer.alloc(0)),
   ]);
 }
 
@@ -235,7 +399,7 @@ function createFixtureWorkspace() {
   const fallbackCoarseMesh = join(root, 'fallback-coarse.obj');
   const packagedArtifact = join(root, 'artifact.obj');
 
-  writeFileSync(referenceImage, 'image');
+  writeFileSync(referenceImage, createReferenceImageBytes());
   writeFileSync(namedCoarseMesh, createBinaryGlbBytes());
   writeFileSync(fallbackCoarseMesh, 'fallback-mesh');
   writeFileSync(packagedArtifact, 'refined-artifact');
@@ -372,6 +536,14 @@ function checkpointBundlePayload() {
   };
 }
 
+function checkpointBundleWithout(...missingSubtrees: Array<'vae' | 'dit' | 'conditioner'>) {
+  const payload = checkpointBundlePayload() as Record<string, unknown>;
+  for (const subtree of missingSubtrees) {
+    delete payload[subtree];
+  }
+  return payload;
+}
+
 function writeReadiness(
   root: string,
   overrides: Partial<{
@@ -481,7 +653,7 @@ describe('UltraShape processor.py protocol', () => {
     }
   });
 
-  it('treats named reference_image and coarse_mesh inputs as the primary manifest contract and rejects non-glb output requests for the local-only MVP', () => {
+  it('treats named reference_image and coarse_mesh inputs as the primary manifest contract on the supported glb-only path', () => {
     expect(manifest.nodes[0]?.inputs).toEqual([
       {
         name: 'reference_image',
@@ -520,7 +692,7 @@ describe('UltraShape processor.py protocol', () => {
           params: {
             backend: 'auto',
             coarse_mesh: join(fixture.root, 'missing-fallback.glb'),
-            output_format: 'obj',
+            output_format: 'glb',
           },
           workspaceDir: fixture.outputDir,
         },
@@ -530,18 +702,16 @@ describe('UltraShape processor.py protocol', () => {
       );
 
       expect(outcome.status).toBe(0);
-      expect(outcome.events.map((event) => event.type)).toEqual([
-        'progress',
-        'log',
-        'error',
-      ]);
+      expect(outcome.events[0]?.type).toBe('progress');
+      expect(outcome.events[1]?.type).toBe('log');
+      expect(outcome.events.at(-1)?.type).toBe('error');
 
       const resolutionLog = outcome.events[1];
       const resolved = JSON.parse(String(resolutionLog.message)) as Record<string, string>;
       expect(resolved.reference_image).toBe(fixture.referenceImage);
       expect(resolved.coarse_mesh).toBe(fixture.namedCoarseMesh);
       expect(resolved.backend).toBe('local');
-      expect(resolved.output_format).toBe('obj');
+      expect(resolved.output_format).toBe('glb');
 
       const error = outcome.events.at(-1);
       expect(error).toEqual({
@@ -549,7 +719,7 @@ describe('UltraShape processor.py protocol', () => {
         message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
         code: 'LOCAL_RUNTIME_UNAVAILABLE',
       });
-      expect(existsSync(join(fixture.outputDir, 'refined.obj'))).toBe(false);
+      expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
     } finally {
       fixture.cleanup();
     }
@@ -696,6 +866,16 @@ describe('UltraShape processor.py protocol', () => {
         '  requires_exact_closure: true',
         'export:',
         '  format: glb',
+        'public_contract:',
+        '  backend_modes:',
+        '    - auto',
+        '    - local',
+        '  success_output_formats:',
+        '    - glb',
+        '  public_error_codes:',
+        '    - DEPENDENCY_MISSING',
+        '    - WEIGHTS_MISSING',
+        '    - LOCAL_RUNTIME_UNAVAILABLE',
         'checkpoint:',
         '  required_subtrees:',
         '    - vae',
@@ -762,6 +942,7 @@ describe('UltraShape processor.py protocol', () => {
             output_format: 'glb-only',
             requires_exact_closure: true,
             checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
+            public_error_codes: ['DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'],
           },
           warnings: [],
         }),
@@ -782,14 +963,39 @@ describe('UltraShape processor.py protocol', () => {
           conditioning: expect.objectContaining({
             voxel_count: expect.any(Number),
             mask_tokens: expect.any(Number),
+            checkpoint_tensor_count: expect.any(Number),
+            checkpoint_value_count: expect.any(Number),
+            state_hydrated: true,
+            hydration: expect.objectContaining({
+              module: 'SingleImageEncoder',
+              load_style: 'load_state_dict',
+              strict: false,
+            }),
           }),
           scheduler: expect.objectContaining({
             family: 'flow-matching-euler-discrete',
             step_count: 30,
+            sigma_start: expect.any(Number),
+            sigma_end: expect.any(Number),
           }),
           denoise: expect.objectContaining({
             attention: expect.any(String),
             latent_signature: expect.any(Number),
+            conditioning_signature: expect.any(Number),
+            timestep_count: 30,
+            state_hydrated: true,
+            hydration: expect.objectContaining({
+              module: 'RefineDiT',
+              load_style: 'load_state_dict',
+              strict: false,
+            }),
+          }),
+          checkpoint: expect.objectContaining({
+            hydration: expect.arrayContaining([
+              expect.objectContaining({ module: 'SingleImageEncoder' }),
+              expect.objectContaining({ module: 'RefineDiT' }),
+              expect.objectContaining({ module: 'ShapeVAE' }),
+            ]),
           }),
           decode: expect.objectContaining({
             field_density: expect.any(Number),
@@ -802,6 +1008,93 @@ describe('UltraShape processor.py protocol', () => {
       );
       expect(Number(metrics.rms)).toBeGreaterThan(0.01);
       expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects runner jobs whose checkpoint omits any required vae/dit/conditioner subtree', () => {
+    const fixture = createFixtureWorkspace();
+    const configPath = join(fixture.root, 'runtime-config.yaml');
+    const checkpointPath = join(fixture.root, 'ultrashape_v1.pt');
+
+    writeFileSync(
+      configPath,
+      [
+        'model:',
+        '  scope: mc-only',
+        'runtime:',
+        '  backend: local',
+        '  requires_exact_closure: true',
+        'export:',
+        '  format: glb',
+        'public_contract:',
+        '  backend_modes:',
+        '    - auto',
+        '    - local',
+        '  success_output_formats:',
+        '    - glb',
+        '  public_error_codes:',
+        '    - DEPENDENCY_MISSING',
+        '    - WEIGHTS_MISSING',
+        '    - LOCAL_RUNTIME_UNAVAILABLE',
+        'checkpoint:',
+        '  required_subtrees:',
+        '    - vae',
+        '    - dit',
+        '    - conditioner',
+        'dependencies:',
+        '  required:',
+        '    imports:',
+        '      - diffusers',
+        '      - cubvh',
+        'vae_config:',
+        '  enabled: true',
+        'dit_cfg:',
+        '  enabled: true',
+        'conditioner_config:',
+        '  enabled: true',
+        'image_processor_cfg:',
+        '  enabled: true',
+        'scheduler_cfg:',
+        '  family: flow-matching',
+        '',
+      ].join('\n'),
+    );
+    writeFileSync(join(fixture.root, 'py-stubs', 'diffusers.py'), diffusersStubSource());
+
+    try {
+      for (const missingSubtree of ['vae', 'dit', 'conditioner'] as const) {
+        writeBinaryCheckpointBundle(checkpointPath, checkpointBundleWithout(missingSubtree));
+
+        const outcome = runLocalRunner(
+          {
+            reference_image: fixture.referenceImage,
+            coarse_mesh: fixture.namedCoarseMesh,
+            output_dir: fixture.outputDir,
+            output_format: 'glb',
+            checkpoint: checkpointPath,
+            config_path: configPath,
+            ext_dir: fixture.root,
+            backend: 'local',
+            steps: 30,
+            guidance_scale: 5.5,
+            seed: 7,
+            preserve_scale: true,
+          },
+          {
+            cwd: fixture.root,
+          },
+        );
+
+        expect(outcome.status).toBe(1);
+        expect(outcome.result).toEqual({
+          ok: false,
+          error_code: 'WEIGHTS_MISSING',
+          error_message: expect.stringContaining(missingSubtree),
+        });
+        expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
+      }
     } finally {
       fixture.cleanup();
     }

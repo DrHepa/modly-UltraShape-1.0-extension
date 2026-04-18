@@ -2,6 +2,7 @@ import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rm
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { deflateSync } from 'node:zlib';
 
 import { describe, expect, it } from 'vitest';
 
@@ -290,6 +291,214 @@ function createBinaryGlbBytes() {
   ]);
 }
 
+function makeCrc32Table() {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+}
+
+const crc32Table = makeCrc32Table();
+
+function crc32(buffer: Buffer) {
+  let value = 0xffffffff;
+  for (const byte of buffer) {
+    value = crc32Table[(value ^ byte) & 0xff] ^ (value >>> 8);
+  }
+  return (value ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer) {
+  const typeBuffer = Buffer.from(type, 'ascii');
+  const lengthBuffer = Buffer.alloc(4);
+  lengthBuffer.writeUInt32BE(data.length, 0);
+  const checksumBuffer = Buffer.alloc(4);
+  checksumBuffer.writeUInt32BE(crc32(Buffer.concat([typeBuffer, data])), 0);
+  return Buffer.concat([lengthBuffer, typeBuffer, data, checksumBuffer]);
+}
+
+function createRgbaPngBytes(width: number, height: number, pixels: number[][]) {
+  const scanlines: Buffer[] = [];
+  for (let rowIndex = 0; rowIndex < height; rowIndex += 1) {
+    const row = Buffer.alloc(1 + width * 4);
+    row[0] = 0;
+    for (let columnIndex = 0; columnIndex < width; columnIndex += 1) {
+      const pixel = pixels[(rowIndex * width) + columnIndex] ?? [0, 0, 0, 255];
+      const offset = 1 + (columnIndex * 4);
+      row[offset + 0] = pixel[0] ?? 0;
+      row[offset + 1] = pixel[1] ?? 0;
+      row[offset + 2] = pixel[2] ?? 0;
+      row[offset + 3] = pixel[3] ?? 255;
+    }
+    scanlines.push(row);
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(Buffer.concat(scanlines))),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function createReferenceImageBytes(variant: 'a' | 'b' = 'a') {
+  const pixels =
+    variant === 'a'
+      ? [
+          [255, 32, 32, 255],
+          [32, 255, 32, 255],
+          [32, 32, 255, 255],
+          [240, 220, 48, 160],
+        ]
+      : [
+          [20, 20, 20, 255],
+          [220, 120, 40, 255],
+          [180, 40, 200, 200],
+          [40, 220, 240, 96],
+        ];
+
+  return createRgbaPngBytes(2, 2, pixels);
+}
+
+function createMeshGlbBytes(vertices: Array<[number, number, number]>, faces: Array<[number, number, number]>) {
+  const vertexBytes = Buffer.alloc(vertices.length * 12);
+  vertices.forEach((vertex, index) => {
+    vertexBytes.writeFloatLE(vertex[0], index * 12);
+    vertexBytes.writeFloatLE(vertex[1], (index * 12) + 4);
+    vertexBytes.writeFloatLE(vertex[2], (index * 12) + 8);
+  });
+
+  const indexBytes = Buffer.alloc(faces.length * 12);
+  faces.forEach((face, index) => {
+    indexBytes.writeUInt32LE(face[0], index * 12);
+    indexBytes.writeUInt32LE(face[1], (index * 12) + 4);
+    indexBytes.writeUInt32LE(face[2], (index * 12) + 8);
+  });
+
+  const paddedVertexBytes = Buffer.concat([vertexBytes, Buffer.alloc((4 - (vertexBytes.length % 4)) % 4)]);
+  const paddedIndexBytes = Buffer.concat([indexBytes, Buffer.alloc((4 - (indexBytes.length % 4)) % 4)]);
+  const binaryBlob = Buffer.concat([paddedVertexBytes, paddedIndexBytes]);
+  const jsonDocument = {
+    asset: { version: '2.0', generator: 'runtime-flow-test-fixture' },
+    scene: 0,
+    scenes: [{ nodes: [0] }],
+    nodes: [{ mesh: 0, name: 'coarse-mesh' }],
+    meshes: [{ name: 'coarse-mesh', primitives: [{ attributes: { POSITION: 0 }, indices: 1 }] }],
+    buffers: [{ byteLength: binaryBlob.length }],
+    bufferViews: [
+      { buffer: 0, byteOffset: 0, byteLength: vertexBytes.length, target: 34962 },
+      { buffer: 0, byteOffset: paddedVertexBytes.length, byteLength: indexBytes.length, target: 34963 },
+    ],
+    accessors: [
+      {
+        bufferView: 0,
+        componentType: 5126,
+        count: vertices.length,
+        type: 'VEC3',
+        min: [
+          Math.min(...vertices.map((vertex) => vertex[0])),
+          Math.min(...vertices.map((vertex) => vertex[1])),
+          Math.min(...vertices.map((vertex) => vertex[2])),
+        ],
+        max: [
+          Math.max(...vertices.map((vertex) => vertex[0])),
+          Math.max(...vertices.map((vertex) => vertex[1])),
+          Math.max(...vertices.map((vertex) => vertex[2])),
+        ],
+      },
+      { bufferView: 1, componentType: 5125, count: faces.length * 3, type: 'SCALAR' },
+    ],
+  };
+
+  const jsonBytes = Buffer.from(JSON.stringify(jsonDocument), 'utf8');
+  const paddedJsonBytes = Buffer.concat([jsonBytes, Buffer.alloc((4 - (jsonBytes.length % 4)) % 4, 0x20)]);
+  const totalLength = 12 + 8 + paddedJsonBytes.length + 8 + binaryBlob.length;
+
+  const header = Buffer.alloc(12);
+  header.write('glTF', 0, 'ascii');
+  header.writeUInt32LE(2, 4);
+  header.writeUInt32LE(totalLength, 8);
+
+  const jsonHeader = Buffer.alloc(8);
+  jsonHeader.writeUInt32LE(paddedJsonBytes.length, 0);
+  jsonHeader.writeUInt32LE(0x4e4f534a, 4);
+
+  const binHeader = Buffer.alloc(8);
+  binHeader.writeUInt32LE(binaryBlob.length, 0);
+  binHeader.writeUInt32LE(0x004e4942, 4);
+
+  return Buffer.concat([header, jsonHeader, paddedJsonBytes, binHeader, binaryBlob]);
+}
+
+function createCoarseMeshBytes(variant: 'a' | 'b' = 'a') {
+  if (variant === 'a') {
+    return createMeshGlbBytes(
+      [
+        [-0.9, -0.7, -0.5],
+        [0.8, -0.6, -0.4],
+        [0.9, 0.7, -0.3],
+        [-0.8, 0.8, -0.2],
+        [-0.6, -0.5, 0.7],
+        [0.7, -0.4, 0.9],
+        [0.6, 0.5, 0.8],
+        [-0.7, 0.6, 0.6],
+      ],
+      [
+        [0, 1, 2],
+        [0, 2, 3],
+        [4, 6, 5],
+        [4, 7, 6],
+        [0, 4, 5],
+        [0, 5, 1],
+        [1, 5, 6],
+        [1, 6, 2],
+        [2, 6, 7],
+        [2, 7, 3],
+        [3, 7, 4],
+        [3, 4, 0],
+      ],
+    );
+  }
+
+  return createMeshGlbBytes(
+    [
+      [-0.4, -0.9, -0.7],
+      [0.9, -0.7, -0.2],
+      [1.1, 0.1, -0.1],
+      [0.5, 0.9, 0.3],
+      [-0.3, 1.0, 0.6],
+      [-1.0, 0.2, 0.4],
+      [-0.8, -0.2, 0.9],
+      [0.2, -0.4, 1.0],
+    ],
+    [
+      [0, 1, 7],
+      [1, 2, 7],
+      [2, 3, 7],
+      [3, 4, 7],
+      [4, 5, 6],
+      [4, 6, 7],
+      [5, 0, 6],
+      [0, 7, 6],
+      [0, 1, 5],
+      [1, 2, 3],
+      [1, 3, 5],
+      [3, 4, 5],
+    ],
+  );
+}
+
 function readGlbJson(path: string) {
   const payload = readFileSync(path);
   expect(payload.subarray(0, 4).toString('ascii')).toBe('glTF');
@@ -367,9 +576,9 @@ function createFixtureWorkspace() {
   const checkpoint = join(modelsDir, 'ultrashape_v1.pt');
   const configPath = join(root, 'infer_dit_refine.yaml');
 
-  writeFileSync(referenceImage, 'image');
-  writeFileSync(coarseMesh, 'mesh');
-  writeFileSync(binaryCoarseMesh, createBinaryGlbBytes());
+  writeFileSync(referenceImage, createReferenceImageBytes('a'));
+  writeFileSync(coarseMesh, createCoarseMeshBytes('a'));
+  writeFileSync(binaryCoarseMesh, createCoarseMeshBytes('b'));
   writeFileSync(packagedArtifact, 'refined-mesh');
   writeFileSync(join(stubDir, 'cubvh.py'), cubvhStubSource());
   writeFileSync(join(stubDir, 'diffusers.py'), diffusersStubSource());
@@ -425,6 +634,14 @@ function checkpointBundlePayload(variant: 'a' | 'b' = 'a') {
   };
 }
 
+function checkpointBundleWithout(...missingSubtrees: Array<'vae' | 'dit' | 'conditioner'>) {
+  const payload = checkpointBundlePayload('a') as Record<string, unknown>;
+  for (const subtree of missingSubtrees) {
+    delete payload[subtree];
+  }
+  return payload;
+}
+
 function writeCheckpointBundle(path: string, variant: 'a' | 'b' = 'a') {
   writeBinaryCheckpointBundle(path, checkpointBundlePayload(variant));
 }
@@ -441,6 +658,9 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
         processor: 'ImageProcessorV2',
         byte_length: expect.any(Number),
         normalized_channels: 4,
+        image_tensor_shape: [1, 2, 2, 4],
+        image_feature_count: expect.any(Number),
+        mask_feature_count: expect.any(Number),
         image_signature: expect.any(Number),
         mask_signature: expect.any(Number),
       }),
@@ -448,7 +668,11 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
         surface_loader: 'SharpEdgeSurfaceLoader',
         encoder: 'SingleImageEncoder',
         voxelizer: 'voxelize_from_point',
+        surface_vertex_count: expect.any(Number),
+        surface_face_count: expect.any(Number),
+        surface_point_count: expect.any(Number),
         voxel_count: expect.any(Number),
+        voxel_resolution: expect.any(Number),
         mask_tokens: expect.any(Number),
         surface_signature: expect.any(Number),
         voxel_signature: expect.any(Number),
@@ -552,6 +776,16 @@ function writeRuntimeConfig(
       'runtime:',
       `  backend: ${overrides.backend ?? 'local'}`,
       '  requires_exact_closure: true',
+      'public_contract:',
+      '  backend_modes:',
+      '    - auto',
+      '    - local',
+      '  success_output_formats:',
+      '    - glb',
+      '  public_error_codes:',
+      '    - DEPENDENCY_MISSING',
+      '    - WEIGHTS_MISSING',
+      '    - LOCAL_RUNTIME_UNAVAILABLE',
       'checkpoint:',
       '  primary: models/ultrashape/ultrashape_v1.pt',
       '  required_subtrees:',
@@ -564,16 +798,28 @@ function writeRuntimeConfig(
       '  target: ultrashape_runtime.models.denoisers.dit_mask.RefineDiT',
       'conditioner_config:',
       '  target: ultrashape_runtime.models.conditioner_mask.SingleImageEncoder',
+      'preprocess:',
+      '  image_processor: ImageProcessorV2',
+      '  require_cutout: conditional',
       'image_processor_cfg:',
       '  target: ultrashape_runtime.preprocessors.ImageProcessorV2',
+      'conditioning:',
+      '  coarse_mesh_encoder: SharpEdgeSurfaceLoader',
+      '  voxelizer: voxelize_from_point',
       'surface:',
       `  extraction: ${overrides.extraction ?? 'mc'}`,
+      '  loader: SharpEdgeSurfaceLoader',
       'scheduler:',
       '  family: flow-matching',
       'scheduler_cfg:',
       '  target: diffusers.FlowMatchEulerDiscreteScheduler',
+      'decoder:',
+      '  vae: ShapeVAE',
+      '  volume_decoder: VanillaVDMVolumeDecoding',
       'weights:',
       `  primary: ${overrides.primaryWeight ?? 'models/ultrashape/ultrashape_v1.pt'}`,
+      'gate:',
+      '  mode: geometric-hard-gate',
       'export:',
       '  format: glb',
       'dependencies:',
@@ -680,6 +926,17 @@ function runLocalRunner(payload: Record<string, unknown>, options: { env?: NodeJ
   });
 
   return outcome.stdout ? (JSON.parse(outcome.stdout) as Record<string, unknown>) : null;
+}
+
+function runPythonSnippet(source: string, args: string[] = [], pythonPathEntries: string[] = []) {
+  return spawnSync('python3', ['-c', source, ...args], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PYTHONPATH: [...pythonPathEntries, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+    },
+  });
 }
 
 describe('UltraShape runtime flow', () => {
@@ -893,6 +1150,7 @@ describe('UltraShape runtime flow', () => {
             output_format: 'glb-only',
             requires_exact_closure: true,
             checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
+            public_error_codes: ['DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'],
           },
           warnings: [],
         },
@@ -941,6 +1199,7 @@ describe('UltraShape runtime flow', () => {
             output_format: 'glb-only',
             requires_exact_closure: true,
             checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
+            public_error_codes: ['DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'],
           },
           warnings: [],
         },
@@ -1085,31 +1344,32 @@ describe('UltraShape runtime flow', () => {
 
     try {
       writeRuntimeConfig(fixture.configPath);
-      writeBinaryCheckpointBundle(fixture.checkpoint, {
-        vae: { weights: 'fixture-vae' },
-        dit: { weights: 'fixture-dit' },
-      });
 
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: null,
-        preserve_scale: true,
-      });
+      for (const missingSubtree of ['vae', 'dit', 'conditioner'] as const) {
+        writeBinaryCheckpointBundle(fixture.checkpoint, checkpointBundleWithout(missingSubtree));
 
-      expect(outcome).toEqual({
-        ok: false,
-        error_code: 'WEIGHTS_MISSING',
-        error_message: expect.stringContaining('conditioner'),
-      });
+        const outcome = runLocalRunner({
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: fixture.outputDir,
+          output_format: 'glb',
+          checkpoint: null,
+          config_path: fixture.configPath,
+          ext_dir: fixture.root,
+          backend: 'local',
+          steps: 30,
+          guidance_scale: 5.5,
+          seed: null,
+          preserve_scale: true,
+        });
+
+        expect(outcome).toEqual({
+          ok: false,
+          error_code: 'WEIGHTS_MISSING',
+          error_message: expect.stringContaining(missingSubtree),
+        });
+        expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
+      }
     } finally {
       fixture.cleanup();
     }
@@ -1320,7 +1580,7 @@ describe('UltraShape runtime flow', () => {
         preserve_scale: true,
       });
 
-      writeFileSync(fixture.referenceImage, 'image-with-real-preprocess-drift');
+      writeFileSync(fixture.referenceImage, createReferenceImageBytes('b'));
 
       const secondOutcome = runLocalRunner({
         reference_image: fixture.referenceImage,
@@ -1340,6 +1600,19 @@ describe('UltraShape runtime flow', () => {
       const firstMetrics = getRunnerMetrics(firstOutcome);
       const secondMetrics = getRunnerMetrics(secondOutcome);
 
+      expect(firstMetrics.preprocess).toEqual(
+        expect.objectContaining({
+          image_tensor_shape: [1, 2, 2, 4],
+          image_feature_count: expect.any(Number),
+        }),
+      );
+      expect(firstMetrics.conditioning).toEqual(
+        expect.objectContaining({
+          surface_vertex_count: 8,
+          surface_face_count: 12,
+          voxel_resolution: 12,
+        }),
+      );
       expect(firstMetrics.preprocess).not.toEqual(secondMetrics.preprocess);
       expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
       expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
@@ -1390,10 +1663,39 @@ describe('UltraShape runtime flow', () => {
       const secondMetrics = getRunnerMetrics(secondOutcome);
 
       expect(firstMetrics.preprocess).toEqual(secondMetrics.preprocess);
+      expect(firstMetrics.conditioning).toEqual(
+        expect.objectContaining({
+          surface_vertex_count: 8,
+          surface_face_count: 12,
+          surface_point_count: expect.any(Number),
+        }),
+      );
+      expect(secondMetrics.conditioning).toEqual(
+        expect.objectContaining({
+          surface_vertex_count: 8,
+          surface_face_count: 12,
+          surface_point_count: expect.any(Number),
+        }),
+      );
+      expect(firstMetrics.gate).toEqual(
+        expect.objectContaining({
+          reference_image_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+          attribution_signature: expect.any(Number),
+        }),
+      );
+      expect(secondMetrics.gate).toEqual(
+        expect.objectContaining({
+          reference_image_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+          attribution_signature: expect.any(Number),
+        }),
+      );
       expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
       expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
       expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
       expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
+      expect(firstMetrics.gate).not.toEqual(secondMetrics.gate);
     } finally {
       fixture.cleanup();
     }
@@ -1420,7 +1722,7 @@ describe('UltraShape runtime flow', () => {
         preserve_scale: true,
       });
 
-      writeFileSync(fixture.referenceImage, 'image-with-real-preprocess-drift');
+      writeFileSync(fixture.referenceImage, createReferenceImageBytes('b'));
 
       const secondOutcome = runLocalRunner({
         reference_image: fixture.referenceImage,
@@ -1440,11 +1742,33 @@ describe('UltraShape runtime flow', () => {
       const firstMetrics = getRunnerMetrics(firstOutcome);
       const secondMetrics = getRunnerMetrics(secondOutcome);
 
+      expect(firstMetrics.preprocess).toEqual(
+        expect.objectContaining({
+          image_tensor_shape: [1, 2, 2, 4],
+          image_feature_count: expect.any(Number),
+          mask_feature_count: expect.any(Number),
+        }),
+      );
+      expect(firstMetrics.gate).toEqual(
+        expect.objectContaining({
+          coarse_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+          attribution_signature: expect.any(Number),
+        }),
+      );
+      expect(secondMetrics.gate).toEqual(
+        expect.objectContaining({
+          coarse_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+          attribution_signature: expect.any(Number),
+        }),
+      );
       expect(firstMetrics.preprocess).not.toEqual(secondMetrics.preprocess);
       expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
       expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
       expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
       expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
+      expect(firstMetrics.gate).not.toEqual(secondMetrics.gate);
     } finally {
       fixture.cleanup();
     }
@@ -1474,9 +1798,19 @@ describe('UltraShape runtime flow', () => {
       expect(getRunnerMetrics(outcome).conditioning).toEqual(
         expect.objectContaining({
           encoder: 'SingleImageEncoder',
+          surface_vertex_count: 8,
+          surface_face_count: 12,
           image_token_signature: expect.any(Number),
           checkpoint_signature: expect.any(Number),
+          checkpoint_tensor_count: expect.any(Number),
+          checkpoint_value_count: expect.any(Number),
           conditioning_signature: expect.any(Number),
+          state_hydrated: true,
+          hydration: expect.objectContaining({
+            module: 'SingleImageEncoder',
+            load_style: 'load_state_dict',
+            strict: false,
+          }),
         }),
       );
     } finally {
@@ -1527,6 +1861,9 @@ describe('UltraShape runtime flow', () => {
         expect.objectContaining({
           family: 'flow-matching-euler-discrete',
           target: 'diffusers.FlowMatchEulerDiscreteScheduler',
+          step_count: 12,
+          sigma_start: expect.any(Number),
+          sigma_end: expect.any(Number),
           timestep_signature: expect.any(Number),
         }),
       );
@@ -1534,6 +1871,14 @@ describe('UltraShape runtime flow', () => {
         expect.objectContaining({
           model: 'RefineDiT',
           scheduler_signature: expect.any(Number),
+          conditioning_signature: expect.any(Number),
+          timestep_count: 12,
+          state_hydrated: true,
+          hydration: expect.objectContaining({
+            module: 'RefineDiT',
+            load_style: 'load_state_dict',
+            strict: false,
+          }),
         }),
       );
       expect(firstMetrics.scheduler).not.toEqual(secondMetrics.scheduler);
@@ -1602,6 +1947,83 @@ describe('UltraShape runtime flow', () => {
           ensure_consistency: false,
         }),
       );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('exports refined.glb from the extracted mesh geometry instead of synthetic payload bytes', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const outcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+
+      expect(outcome?.ok).toBe(true);
+      const metrics = getRunnerMetrics(outcome);
+      const extractMetrics = metrics.extract as Record<string, unknown>;
+      const refinedPath = join(fixture.outputDir, 'refined.glb');
+      const refinedBytes = readFileSync(refinedPath);
+      const refinedDocument = readGlbJson(refinedPath);
+      const primitive = refinedDocument.meshes?.[0]?.primitives?.[0];
+      const indexAccessorIndex = primitive?.indices;
+      expect(indexAccessorIndex).toEqual(expect.any(Number));
+      const indexAccessor = refinedDocument.accessors?.[indexAccessorIndex as number] as { count?: unknown } | undefined;
+
+      expect(extractMetrics).toEqual(
+        expect.objectContaining({
+          vertex_count: getGlbPositionAccessorCount(refinedPath),
+          face_count: Math.floor(Number(indexAccessor?.count ?? 0) / 3),
+          payload_bytes: refinedBytes.length,
+        }),
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects byte-derived refined mesh payloads instead of fabricating fallback geometry', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      const outcome = runPythonSnippet(
+        [
+          'import json',
+          'from ultrashape_runtime.utils.mesh import build_renderable_mesh_payload',
+          'try:',
+          '    build_renderable_mesh_payload({',
+          '        "kind": "refined-mesh",',
+          '        "mesh_name": "synthetic-refined",',
+          '        "bytes": b"synthetic-refined-payload",',
+          '    })',
+          'except Exception as error:',
+          '    print(json.dumps({"ok": False, "error": str(error)}))',
+          'else:',
+          '    print(json.dumps({"ok": True}))',
+        ].join('\n'),
+        [],
+        [fixture.stubDir],
+      );
+
+      expect(outcome.status).toBe(0);
+      expect(JSON.parse(outcome.stdout)).toEqual({
+        ok: false,
+        error: expect.stringContaining('renderable vertices and faces'),
+      });
     } finally {
       fixture.cleanup();
     }
@@ -1712,8 +2134,25 @@ describe('UltraShape runtime flow', () => {
           checkpoint_signature: expect.any(Number),
         }),
       );
+      expect(firstMetrics.gate).toEqual(
+        expect.objectContaining({
+          coarse_signature: expect.any(Number),
+          reference_image_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+          attribution_signature: expect.any(Number),
+        }),
+      );
+      expect(secondMetrics.gate).toEqual(
+        expect.objectContaining({
+          coarse_signature: expect.any(Number),
+          reference_image_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+          attribution_signature: expect.any(Number),
+        }),
+      );
       expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
       expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
+      expect(firstMetrics.gate).not.toEqual(secondMetrics.gate);
     } finally {
       fixture.cleanup();
     }
@@ -1750,7 +2189,7 @@ describe('UltraShape runtime flow', () => {
       expect(outcome).toEqual({
         ok: false,
         error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('GEOMETRIC_GATE_REJECTED'),
+        error_message: expect.stringContaining('passthrough-like'),
       });
       expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
     } finally {
@@ -1789,7 +2228,7 @@ describe('UltraShape runtime flow', () => {
       expect(rejected).toEqual({
         ok: false,
         error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('GEOMETRIC_GATE_REJECTED'),
+        error_message: expect.stringContaining('preserve-scale bbox tolerance failed'),
       });
       expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
 
@@ -1823,6 +2262,11 @@ describe('UltraShape runtime flow', () => {
           backend: 'local',
           metrics: expect.objectContaining({
             extent_ratio: expect.any(Array),
+            gate: expect.objectContaining({
+              preserve_scale: false,
+              scale_fit_applied: true,
+              attribution_signature: expect.any(Number),
+            }),
           }),
           fallbacks: ['flash_attn->sdpa'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
@@ -1832,6 +2276,7 @@ describe('UltraShape runtime flow', () => {
             output_format: 'glb-only',
             requires_exact_closure: true,
             checkpoint_subtrees: ['vae', 'dit', 'conditioner'],
+            public_error_codes: ['DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'],
           },
           warnings: [],
         },

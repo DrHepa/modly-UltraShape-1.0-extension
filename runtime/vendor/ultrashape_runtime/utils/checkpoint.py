@@ -153,6 +153,31 @@ def checkpoint_signature(checkpoint_state: object) -> int:
     return stable_signature(checkpoint_tokens(checkpoint_state, limit=MAX_TENSOR_SAMPLES))
 
 
+def checkpoint_tensor_count(checkpoint_state: object) -> int:
+    if isinstance(checkpoint_state, Mapping) and isinstance(checkpoint_state.get('tensor_count'), int):
+        return int(checkpoint_state['tensor_count'])
+
+    tensors = checkpoint_state.get('tensors') if isinstance(checkpoint_state, Mapping) else None
+    return len(tensors) if isinstance(tensors, Mapping) else 0
+
+
+def checkpoint_value_count(checkpoint_state: object) -> int:
+    if isinstance(checkpoint_state, Mapping) and isinstance(checkpoint_state.get('value_count'), int):
+        return int(checkpoint_state['value_count'])
+
+    tensors = checkpoint_state.get('tensors') if isinstance(checkpoint_state, Mapping) else None
+    if not isinstance(tensors, Mapping):
+        return 0
+
+    total = 0
+    for tensor in tensors.values():
+        if isinstance(tensor, Mapping) and isinstance(tensor.get('value_count'), int):
+            total += int(tensor['value_count'])
+        elif isinstance(tensor, (list, tuple)):
+            total += len(tensor)
+    return total
+
+
 def apply_checkpoint_state(module: object, checkpoint_state: object, *, strict: bool = False) -> dict[str, object]:
     if not isinstance(checkpoint_state, Mapping):
         raise CheckpointResolutionError('Checkpoint hydration requires structured checkpoint state.')
@@ -171,6 +196,8 @@ def apply_checkpoint_state(module: object, checkpoint_state: object, *, strict: 
         'load_style': 'load_state_dict',
         'strict': strict,
         'signature': checkpoint_signature(checkpoint_state),
+        'tensor_count': checkpoint_tensor_count(checkpoint_state),
+        'value_count': checkpoint_value_count(checkpoint_state),
     }
 
 

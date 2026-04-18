@@ -18,17 +18,9 @@ DEFAULT_PARAMS = {
 
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 MESH_EXTENSIONS = {'.glb', '.obj', '.fbx', '.ply'}
-ALLOWED_BACKENDS = {'auto', 'local', 'remote', 'hybrid'}
-ALLOWED_OUTPUTS = {'glb', 'obj', 'fbx', 'ply'}
-PUBLIC_ERROR_CODES = {
-    'INVALID_PARAMS',
-    'MISSING_INPUT',
-    'UNREADABLE_ASSET',
-    'UNSUPPORTED_ASSET_TYPE',
-    'DEPENDENCY_MISSING',
-    'WEIGHTS_MISSING',
-    'LOCAL_RUNTIME_UNAVAILABLE',
-}
+ALLOWED_BACKENDS = {'auto', 'local'}
+ALLOWED_OUTPUTS = {'glb'}
+PUBLIC_ERROR_CODES = {'DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'}
 
 
 class ProcessorError(Exception):
@@ -80,7 +72,7 @@ def normalize_params(payload: dict) -> dict:
 
     backend = merged['backend']
     if backend not in ALLOWED_BACKENDS:
-        raise ProcessorError('INVALID_PARAMS', 'backend must be auto, local, remote, or hybrid.')
+        raise ProcessorError('INVALID_PARAMS', 'backend must be auto or local.')
     if not isinstance(merged['steps'], int) or merged['steps'] <= 0:
         raise ProcessorError('INVALID_PARAMS', 'steps must be a positive integer.')
     if not isinstance(merged['guidance_scale'], (int, float)) or merged['guidance_scale'] <= 0:
@@ -90,7 +82,7 @@ def normalize_params(payload: dict) -> dict:
     if not isinstance(merged['preserve_scale'], bool):
         raise ProcessorError('INVALID_PARAMS', 'preserve_scale must be a boolean.')
     if merged['output_format'] not in ALLOWED_OUTPUTS:
-        raise ProcessorError('INVALID_PARAMS', 'output_format must be glb, obj, fbx, or ply.')
+        raise ProcessorError('INVALID_PARAMS', 'output_format must be glb.')
     checkpoint = merged.get('checkpoint')
     if checkpoint not in (None, ''):
         ensure_file(str(checkpoint), 'checkpoint', allowed_extensions=None)

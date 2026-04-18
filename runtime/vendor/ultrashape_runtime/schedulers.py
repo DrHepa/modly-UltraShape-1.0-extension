@@ -48,6 +48,7 @@ def build_flow_matching_schedule(*, steps: int, guidance_scale: float) -> dict[s
         'step_count': steps,
         'guidance_scale': guidance_scale,
         'timesteps': timesteps,
+        'timestep_count': len(timesteps),
         'timestep_signature': stable_signature(timesteps),
         'sigma_start': clamp_unit(1.0 - (1.0 / max(steps, 1))),
         'sigma_end': clamp_unit(1.0 / max(steps, 1)),

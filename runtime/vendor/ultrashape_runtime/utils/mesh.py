@@ -8,7 +8,7 @@ import os
 import struct
 from pathlib import Path
 
-from .tensors import bytes_to_unit_floats, clamp_unit, stable_signature
+from .tensors import clamp_unit, stable_signature
 
 
 class MeshExportError(Exception):
@@ -190,70 +190,6 @@ def _extract_glb_geometry(payload: bytes) -> tuple[list[tuple[float, float, floa
     return vertices, faces
 
 
-def _base_mesh_faces() -> list[tuple[int, int, int]]:
-    return [
-        (0, 1, 2),
-        (0, 2, 3),
-        (4, 6, 5),
-        (4, 7, 6),
-        (0, 4, 5),
-        (0, 5, 1),
-        (1, 5, 6),
-        (1, 6, 2),
-        (2, 6, 7),
-        (2, 7, 3),
-        (3, 7, 4),
-        (3, 4, 0),
-    ]
-
-
-def _derived_mesh_geometry(mesh_payload: dict[str, object]) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]]:
-    tokens = bytes_to_unit_floats(_mesh_payload_bytes(mesh_payload), length=36)
-    scale_x, scale_y, scale_z = _extent_scale(mesh_payload)
-    half_extents = (scale_x / 2.0, scale_y / 2.0, scale_z / 2.0)
-    corners = [
-        (-1.0, -1.0, -1.0),
-        (1.0, -1.0, -1.0),
-        (1.0, 1.0, -1.0),
-        (-1.0, 1.0, -1.0),
-        (-1.0, -1.0, 1.0),
-        (1.0, -1.0, 1.0),
-        (1.0, 1.0, 1.0),
-        (-1.0, 1.0, 1.0),
-        (0.0, -1.0, 0.0),
-        (1.0, 0.0, 0.0),
-        (0.0, 1.0, 0.0),
-        (-1.0, 0.0, 0.0),
-    ]
-    vertices: list[tuple[float, float, float]] = []
-
-    for index, (sign_x, sign_y, sign_z) in enumerate(corners):
-        token_offset = index * 3
-        axis_tokens = tokens[token_offset : token_offset + 3]
-        while len(axis_tokens) < 3:
-            axis_tokens.append(0.5)
-        offsets = [((axis_token - 0.5) * 0.18) for axis_token in axis_tokens]
-        vertices.append(
-            (
-                round(sign_x * half_extents[0] * (1.0 + offsets[0]), 6),
-                round(sign_y * half_extents[1] * (1.0 + offsets[1]), 6),
-                round(sign_z * half_extents[2] * (1.0 + offsets[2]), 6),
-            )
-        )
-
-    faces = _base_mesh_faces() + [
-        (0, 8, 1),
-        (1, 9, 2),
-        (2, 10, 3),
-        (3, 11, 0),
-        (4, 8, 5),
-        (5, 9, 6),
-        (6, 10, 7),
-        (7, 11, 4),
-    ]
-    return vertices, faces
-
-
 def _apply_extent_scale(vertices: list[tuple[float, float, float]], mesh_payload: dict[str, object]) -> list[tuple[float, float, float]]:
     scale_x, scale_y, scale_z = _extent_scale(mesh_payload)
     if (scale_x, scale_y, scale_z) == (1.0, 1.0, 1.0):
@@ -288,7 +224,7 @@ def _mesh_geometry(mesh_payload: dict[str, object]) -> dict[str, object]:
         if parsed_vertices is not None and parsed_faces is not None:
             vertices, faces = parsed_vertices, parsed_faces
         else:
-            vertices, faces = _derived_mesh_geometry(mesh_payload)
+            raise MeshGateError('GEOMETRIC_GATE_REJECTED: mesh payload must provide renderable vertices/faces or a valid binary GLB.')
 
     vertices = _apply_extent_scale(vertices, mesh_payload)
     return {
@@ -359,7 +295,28 @@ def _topology_delta_ratio(coarse_count: int, refined_count: int) -> float:
     return abs(refined_count - coarse_count) / baseline
 
 
-def evaluate_geometric_gate(*, coarse_mesh_payload: object, refined_mesh_payload: object, preserve_scale: bool) -> dict[str, object]:
+def _gate_signature(*values: object) -> int:
+    flattened: list[float] = []
+    for value in values:
+        if isinstance(value, bool):
+            flattened.append(1.0 if value else 0.0)
+        elif _is_number(value):
+            flattened.append(float(value))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if _is_number(item):
+                    flattened.append(float(item))
+    return stable_signature(flattened)
+
+
+def evaluate_geometric_gate(
+    *,
+    coarse_mesh_payload: object,
+    refined_mesh_payload: object,
+    preserve_scale: bool,
+    reference_image_signature: object = None,
+    checkpoint_signature: object = None,
+) -> dict[str, object]:
     if not isinstance(coarse_mesh_payload, dict) or not isinstance(refined_mesh_payload, dict):
         raise MeshGateError('GEOMETRIC_GATE_REJECTED: coarse and refined mesh payloads must be structured dictionaries.')
 
@@ -369,13 +326,24 @@ def evaluate_geometric_gate(*, coarse_mesh_payload: object, refined_mesh_payload
     refined_points = _center_points(refined_geometry['points'])
     coarse_extents = coarse_geometry['extents']
     refined_extents = refined_geometry['extents']
-    extent_ratio = _extent_ratio(coarse_extents, refined_extents)
+    raw_extent_ratio = _extent_ratio(coarse_extents, refined_extents)
+    extent_ratio = list(raw_extent_ratio)
     diagonal = _bbox_diagonal(coarse_extents)
+    passthrough_like = (
+        coarse_geometry['signature'] == refined_geometry['signature']
+        and coarse_geometry['vertex_count'] == refined_geometry['vertex_count']
+        and coarse_geometry['face_count'] == refined_geometry['face_count']
+    )
+    scale_fit_applied = False
 
     if not preserve_scale:
         scale_factor = _mean_extent(coarse_extents) / max(_mean_extent(refined_extents), 1e-6)
         refined_points = _scale_points(refined_points, scale_factor)
         extent_ratio = [1.0, 1.0, 1.0]
+        scale_fit_applied = any(abs(axis - 1.0) > 1e-6 for axis in raw_extent_ratio)
+
+    if passthrough_like:
+        raise MeshGateError('GEOMETRIC_GATE_REJECTED: passthrough-like geometry matched the coarse mesh signature.')
 
     chamfer = _chamfer_distance(coarse_points, refined_points, diagonal)
     rms = _rms_displacement(coarse_points, refined_points, diagonal)
@@ -405,6 +373,19 @@ def evaluate_geometric_gate(*, coarse_mesh_payload: object, refined_mesh_payload
         'face_delta_ratio': round(face_delta, 6),
         'coarse_signature': coarse_geometry['signature'],
         'refined_signature': refined_geometry['signature'],
+        'reference_image_signature': int(reference_image_signature) if _is_number(reference_image_signature) else 0,
+        'checkpoint_signature': int(checkpoint_signature) if _is_number(checkpoint_signature) else 0,
+        'preserve_scale': preserve_scale,
+        'scale_fit_applied': scale_fit_applied,
+        'attribution_signature': _gate_signature(
+            coarse_geometry['signature'],
+            refined_geometry['signature'],
+            reference_image_signature,
+            checkpoint_signature,
+            extent_ratio,
+            preserve_scale,
+            scale_fit_applied,
+        ),
         'coarse_vertex_count': coarse_geometry['vertex_count'],
         'refined_vertex_count': refined_geometry['vertex_count'],
         'coarse_face_count': coarse_geometry['face_count'],
@@ -428,17 +409,21 @@ def build_renderable_mesh_payload(mesh_payload: object) -> dict[str, object]:
 
     normalized_payload = dict(mesh_payload)
     payload_bytes = normalized_payload.get('bytes')
-    if not isinstance(payload_bytes, bytes):
-        raise MeshExportError('mesh_payload.bytes must be binary data.')
-
     vertices = _normalize_vertices(normalized_payload.get('vertices'))
     faces = _normalize_faces(normalized_payload.get('faces'))
+
     if vertices is None or faces is None:
+        if not isinstance(payload_bytes, bytes):
+            raise MeshExportError('mesh_payload must include renderable vertices and faces or binary GLB bytes.')
+
         parsed_vertices, parsed_faces = _extract_glb_geometry(payload_bytes)
-        if parsed_vertices is not None and parsed_faces is not None:
-            vertices, faces = parsed_vertices, parsed_faces
-        else:
-            vertices, faces = _derived_mesh_geometry(normalized_payload)
+        if parsed_vertices is None or parsed_faces is None:
+            raise MeshExportError('mesh_payload must include renderable vertices and faces or a valid binary GLB payload.')
+
+        vertices, faces = parsed_vertices, parsed_faces
+
+    if payload_bytes is not None and not isinstance(payload_bytes, bytes):
+        raise MeshExportError('mesh_payload.bytes must be binary data.')
 
     normalized_payload['vertices'] = _apply_extent_scale(vertices, normalized_payload)
     normalized_payload['faces'] = faces
