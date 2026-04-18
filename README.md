@@ -136,6 +136,7 @@ Missing required weights are a FATAL install failure. `setup.py` must copy or do
 `processor.py` reads exactly one JSON object line from stdin.
 
 Fallback fixture bundle fields remain documented as: `reference_image`, `coarse_mesh`, `output_dir`, `checkpoint`, and `params`.
+The bundled `fixtures/requests/refiner-bundle/request.json` is a documentation-only compatibility fixture for this temporary seam, NOT authoritative runtime truth.
 
 Input resolution order:
 
@@ -165,7 +166,7 @@ Hunyuan is the recommended and currently validated upstream source, but it is NO
 
 `fixtures/requests/refiner-bundle/`
 
-- `request.json` — compatibility-seam documentation fixture for the local-only smoke path
+- `request.json` — documentation-only compatibility fixture for the temporary local-only smoke seam
 - `assets/reference-image.png` — install-smoke reference image fixture
 - `assets/coarse-mesh.glb` — binary GLB coarse-mesh fixture used by install smoke
 - `expected/output/refined-mesh.glb` — packaged binary GLB baseline kept in the copied payload for smoke comparisons

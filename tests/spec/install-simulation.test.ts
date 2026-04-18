@@ -22,8 +22,6 @@ const installSurfacePaths = [
   'runtime/vendor/ultrashape_runtime/schedulers.py',
   'runtime/vendor/ultrashape_runtime/utils/__init__.py',
   'runtime/vendor/ultrashape_runtime/utils/checkpoint.py',
-  'runtime/vendor/ultrashape_runtime/utils/mesh.py',
-  'runtime/vendor/ultrashape_runtime/utils/tensors.py',
   'runtime/vendor/ultrashape_runtime/utils/voxelize.py',
   'runtime/vendor/ultrashape_runtime/models/conditioner_mask.py',
   'runtime/vendor/ultrashape_runtime/models/denoisers/__init__.py',
@@ -44,6 +42,10 @@ const installSurfacePaths = [
 type Readiness = {
   status: 'ready' | 'degraded' | 'blocked';
   backend: string;
+  install_ready: boolean;
+  runtime_ready: boolean;
+  runtime_closure_ready: boolean;
+  runtime_closure_reason: string | null;
   weights_ready: boolean;
   required_imports_ok: boolean;
   missing_required: string[];
@@ -78,6 +80,10 @@ type SetupSummary = {
   torch_profile: string;
   runtime_layout_version: string;
   install_success: boolean;
+  install_ready: boolean;
+  runtime_ready: boolean;
+  runtime_closure_ready: boolean;
+  runtime_closure_reason: string | null;
   install_surface: {
     layout: string;
     entry: string;
@@ -147,7 +153,7 @@ function expectedProcessorOutcome(readiness: Readiness): 'done' | 'WEIGHTS_MISSI
     return 'DEPENDENCY_MISSING';
   }
 
-  if (readiness.status === 'blocked' || readiness.backend !== 'local') {
+  if (!readiness.runtime_ready || readiness.status === 'blocked' || readiness.backend !== 'local') {
     return 'LOCAL_RUNTIME_UNAVAILABLE';
   }
 
@@ -212,7 +218,7 @@ describe('UltraShape Python install surface', () => {
     }
   });
 
-  it('keeps copied extracted-root setup ready when HF fills the weight and the required runtime closure is present', () => {
+  it('marks copied extracted-root installs as install-ready and runtime-ready once the upstream closure is ported', () => {
     const simulation = copyInstallSurface();
     const hfTracePath = resolve(simulation.installDir, '.hf-download-trace.json');
 
@@ -249,8 +255,12 @@ describe('UltraShape Python install surface', () => {
       const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as SetupSummary;
       expect(summary.torch_profile).toBe('linux-arm64-cu128-sm90+');
       expect(summary.runtime_layout_version).toBe('1');
-      expect(summary.install_success).toBe(true);
-      expect(summary.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-default']);
+       expect(summary.install_success).toBe(true);
+       expect(summary.install_ready).toBe(true);
+       expect(summary.runtime_ready).toBe(true);
+       expect(summary.runtime_closure_ready).toBe(true);
+       expect(summary.runtime_closure_reason).toContain('ported upstream MVP closure');
+       expect(summary.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-default']);
       expect(summary.resolved_weight_source_kind).toBe('hf-default');
       expect(summary.weight_source_repo_id).toBe('infinith/UltraShape');
       expect(summary.weight_source_filename).toBe('ultrashape_v1.pt');
@@ -298,15 +308,19 @@ describe('UltraShape Python install surface', () => {
         attempted_weight_source_kinds: string[];
         resolved_weight_source_kind: string;
       };
-      expect(readiness.install_success).toBe(true);
-      expect(readiness.failure_stage).toBeNull();
-      expect(readiness.failure_code).toBeNull();
-      expect(readiness.status).toBe('ready');
-      expect(readiness.backend).toBe('local');
-      expect(readiness.weights_ready).toBe(true);
-      expect(readiness.required_imports_ok).toBe(true);
-      expect(readiness.missing_required).toEqual([]);
-      expect(readiness.missing_optional).toEqual([]);
+       expect(readiness.install_success).toBe(true);
+       expect(readiness.install_ready).toBe(true);
+       expect(readiness.runtime_ready).toBe(true);
+       expect(readiness.runtime_closure_ready).toBe(true);
+       expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
+       expect(readiness.failure_stage).toBeNull();
+       expect(readiness.failure_code).toBeNull();
+       expect(readiness.status).toBe('ready');
+       expect(readiness.backend).toBe('local');
+       expect(readiness.weights_ready).toBe(true);
+       expect(readiness.required_imports_ok).toBe(true);
+       expect(readiness.missing_required).toEqual([]);
+       expect(readiness.missing_optional).toEqual([]);
       expect(readiness.missing_conditional).toEqual([]);
       expect(readiness.missing_degradable).toEqual([]);
       expect(readiness.expected_weights).toEqual(['models/ultrashape/ultrashape_v1.pt']);
@@ -355,6 +369,10 @@ describe('UltraShape Python install surface', () => {
 
       const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as {
         install_success: boolean;
+        install_ready: boolean;
+        runtime_ready: boolean;
+        runtime_closure_ready: boolean;
+        runtime_closure_reason: string | null;
         failure_stage: string;
         failure_code: string;
         missing_required: string[];
@@ -368,6 +386,10 @@ describe('UltraShape Python install surface', () => {
       expect(summary.attempted_weight_source_kinds).toEqual(['ext-dir', 'repo-local', 'hf-override']);
       expect(summary.resolved_weight_source_kind).toBe('hf-override');
       expect(summary.install_success).toBe(true);
+      expect(summary.install_ready).toBe(true);
+      expect(summary.runtime_ready).toBe(true);
+      expect(summary.runtime_closure_ready).toBe(true);
+      expect(summary.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(summary.failure_stage).toBeNull();
       expect(summary.failure_code).toBeNull();
       expect(summary.missing_required).toEqual([]);
@@ -389,7 +411,7 @@ describe('UltraShape Python install surface', () => {
     }
   });
 
-  it('keeps manifest entry and copied-payload setup metadata aligned on repo-root local-only glb-only install truth', () => {
+  it('keeps manifest entry and copied-payload setup metadata aligned on runtime-ready truth once the closure is ported', () => {
     const simulation = copyInstallSurface();
 
     try {
@@ -439,6 +461,10 @@ describe('UltraShape Python install surface', () => {
       });
 
       const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness;
+      expect(readiness.install_ready).toBe(true);
+      expect(readiness.runtime_ready).toBe(true);
+      expect(readiness.runtime_closure_ready).toBe(true);
+      expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(readiness.status).toBe('ready');
       expect(readiness.backend).toBe('local');
       expect(readiness.weights_ready).toBe(true);
@@ -454,7 +480,7 @@ describe('UltraShape Python install surface', () => {
     }
   });
 
-  it('keeps copied-payload setup degraded-but-usable when flash_attn is the only degradable stage failure', () => {
+  it('keeps copied-payload runtime truth degraded-but-ready when flash_attn also degrades', () => {
     const simulation = copyInstallSurface();
     const sourceWeight = stageRequiredWeight(resolve(simulation.installDir, '..', 'weight-cache'));
 
@@ -479,6 +505,10 @@ describe('UltraShape Python install surface', () => {
 
       const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as SetupSummary;
       expect(summary.install_success).toBe(true);
+      expect(summary.install_ready).toBe(true);
+      expect(summary.runtime_ready).toBe(true);
+      expect(summary.runtime_closure_ready).toBe(true);
+      expect(summary.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(summary.native_install_contract).toEqual({
         order: ['core', 'cubvh', 'flash_attn'],
         cubvh_required: true,
@@ -516,6 +546,10 @@ describe('UltraShape Python install surface', () => {
         failure_code: string | null;
       };
       expect(readiness.install_success).toBe(true);
+      expect(readiness.install_ready).toBe(true);
+      expect(readiness.runtime_ready).toBe(true);
+      expect(readiness.runtime_closure_ready).toBe(true);
+      expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(readiness.failure_stage).toBeNull();
       expect(readiness.failure_code).toBeNull();
       expect(readiness.status).toBe('degraded');

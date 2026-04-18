@@ -22,8 +22,6 @@ const extractedRootPaths = [
   'runtime/vendor/ultrashape_runtime/schedulers.py',
   'runtime/vendor/ultrashape_runtime/utils/__init__.py',
   'runtime/vendor/ultrashape_runtime/utils/checkpoint.py',
-  'runtime/vendor/ultrashape_runtime/utils/mesh.py',
-  'runtime/vendor/ultrashape_runtime/utils/tensors.py',
   'runtime/vendor/ultrashape_runtime/utils/voxelize.py',
   'runtime/vendor/ultrashape_runtime/models/conditioner_mask.py',
   'runtime/vendor/ultrashape_runtime/models/denoisers/__init__.py',
@@ -44,6 +42,10 @@ const extractedRootPaths = [
 type Readiness = {
   status: 'ready' | 'degraded' | 'blocked';
   backend: string;
+  install_ready: boolean;
+  runtime_ready: boolean;
+  runtime_closure_ready: boolean;
+  runtime_closure_reason: string | null;
   weights_ready: boolean;
   required_imports_ok: boolean;
   missing_required: string[];
@@ -106,7 +108,7 @@ function expectedProcessorOutcome(readiness: Readiness): 'done' | 'WEIGHTS_MISSI
     return 'DEPENDENCY_MISSING';
   }
 
-  if (readiness.status === 'blocked' || readiness.backend !== 'local') {
+  if (!readiness.runtime_ready || readiness.status === 'blocked' || readiness.backend !== 'local') {
     return 'LOCAL_RUNTIME_UNAVAILABLE';
   }
 
@@ -143,7 +145,7 @@ function buildSetupEnv(extra: NodeJS.ProcessEnv = {}) {
 }
 
 describe('UltraShape GitHub install smoke', () => {
-  it('keeps GitHub/root install smoke ready when HF fills the weight and the runtime closure is complete', () => {
+  it('keeps GitHub/root install smoke runtime-ready once the upstream closure is real', () => {
     const simulation = copyExtractedRoot();
     const hfTracePath = resolve(simulation.installDir, '.hf-download-trace.json');
 
@@ -201,6 +203,10 @@ describe('UltraShape GitHub install smoke', () => {
         weight_source_filename: string;
       };
       expect(readiness.install_success).toBe(true);
+      expect(readiness.install_ready).toBe(true);
+      expect(readiness.runtime_ready).toBe(true);
+      expect(readiness.runtime_closure_ready).toBe(true);
+      expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(readiness.failure_stage).toBeNull();
       expect(readiness.failure_code).toBeNull();
       expect(readiness.status).toBe('ready');
@@ -230,7 +236,7 @@ describe('UltraShape GitHub install smoke', () => {
     }
   });
 
-  it('requires the staged required weight and keeps GitHub/root install smoke aligned on repo-root local-only glb-only truth', () => {
+  it('requires the staged required weight and keeps GitHub/root install smoke aligned on install-ready truth only', () => {
     const simulation = copyExtractedRoot();
 
     try {
@@ -292,6 +298,10 @@ describe('UltraShape GitHub install smoke', () => {
       });
 
       const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness;
+      expect(readiness.install_ready).toBe(true);
+      expect(readiness.runtime_ready).toBe(true);
+      expect(readiness.runtime_closure_ready).toBe(true);
+      expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(readiness.status).toBe('ready');
       expect(readiness.backend).toBe('local');
       expect(readiness.weights_ready).toBe(true);

@@ -58,6 +58,7 @@ DEFAULT_WEIGHT_REPO_ID = 'infinith/UltraShape'
 RUNTIME_LAYOUT_VERSION = '1'
 WEIGHT_FAILURE_CODE = 'WEIGHT_ACQUISITION_FAILED'
 IMPORT_FAILURE_CODE = 'REQUIRED_IMPORT_SMOKE_FAILED'
+RUNTIME_CLOSURE_FAILURE_CODE = 'UPSTREAM_RUNTIME_CLOSURE_MISSING'
 CUBVH_PREREQUISITES_FAILURE_CODE = 'CUBVH_PREREQUISITES_MISSING'
 CUBVH_PREREQUISITES_FAILURE_MESSAGE = 'cubvh source build requires Linux ARM64 with git, compiler toolchain, CUDA build tooling, and Eigen headers available.'
 CUBVH_IMPORT_FAILURE_CODE = 'CUBVH_IMPORT_SMOKE_FAILED'
@@ -163,8 +164,6 @@ REQUIRED_RUNTIME_FILES = [
     'ultrashape_runtime/schedulers.py',
     'ultrashape_runtime/utils/__init__.py',
     'ultrashape_runtime/utils/checkpoint.py',
-    'ultrashape_runtime/utils/mesh.py',
-    'ultrashape_runtime/utils/tensors.py',
     'ultrashape_runtime/utils/voxelize.py',
     'ultrashape_runtime/models/conditioner_mask.py',
     'ultrashape_runtime/models/denoisers/__init__.py',
@@ -344,6 +343,7 @@ def build_cubvh_prerequisite_blockers(prerequisite_probe: dict[str, object]) -> 
         'missing_weights': [],
         'missing_runtime_files': [],
         'missing_required': ['native-stage:cubvh'],
+        'missing_runtime_closure': [],
         'missing_optional': [],
         'missing_conditional': [],
         'missing_degradable': [],
@@ -351,6 +351,9 @@ def build_cubvh_prerequisite_blockers(prerequisite_probe: dict[str, object]) -> 
         'failure_code': CUBVH_PREREQUISITES_FAILURE_CODE,
         'failure_detail': prerequisite_probe['failure_message'],
         'install_success': False,
+        'runtime_ready': False,
+        'runtime_closure_ready': False,
+        'runtime_closure_reason': None,
         'status': 'blocked',
         'required_import_failures': [],
     }
@@ -637,6 +640,7 @@ def build_cubvh_import_failure(overrides: dict[str, object]) -> tuple[dict[str, 
             'missing_weights': [],
             'missing_runtime_files': [],
             'missing_required': ['import:cubvh'],
+            'missing_runtime_closure': [],
             'missing_optional': [],
             'missing_conditional': [],
             'missing_degradable': [],
@@ -644,6 +648,9 @@ def build_cubvh_import_failure(overrides: dict[str, object]) -> tuple[dict[str, 
             'failure_code': CUBVH_IMPORT_FAILURE_CODE,
             'failure_detail': CUBVH_IMPORT_FAILURE_MESSAGE,
             'install_success': False,
+            'runtime_ready': False,
+            'runtime_closure_ready': False,
+            'runtime_closure_reason': None,
             'status': 'blocked',
             'required_import_failures': ['cubvh'],
         },
@@ -1052,6 +1059,43 @@ def run_import_smoke(venv_dir: Path, ext_dir: str, modules: list[str]) -> list[s
     return json.loads(outcome.stdout or '[]')
 
 
+def probe_runtime_closure(venv_dir: Path, ext_dir: str) -> dict[str, object]:
+    venv_python = get_venv_python(venv_dir)
+    script_lines = [
+        'import importlib',
+        'import json',
+        'import sys',
+        f'sys.path.insert(0, {str(Path(ext_dir) / "runtime")!r})',
+        'runtime = importlib.import_module("ultrashape_runtime")',
+        'print(json.dumps({',
+        '    "upstream_closure_ready": bool(getattr(runtime, "UPSTREAM_CLOSURE_READY", False)),',
+        '    "upstream_closure_reason": getattr(runtime, "UPSTREAM_CLOSURE_REASON", None),',
+        '}))',
+    ]
+    outcome = subprocess.run(
+        [str(venv_python), '-c', '\n'.join(script_lines)],
+        check=False,
+        capture_output=True,
+        encoding='utf8',
+    )
+    if outcome.returncode != 0:
+        return {
+            'ready': False,
+            'reason': 'Unable to probe the staged ultrashape_runtime package for upstream-closure truth.',
+        }
+
+    try:
+        payload = json.loads(outcome.stdout or '{}')
+    except json.JSONDecodeError:
+        payload = {}
+
+    reason = payload.get('upstream_closure_reason') if isinstance(payload.get('upstream_closure_reason'), str) else None
+    return {
+        'ready': bool(payload.get('upstream_closure_ready')),
+        'reason': reason,
+    }
+
+
 def list_missing_runtime_files(ext_dir: str) -> list[str]:
     runtime_root = Path(ext_dir) / 'runtime'
     return [path for path in REQUIRED_RUNTIME_FILES if not (runtime_root / path).is_file()]
@@ -1094,6 +1138,7 @@ def collect_install_health(
     required_import_failures: list[str],
     conditional_import_failures: list[str],
     degradable_import_failures: list[str],
+    runtime_closure_probe: dict[str, object],
     health_override: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if health_override is not None:
@@ -1102,10 +1147,15 @@ def collect_install_health(
     install_root = Path(ext_dir)
     missing_weights = [weight for weight in EXPECTED_WEIGHTS if not (install_root / weight).is_file()]
     missing_runtime_files = list_missing_runtime_files(ext_dir)
+    runtime_closure_ready = bool(runtime_closure_probe.get('ready'))
+    runtime_closure_reason = runtime_closure_probe.get('reason') if isinstance(runtime_closure_probe.get('reason'), str) else None
+    install_success = not missing_weights and not missing_runtime_files and not required_import_failures
+    missing_runtime_closure = [] if runtime_closure_ready or not install_success else ['runtime:upstream-closure']
     missing_required = [
         *missing_weights,
         *[f'runtime/{path}' for path in missing_runtime_files],
         *[f'import:{module}' for module in required_import_failures],
+        *missing_runtime_closure,
     ]
     failure_stage = None
     failure_code = None
@@ -1123,19 +1173,24 @@ def collect_install_health(
         failure_stage = 'required-import-smoke'
         failure_code = IMPORT_FAILURE_CODE
         failure_detail = 'Required dependency import smoke failed after dependency installation.'
+    elif missing_runtime_closure:
+        failure_stage = 'runtime-closure-validation'
+        failure_code = RUNTIME_CLOSURE_FAILURE_CODE
+        failure_detail = runtime_closure_reason or 'The staged UltraShape shell does not yet include the real upstream closure.'
 
     missing_optional = [*conditional_import_failures, *degradable_import_failures]
-    install_success = not missing_required
+    runtime_ready = install_success and runtime_closure_ready
     status = 'blocked'
-    if install_success and missing_optional:
+    if runtime_ready and missing_optional:
         status = 'degraded'
-    elif install_success:
+    elif runtime_ready:
         status = 'ready'
 
     return {
         'missing_weights': missing_weights,
         'missing_runtime_files': missing_runtime_files,
         'missing_required': missing_required,
+        'missing_runtime_closure': missing_runtime_closure,
         'missing_optional': missing_optional,
         'missing_conditional': conditional_import_failures,
         'missing_degradable': degradable_import_failures,
@@ -1143,6 +1198,9 @@ def collect_install_health(
         'failure_code': failure_code,
         'failure_detail': failure_detail,
         'install_success': install_success,
+        'runtime_ready': runtime_ready,
+        'runtime_closure_ready': runtime_closure_ready,
+        'runtime_closure_reason': runtime_closure_reason,
         'status': status,
         'required_import_failures': required_import_failures,
     }
@@ -1154,6 +1212,10 @@ def build_readiness(ext_dir: str, health: dict[str, object], weight_result: dict
     return {
         'status': health['status'],
         'backend': 'local',
+        'install_ready': health['install_success'],
+        'runtime_ready': health['runtime_ready'],
+        'runtime_closure_ready': health['runtime_closure_ready'],
+        'runtime_closure_reason': health['runtime_closure_reason'],
         'mvp_scope': 'mc-only',
         'output_format': 'glb',
         'weights_ready': not health['missing_weights'],
@@ -1192,6 +1254,7 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
 
 def write_summary(
     ext_dir: str,
+    venv_dir: Path,
     context: dict[str, str],
     payload: dict[str, object],
     dependency_install: dict[str, object],
@@ -1212,12 +1275,17 @@ def write_summary(
         required_import_failures,
         conditional_import_failures,
         degradable_import_failures,
+        probe_runtime_closure(venv_dir, ext_dir),
         health_override,
     )
     summary.update({
         'dependency_install': dependency_install,
         'native_install': merge_native_install_summary(dependency_install, native_install_override),
         'install_success': health['install_success'],
+        'install_ready': health['install_success'],
+        'runtime_ready': health['runtime_ready'],
+        'runtime_closure_ready': health['runtime_closure_ready'],
+        'runtime_closure_reason': health['runtime_closure_reason'],
         'failure_stage': health['failure_stage'],
         'failure_code': health['failure_code'],
         'failure_detail': health['failure_detail'],
@@ -1247,6 +1315,7 @@ def main() -> int:
         print(CUBVH_PREREQUISITES_FAILURE_MESSAGE, file=sys.stderr)
         write_summary(
             context['ext_dir'],
+            venv_dir,
             context,
             payload,
             dependency_install,
@@ -1264,6 +1333,7 @@ def main() -> int:
         print(CUBVH_IMPORT_FAILURE_MESSAGE, file=sys.stderr)
         write_summary(
             context['ext_dir'],
+            venv_dir,
             context,
             payload,
             dependency_install,
@@ -1282,6 +1352,7 @@ def main() -> int:
     degradable_import_failures = run_import_smoke(venv_dir, context['ext_dir'], DEGRADABLE_IMPORT_MODULES)
     write_summary(
         context['ext_dir'],
+        venv_dir,
         context,
         payload,
         dependency_install,

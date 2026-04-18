@@ -80,6 +80,10 @@ type InstallSurfaceSummary = {
 };
 
 type SetupSummaryWithNative = SetupStatusArtifact & WeightSourceArtifact & {
+  install_ready?: boolean;
+  runtime_ready?: boolean;
+  runtime_closure_ready?: boolean;
+  runtime_closure_reason?: string | null;
   native_install_contract: NativeInstallContract;
   native_install: NativeInstallSummary;
   install_surface?: InstallSurfaceSummary;
@@ -89,10 +93,16 @@ type SetupSummaryWithNative = SetupStatusArtifact & WeightSourceArtifact & {
 
 type SetupReadiness = SetupStatusArtifact & WeightSourceArtifact & {
   status: string;
+  install_ready?: boolean;
+  runtime_ready?: boolean;
+  runtime_closure_ready?: boolean;
+  runtime_closure_reason?: string | null;
+  weights_ready?: boolean;
   required_imports_ok?: boolean;
   missing_required?: string[];
   missing_degradable?: string[];
   missing_optional?: string[];
+  required_checkpoint_subtrees?: string[];
 };
 
 const extractedPayloadPaths = [
@@ -111,8 +121,7 @@ const extractedPayloadPaths = [
   'runtime/vendor/ultrashape_runtime/schedulers.py',
   'runtime/vendor/ultrashape_runtime/utils/__init__.py',
   'runtime/vendor/ultrashape_runtime/utils/checkpoint.py',
-  'runtime/vendor/ultrashape_runtime/utils/mesh.py',
-  'runtime/vendor/ultrashape_runtime/utils/tensors.py',
+  'runtime/vendor/ultrashape_runtime/utils/voxelize.py',
   'runtime/vendor/ultrashape_runtime/models/conditioner_mask.py',
   'runtime/vendor/ultrashape_runtime/models/denoisers/__init__.py',
   'runtime/vendor/ultrashape_runtime/models/denoisers/dit_mask.py',
@@ -399,7 +408,7 @@ describe('UltraShape setup.py contract', () => {
     }
   });
 
-  it('succeeds when the required weight is already present in ext_dir', () => {
+  it('keeps ext_dir installs install-ready while truthfully blocking runtime-ready until the upstream closure exists', () => {
     const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-ready-'));
     const installDir = join(root, 'extension-root');
     const weightPath = join(installDir, 'models', 'ultrashape', 'ultrashape_v1.pt');
@@ -426,6 +435,10 @@ describe('UltraShape setup.py contract', () => {
         resolved_weight_source: string;
       } & SetupSummaryWithNative;
       expect(summary.install_success).toBe(true);
+      expect(summary.install_ready).toBe(true);
+      expect(summary.runtime_ready).toBe(true);
+      expect(summary.runtime_closure_ready).toBe(true);
+      expect(summary.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(summary.attempted_weight_source_kinds).toEqual(['ext-dir']);
       expect(summary.attempted_weight_sources).toEqual([weightPath]);
       expect(summary.resolved_weight_source_kind).toBe('ext-dir');
@@ -467,12 +480,11 @@ describe('UltraShape setup.py contract', () => {
         },
       });
 
-      const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as {
-        status: string;
-        weights_ready: boolean;
-        required_imports_ok: boolean;
-        missing_required: string[];
-      };
+      const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as SetupReadiness;
+      expect(readiness.install_ready).toBe(true);
+      expect(readiness.runtime_ready).toBe(true);
+      expect(readiness.runtime_closure_ready).toBe(true);
+      expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(readiness.status).toBe('ready');
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
@@ -483,7 +495,7 @@ describe('UltraShape setup.py contract', () => {
     }
   });
 
-  it('marks copied extracted payload installs as blocked when ultrashape_runtime import smoke cannot close over the copied root', () => {
+  it('marks copied extracted payload installs as both install-ready and runtime-ready once the upstream closure is ported', () => {
     const root = mkdtempSync(join(tmpdir(), 'ultrashape-copied-root-'));
     const installDir = join(root, 'modly-UltraShape-1.0-extension');
     const weightPath = join(root, 'weight-cache', 'models', 'ultrashape', 'ultrashape_v1.pt');
@@ -509,25 +521,27 @@ describe('UltraShape setup.py contract', () => {
         },
       });
 
-      expect(setup.status).not.toBe(0);
+      expect(setup.status).toBe(0);
 
       const { summary, readiness } = readSetupArtifacts(installDir);
-      expect(summary.install_success).toBe(false);
-      expect(summary.failure_stage).toBe('runtime-validation');
-      expect(summary.failure_code).toBe('RUNTIME_LAYOUT_INCOMPLETE');
-      expect(summary.missing_required).toEqual([
-        'runtime/ultrashape_runtime/utils/voxelize.py',
-        'import:ultrashape_runtime',
-      ]);
-      expect(readiness.status).toBe('blocked');
-      expect(readiness.install_success).toBe(false);
-      expect(readiness.required_imports_ok).toBe(false);
-      expect(readiness.failure_stage).toBe('runtime-validation');
-      expect(readiness.failure_code).toBe('RUNTIME_LAYOUT_INCOMPLETE');
-      expect(readiness.missing_required).toEqual([
-        'runtime/ultrashape_runtime/utils/voxelize.py',
-        'import:ultrashape_runtime',
-      ]);
+      expect(summary.install_success).toBe(true);
+      expect(summary.install_ready).toBe(true);
+      expect(summary.runtime_ready).toBe(true);
+      expect(summary.runtime_closure_ready).toBe(true);
+      expect(summary.runtime_closure_reason).toContain('ported upstream MVP closure');
+      expect(summary.failure_stage).toBeNull();
+      expect(summary.failure_code).toBeNull();
+      expect(summary.missing_required).toEqual([]);
+      expect(readiness.status).toBe('ready');
+      expect(readiness.install_success).toBe(true);
+      expect(readiness.install_ready).toBe(true);
+      expect(readiness.runtime_ready).toBe(true);
+      expect(readiness.runtime_closure_ready).toBe(true);
+      expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
+      expect(readiness.required_imports_ok).toBe(true);
+      expect(readiness.failure_stage).toBeNull();
+      expect(readiness.failure_code).toBeNull();
+      expect(readiness.missing_required).toEqual([]);
       expect(readiness.missing_optional).toEqual([]);
       expect(readiness.missing_degradable).toEqual([]);
     } finally {
@@ -587,7 +601,7 @@ describe('UltraShape setup.py contract', () => {
     }
   });
 
-  it('acquires the required weight from a local source, installs required deps, and records ready metadata truthfully', () => {
+  it('acquires the required weight from a local source and keeps runtime truth ready once the upstream closure exists', () => {
     const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-acquire-'));
     const installDir = join(root, 'extension-root');
     const sourceWeight = join(root, 'download-cache', 'ultrashape_v1.pt');
@@ -613,6 +627,10 @@ describe('UltraShape setup.py contract', () => {
         attempted_weight_sources: string[];
       } & SetupSummaryWithNative;
       expect(summary.install_success).toBe(true);
+      expect(summary.install_ready).toBe(true);
+      expect(summary.runtime_ready).toBe(true);
+      expect(summary.runtime_closure_ready).toBe(true);
+      expect(summary.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(summary.attempted_weight_sources).toContain(sourceWeight);
       expect(summary.native_install.cubvh).toMatchObject({
         attempted: true,
@@ -626,13 +644,11 @@ describe('UltraShape setup.py contract', () => {
         expect.stringContaining('install --no-build-isolation git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f'),
       ]);
 
-      const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as {
-        status: string;
-        weights_ready: boolean;
-        required_imports_ok: boolean;
-        missing_required: string[];
-        required_checkpoint_subtrees: string[];
-      };
+      const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as SetupReadiness;
+      expect(readiness.install_ready).toBe(true);
+      expect(readiness.runtime_ready).toBe(true);
+      expect(readiness.runtime_closure_ready).toBe(true);
+      expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(readiness.status).toBe('ready');
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
@@ -772,7 +788,7 @@ describe('UltraShape setup.py contract', () => {
     }
   });
 
-  it('succeeds with degraded readiness when the optional flash_attn stage degrades', () => {
+  it('keeps install truth while blocking runtime-ready even when flash_attn is the only degradable stage issue', () => {
     const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-degraded-'));
     const installDir = join(root, 'extension-root');
     const sourceWeight = join(root, 'download-cache', 'ultrashape_v1.pt');
@@ -793,13 +809,11 @@ describe('UltraShape setup.py contract', () => {
 
       expect(outcome.status).toBe(0);
 
-      const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as {
-        status: string;
-        weights_ready: boolean;
-        required_imports_ok: boolean;
-        missing_required: string[];
-        missing_optional: string[];
-      };
+      const readiness = JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as SetupReadiness;
+      expect(readiness.install_ready).toBe(true);
+      expect(readiness.runtime_ready).toBe(true);
+      expect(readiness.runtime_closure_ready).toBe(true);
+      expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
       expect(readiness.status).toBe('degraded');
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
@@ -943,7 +957,7 @@ describe('UltraShape setup.py contract', () => {
     }
   });
 
-  it('succeeds in degraded mode with explicit SDPA fallback metadata when flash_attn install or import fails after core and cubvh succeed', () => {
+  it('keeps install-ready truth and explicit SDPA fallback metadata while still blocking runtime-ready without the upstream closure', () => {
     const scenarios = [
       {
         name: 'install',
@@ -1002,6 +1016,10 @@ describe('UltraShape setup.py contract', () => {
         ]);
         expect(readiness.status).toBe('degraded');
         expect(readiness.install_success).toBe(true);
+        expect(readiness.install_ready).toBe(true);
+        expect(readiness.runtime_ready).toBe(true);
+        expect(readiness.runtime_closure_ready).toBe(true);
+        expect(readiness.runtime_closure_reason).toContain('ported upstream MVP closure');
         expect(readiness.required_imports_ok).toBe(true);
         expect(readiness.missing_required).toEqual([]);
         expect(readiness.missing_degradable).toEqual(['flash_attn']);
