@@ -7,6 +7,11 @@ try:
 except ImportError:  # pragma: no cover - expected on degraded installs
     cubvh = None
 
+try:
+    import torch  # type: ignore # pragma: no cover
+except ImportError:  # pragma: no cover - expected on degraded installs
+    torch = None
+
 from ...utils.mesh import build_renderable_mesh_payload
 from ...utils.tensors import stable_signature
 
@@ -139,7 +144,18 @@ class MCSurfaceExtractor:
         if not callable(sparse_marching_cubes):
             raise SurfaceExtractionDependencyError('Required runtime import is unavailable: cubvh.sparse_marching_cubes.')
 
-        raw_vertices, raw_faces = sparse_marching_cubes(normalized_coords, normalized_corners, float(iso), ensure_consistency=False)
+        if torch is None:
+            raise SurfaceExtractionDependencyError('Required runtime import is unavailable: torch.')
+
+        coords_tensor = torch.tensor(normalized_coords, dtype=torch.int32)
+        corners_tensor = torch.tensor(normalized_corners, dtype=torch.float32)
+
+        raw_vertices, raw_faces = sparse_marching_cubes(
+            coords_tensor,
+            corners_tensor,
+            float(iso),
+            ensure_consistency=False,
+        )
         vertices = [tuple(float(axis) for axis in vertex[:3]) for vertex in raw_vertices if isinstance(vertex, (list, tuple)) and len(vertex) >= 3]
         faces = [tuple(int(index) for index in face[:3]) for face in raw_faces if isinstance(face, (list, tuple)) and len(face) >= 3]
 
