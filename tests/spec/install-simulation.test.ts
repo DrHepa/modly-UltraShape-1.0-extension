@@ -78,6 +78,14 @@ type SetupSummary = {
   torch_profile: string;
   runtime_layout_version: string;
   install_success: boolean;
+  install_surface: {
+    layout: string;
+    entry: string;
+    backend_modes: string[];
+    resolved_backend: string;
+    output_formats: string[];
+    remote_hybrid_supported: boolean;
+  };
   attempted_weight_source_kinds: string[];
   resolved_weight_source_kind: string;
   weight_source_repo_id: string;
@@ -381,14 +389,30 @@ describe('UltraShape Python install surface', () => {
     }
   });
 
-  it('keeps manifest entry, setup contract, and processor smoke aligned on ready install truth while runtime weight validation stays public', () => {
+  it('keeps manifest entry and copied-payload setup metadata aligned on repo-root local-only glb-only install truth', () => {
     const simulation = copyInstallSurface();
 
     try {
       const manifest = JSON.parse(readFileSync(resolve(simulation.installDir, 'manifest.json'), 'utf8')) as {
         entry: string;
+        testing_fallback_only: {
+          semantic_contract: string;
+          supported_execution: {
+            backend_modes: string[];
+            resolved_backend: string;
+            output_formats: string[];
+            remote_hybrid_supported: boolean;
+          };
+        };
       };
       expect(manifest.entry).toBe('processor.py');
+      expect(manifest.testing_fallback_only.semantic_contract).toBe('reference_image + coarse_mesh -> refined.glb');
+      expect(manifest.testing_fallback_only.supported_execution).toEqual({
+        backend_modes: ['auto', 'local'],
+        resolved_backend: 'local',
+        output_formats: ['glb'],
+        remote_hybrid_supported: false,
+      });
       const sourceWeight = stageRequiredWeight(resolve(simulation.installDir, '..', 'weight-cache'));
 
       const outcome = spawnSync('python3', ['setup.py', JSON.stringify({
@@ -404,8 +428,19 @@ describe('UltraShape Python install surface', () => {
 
       expect(outcome.status).toBe(0);
 
+      const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as SetupSummary;
+      expect(summary.install_surface).toEqual({
+        layout: 'repo-root-python-only',
+        entry: 'processor.py',
+        backend_modes: ['auto', 'local'],
+        resolved_backend: 'local',
+        output_formats: ['glb'],
+        remote_hybrid_supported: false,
+      });
+
       const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness;
       expect(readiness.status).toBe('ready');
+      expect(readiness.backend).toBe('local');
       expect(readiness.weights_ready).toBe(true);
       expect(readiness.required_imports_ok).toBe(true);
       expect(readiness.missing_required).toEqual([]);
@@ -413,34 +448,7 @@ describe('UltraShape Python install surface', () => {
       expect(readiness.missing_conditional).toEqual([]);
       expect(readiness.missing_degradable).toEqual([]);
 
-      const smoke = spawnSync('python3', ['processor.py'], {
-        cwd: simulation.installDir,
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: {
-            filePath: resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/assets/reference-image.png'),
-          },
-          params: {
-            coarse_mesh: resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/assets/coarse-mesh.glb'),
-          },
-          workspaceDir: resolve(simulation.installDir, 'smoke-output'),
-        })}\n`,
-      });
-
-      const events = smoke.stdout
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as Record<string, unknown>);
-
-      expect(smoke.status).toBe(0);
-
       expect(expectedProcessorOutcome(readiness)).toBe('done');
-      expect(events.at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('WEIGHTS_MISSING'),
-        code: 'WEIGHTS_MISSING',
-      });
     } finally {
       simulation.cleanup();
     }

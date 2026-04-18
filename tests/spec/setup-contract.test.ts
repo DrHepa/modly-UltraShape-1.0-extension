@@ -70,9 +70,19 @@ type DependencySummary = {
   degradable: string[];
 };
 
+type InstallSurfaceSummary = {
+  layout: string;
+  entry: string;
+  backend_modes: string[];
+  resolved_backend: string;
+  output_formats: string[];
+  remote_hybrid_supported: boolean;
+};
+
 type SetupSummaryWithNative = SetupStatusArtifact & WeightSourceArtifact & {
   native_install_contract: NativeInstallContract;
   native_install: NativeInstallSummary;
+  install_surface?: InstallSurfaceSummary;
   dependencies?: DependencySummary;
   missing_required?: string[];
 };
@@ -226,6 +236,14 @@ describe('UltraShape setup.py contract', () => {
           order: ['core', 'cubvh', 'flash_attn'],
           cubvh_required: true,
           flash_attn_optional: true,
+        });
+        expect(summary.install_surface).toEqual({
+          layout: 'repo-root-python-only',
+          entry: 'processor.py',
+          backend_modes: ['auto', 'local'],
+          resolved_backend: 'local',
+          output_formats: ['glb'],
+          remote_hybrid_supported: false,
         });
         expect(summary.native_install).toMatchObject({
           core: {
@@ -416,6 +434,14 @@ describe('UltraShape setup.py contract', () => {
         order: ['core', 'cubvh', 'flash_attn'],
         cubvh_required: true,
         flash_attn_optional: true,
+      });
+      expect(summary.install_surface).toEqual({
+        layout: 'repo-root-python-only',
+        entry: 'processor.py',
+        backend_modes: ['auto', 'local'],
+        resolved_backend: 'local',
+        output_formats: ['glb'],
+        remote_hybrid_supported: false,
       });
       expect(summary.native_install).toMatchObject({
         core: {

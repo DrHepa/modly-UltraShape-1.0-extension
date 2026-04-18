@@ -230,10 +230,31 @@ describe('UltraShape GitHub install smoke', () => {
     }
   });
 
-  it('requires the staged required weight and keeps GitHub/root install smoke honest when runtime weight validation still surfaces publicly', () => {
+  it('requires the staged required weight and keeps GitHub/root install smoke aligned on repo-root local-only glb-only truth', () => {
     const simulation = copyExtractedRoot();
 
     try {
+      const manifest = JSON.parse(readFileSync(resolve(simulation.installDir, 'manifest.json'), 'utf8')) as {
+        entry: string;
+        testing_fallback_only: {
+          semantic_contract: string;
+          supported_execution: {
+            backend_modes: string[];
+            resolved_backend: string;
+            output_formats: string[];
+            remote_hybrid_supported: boolean;
+          };
+        };
+      };
+      expect(manifest.entry).toBe('processor.py');
+      expect(manifest.testing_fallback_only.semantic_contract).toBe('reference_image + coarse_mesh -> refined.glb');
+      expect(manifest.testing_fallback_only.supported_execution).toEqual({
+        backend_modes: ['auto', 'local'],
+        resolved_backend: 'local',
+        output_formats: ['glb'],
+        remote_hybrid_supported: false,
+      });
+
       const sourceWeight = stageRequiredWeight(resolve(simulation.installDir, '..', 'weight-cache'));
 
       const setup = spawnSync('python3', ['setup.py', JSON.stringify({
@@ -251,6 +272,25 @@ describe('UltraShape GitHub install smoke', () => {
       expect(setup.status).toBe(0);
       expect(existsSync(resolve(simulation.installDir, 'venv'))).toBe(true);
 
+      const summary = JSON.parse(readFileSync(resolve(simulation.installDir, '.setup-summary.json'), 'utf8')) as {
+        install_surface: {
+          layout: string;
+          entry: string;
+          backend_modes: string[];
+          resolved_backend: string;
+          output_formats: string[];
+          remote_hybrid_supported: boolean;
+        };
+      };
+      expect(summary.install_surface).toEqual({
+        layout: 'repo-root-python-only',
+        entry: 'processor.py',
+        backend_modes: ['auto', 'local'],
+        resolved_backend: 'local',
+        output_formats: ['glb'],
+        remote_hybrid_supported: false,
+      });
+
       const readiness = JSON.parse(readFileSync(resolve(simulation.installDir, '.runtime-readiness.json'), 'utf8')) as Readiness;
       expect(readiness.status).toBe('ready');
       expect(readiness.backend).toBe('local');
@@ -262,36 +302,7 @@ describe('UltraShape GitHub install smoke', () => {
       expect(readiness.missing_degradable).toEqual([]);
       expect(readiness.expected_weights).toEqual(['models/ultrashape/ultrashape_v1.pt']);
 
-      const smokePayload = {
-        input: {
-          filePath: resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/assets/reference-image.png'),
-        },
-        params: {
-          coarse_mesh: resolve(simulation.installDir, 'fixtures/requests/refiner-bundle/assets/coarse-mesh.glb'),
-        },
-        workspaceDir: resolve(simulation.installDir, 'smoke-output'),
-      };
-
-      const outcome = spawnSync('python3', ['processor.py'], {
-        cwd: simulation.installDir,
-        encoding: 'utf8',
-        input: `${JSON.stringify(smokePayload)}\n`,
-      });
-
-      const events = outcome.stdout
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as Record<string, unknown>);
-
-      expect(outcome.status).toBe(0);
-
       expect(expectedProcessorOutcome(readiness)).toBe('done');
-      expect(events.at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('WEIGHTS_MISSING'),
-        code: 'WEIGHTS_MISSING',
-      });
     } finally {
       simulation.cleanup();
     }

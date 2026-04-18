@@ -25,8 +25,6 @@ CORE_DEPENDENCIES = [
     'huggingface_hub',
     'accelerate',
     'diffusers',
-    'rembg',
-    'onnxruntime',
     'safetensors',
     'tqdm',
 ]
@@ -202,6 +200,17 @@ def build_native_install_contract() -> dict[str, object]:
         'order': ['core', 'cubvh', 'flash_attn'],
         'cubvh_required': True,
         'flash_attn_optional': True,
+    }
+
+
+def build_install_surface_summary() -> dict[str, object]:
+    return {
+        'layout': 'repo-root-python-only',
+        'entry': 'processor.py',
+        'backend_modes': ['auto', 'local'],
+        'resolved_backend': 'local',
+        'output_formats': ['glb'],
+        'remote_hybrid_supported': False,
     }
 
 
@@ -1063,6 +1072,7 @@ def build_summary(context: dict[str, str], profile: dict[str, str]) -> dict[str,
             'conditional': CONDITIONAL_DEPENDENCIES,
             'degradable': DEGRADABLE_DEPENDENCIES,
         },
+        'install_surface': build_install_surface_summary(),
         'native_install_contract': build_native_install_contract(),
         'runtime_assets': {
             'required_files': REQUIRED_RUNTIME_FILES,

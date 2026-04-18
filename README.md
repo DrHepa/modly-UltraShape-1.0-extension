@@ -153,7 +153,7 @@ The temporary `params.coarse_mesh` seam exists only until Modly exposes native m
 - Repository/project: `modly-UltraShape-1.0-extension`
 - Extension id: `modly.ultrashape-refiner-process`
 - Node id: `ultrashape-refiner`
-- Semantic contract: `reference_image + coarse_mesh -> refined_mesh`
+- Semantic contract: `reference_image + coarse_mesh -> refined.glb`
 
 This extension is a refiner, NOT a coarse-mesh generator or single-image generation wrapper.
 
