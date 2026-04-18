@@ -40,6 +40,12 @@ function torchCheckpointStubSource() {
     '    def __getitem__(self, index):',
     '        return self._values[index]',
     '',
+    '    def cpu(self):',
+    '        return self',
+    '',
+    '    def tolist(self):',
+    '        return [list(row) if isinstance(row, (list, tuple)) else row for row in self._values]',
+    '',
     'def tensor(values, dtype=None):',
     '    normalized = [list(row) for row in values]',
     '    return Tensor(normalized, dtype)',
@@ -88,6 +94,7 @@ function cubvhStubSource() {
     '__version__ = "0.0-test"',
     'import json',
     'import os',
+    'import torch',
     'from pathlib import Path',
     '',
     'def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):',
@@ -118,6 +125,8 @@ function cubvhStubSource() {
     '        if index + 1 >= len(vertices):',
     '            break',
     '        faces.append((0, index, index + 1))',
+    '    if os.environ.get("ULTRASHAPE_TEST_CUBVH_RETURNS_TENSORS") == "1":',
+    '        return torch.tensor(vertices, dtype=torch.float32), torch.tensor(faces, dtype=torch.int32)',
     '    return vertices, faces',
     '',
   ].join('\n');
@@ -1919,6 +1928,7 @@ describe('UltraShape runtime flow', () => {
           env: {
             ULTRASHAPE_TEST_DIFFUSERS_TRACE_PATH: diffusersTracePath,
             ULTRASHAPE_TEST_CUBVH_TRACE_PATH: cubvhTracePath,
+            ULTRASHAPE_TEST_CUBVH_RETURNS_TENSORS: '1',
           },
         },
       );

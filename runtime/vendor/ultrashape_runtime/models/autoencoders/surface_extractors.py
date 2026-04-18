@@ -85,6 +85,14 @@ def _fit_vertices_to_target(
     return fitted
 
 
+def _cpu_python_rows(values: object) -> list[object]:
+    if hasattr(values, 'cpu') and callable(values.cpu):
+        values = values.cpu()
+    if hasattr(values, 'tolist') and callable(values.tolist):
+        values = values.tolist()
+    return list(values) if isinstance(values, (list, tuple)) else []
+
+
 class MCSurfaceExtractor:
     extractor = 'cubvh.sparse_marching_cubes'
 
@@ -156,6 +164,8 @@ class MCSurfaceExtractor:
             float(iso),
             ensure_consistency=False,
         )
+        raw_vertices = _cpu_python_rows(raw_vertices)
+        raw_faces = _cpu_python_rows(raw_faces)
         vertices = [tuple(float(axis) for axis in vertex[:3]) for vertex in raw_vertices if isinstance(vertex, (list, tuple)) and len(vertex) >= 3]
         faces = [tuple(int(index) for index in face[:3]) for face in raw_faces if isinstance(face, (list, tuple)) and len(face) >= 3]
 
