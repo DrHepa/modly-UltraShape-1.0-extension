@@ -698,6 +698,8 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
         decoder: expect.stringMatching(/VDMVolumeDecoding|VolumeDecoder/u),
         mesh_signature: expect.any(Number),
         field_density: expect.any(Number),
+        cell_count: expect.any(Number),
+        grid_resolution: expect.any(Number),
       }),
       extract: expect.objectContaining({
         extractor: 'cubvh.sparse_marching_cubes',
@@ -1947,6 +1949,10 @@ describe('UltraShape runtime flow', () => {
           ensure_consistency: false,
         }),
       );
+      const cubvhTrace = JSON.parse(readFileSync(cubvhTracePath, 'utf8')) as { coords: number; corners: number };
+      expect(cubvhTrace.coords).toBeGreaterThanOrEqual(64);
+      expect(cubvhTrace.corners).toBe(cubvhTrace.coords);
+      expect((metrics.decode as Record<string, unknown>).cell_count).toBeGreaterThanOrEqual(64);
     } finally {
       fixture.cleanup();
     }
@@ -1991,6 +1997,8 @@ describe('UltraShape runtime flow', () => {
           payload_bytes: refinedBytes.length,
         }),
       );
+      expect(Number(extractMetrics.vertex_count)).toBeGreaterThanOrEqual(24);
+      expect(Number(extractMetrics.face_count)).toBeGreaterThanOrEqual(16);
     } finally {
       fixture.cleanup();
     }

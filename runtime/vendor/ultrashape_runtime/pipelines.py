@@ -205,7 +205,12 @@ def run_refine_pipeline(
     )
     vae = ShapeVAE()
     vae_hydration = apply_checkpoint_state(vae, checkpoint_state.get('vae'))
-    decoded_latents = vae.decode_latents(denoised, reference_asset)
+    decoded_latents = vae.decode_latents(
+        denoised,
+        reference_asset,
+        conditioning=conditioning,
+        coarse_surface=coarse_surface,
+    )
     decoded_volume = decode_volume(decoded_latents)
     refined_surface = extract_surface(
         extraction=extraction,
@@ -323,6 +328,8 @@ def run_refine_pipeline(
                 'mesh_signature': decoded_volume['mesh_signature'],
                 'field_density': decoded_volume['field_density'],
                 'field_signature': decoded_volume['field_signature'],
+                'cell_count': decoded_volume['cell_count'],
+                'grid_resolution': decoded_volume['grid_resolution'],
                 'state_hydrated': decoded_latents['state_hydrated'],
             },
             'extract': {
