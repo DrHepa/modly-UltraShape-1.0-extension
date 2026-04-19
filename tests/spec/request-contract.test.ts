@@ -90,7 +90,7 @@ describe('UltraShape request contract', () => {
       expect(events.at(-1)).toEqual({
         type: 'error',
         message: expect.stringContaining('coarse_mesh'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        code: 'MISSING_INPUT',
       });
     } finally {
       fixture.cleanup();
@@ -128,14 +128,14 @@ describe('UltraShape request contract', () => {
       expect(parseEvents(missingReference.stdout).at(-1)).toEqual({
         type: 'error',
         message: expect.stringContaining('reference_image'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        code: 'MISSING_INPUT',
       });
 
       expect(missingCoarse.status).toBe(0);
       expect(parseEvents(missingCoarse.stdout).at(-1)).toEqual({
         type: 'error',
         message: expect.stringContaining('coarse_mesh'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        code: 'MISSING_INPUT',
       });
     } finally {
       fixture.cleanup();
@@ -183,14 +183,14 @@ describe('UltraShape request contract', () => {
       expect(parseEvents(invalidSteps.stdout).at(-1)).toEqual({
         type: 'error',
         message: expect.stringContaining('steps must be a positive integer'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        code: 'INVALID_PARAMS',
       });
 
       expect(invalidOutput.status).toBe(0);
       expect(parseEvents(invalidOutput.stdout).at(-1)).toEqual({
         type: 'error',
         message: expect.stringContaining('output_format must be glb'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        code: 'INVALID_PARAMS',
       });
     } finally {
       fixture.cleanup();
@@ -299,14 +299,14 @@ describe('UltraShape request contract', () => {
       expect(parseEvents(remoteOutcome.stdout).at(-1)).toEqual({
         type: 'error',
         message: expect.stringContaining('backend must be auto or local'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        code: 'INVALID_PARAMS',
       });
 
       expect(hybridOutcome.status).toBe(0);
       expect(parseEvents(hybridOutcome.stdout).at(-1)).toEqual({
         type: 'error',
         message: expect.stringContaining('backend must be auto or local'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        code: 'INVALID_PARAMS',
       });
     } finally {
       fixture.cleanup();

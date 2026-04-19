@@ -109,7 +109,31 @@ def load_runtime_config(config_path: str) -> dict[str, object]:
     config, _ = _parse_block(path.read_text(encoding='utf8').splitlines(), 0, 0)
     if not isinstance(config, dict):
         raise PipelineUnavailableError('Runtime config root must be a mapping.')
+    _validate_exact_closure_config(config)
     return config
+
+
+def _validate_exact_closure_config(config: dict[str, object]) -> None:
+    runtime = config.get('runtime') if isinstance(config.get('runtime'), dict) else None
+    if not isinstance(runtime, dict) or runtime.get('requires_exact_closure') is not True:
+        raise PipelineUnavailableError('Runtime config requires_exact_closure: true for the upstream closure path.')
+
+    required_sections = {
+        'checkpoint': 'checkpoint subtree loading',
+        'preprocess': 'reference preprocessing',
+        'conditioning': 'surface + voxel conditioning',
+        'scheduler': 'scheduler wiring',
+        'decoder': 'volume decode wiring',
+        'surface': 'surface extraction wiring',
+        'gate': 'geometric gate wiring',
+        'export': 'refined mesh export wiring',
+    }
+
+    missing = [name for name in required_sections if not isinstance(config.get(name), dict)]
+    if missing:
+        raise PipelineUnavailableError(
+            'Runtime config requires_exact_closure: true but is missing closure sections: ' + ', '.join(sorted(missing)) + '.'
+        )
 
 
 def require_imports(config: dict[str, object]) -> None:
@@ -291,6 +315,64 @@ def _causality_metrics(
         'latent_fingerprint': latent_fingerprint,
         'field_fingerprint': field_fingerprint,
         'geometry_fingerprint': geometry_fingerprint,
+    }
+
+
+def _stage_evidence(
+    *,
+    checkpoint_bundle: dict[str, object],
+    reference_asset: dict[str, object],
+    coarse_surface: dict[str, object],
+    conditioning: dict[str, object],
+    schedule: dict[str, object],
+    denoised: dict[str, object],
+    decoded_volume: dict[str, object],
+    refined_surface: dict[str, object],
+    exported_payload_bytes: int,
+) -> dict[str, object]:
+    checkpoint_path = checkpoint_bundle.get('path')
+    checkpoint_summary = checkpoint_bundle.get('summary') if isinstance(checkpoint_bundle.get('summary'), dict) else {}
+    mesh = coarse_surface.get('mesh') if isinstance(coarse_surface.get('mesh'), dict) else {}
+    voxels = coarse_surface.get('voxels') if isinstance(coarse_surface.get('voxels'), dict) else {}
+    metadata = conditioning.get('metadata') if isinstance(conditioning.get('metadata'), dict) else {}
+
+    return {
+        'preprocess': {
+            'source': 'reference_image',
+            'processor': reference_asset.get('processor', 'ImageProcessorV2'),
+            'image_signature': reference_asset.get('image_signature'),
+            'mask_signature': reference_asset.get('mask_signature'),
+        },
+        'checkpoint': {
+            'source': Path(str(checkpoint_path)).name if checkpoint_path else 'ultrashape_v1.pt',
+            'subtrees_loaded': checkpoint_bundle.get('subtrees_loaded', []),
+            'signature': checkpoint_summary.get('signature'),
+        },
+        'conditioning': {
+            'source': 'coarse_mesh+reference_image+checkpoint',
+            'surface_signature': mesh.get('signature'),
+            'voxel_signature': voxels.get('voxel_signature'),
+            'checkpoint_signature': metadata.get('checkpoint_signature'),
+        },
+        'scheduler': {
+            'source': schedule.get('target', 'diffusers.FlowMatchEulerDiscreteScheduler'),
+            'timestep_signature': schedule.get('timestep_signature'),
+        },
+        'denoise': {
+            'source': denoised.get('model', 'RefineDiT'),
+            'latent_signature': denoised.get('latent_signature'),
+            'checkpoint_signature': denoised.get('checkpoint_signature'),
+        },
+        'decode': {
+            'source': f"{decoded_volume.get('vae', 'ShapeVAE')}+{decoded_volume.get('decoder', 'VanillaVDMVolumeDecoding')}",
+            'field_signature': decoded_volume.get('field_signature'),
+            'corner_signature': decoded_volume.get('corner_signature'),
+        },
+        'extract': {
+            'source': refined_surface.get('marching_cubes', 'cubvh.sparse_marching_cubes'),
+            'surface_signature': refined_surface.get('surface_signature'),
+            'payload_bytes': exported_payload_bytes,
+        },
     }
 
 
@@ -526,6 +608,17 @@ def run_refine_pipeline(
                 'refined_face_count': gate_metrics['refined_face_count'],
             },
             'causality': causality,
+            'stage_evidence': _stage_evidence(
+                checkpoint_bundle=checkpoint_bundle,
+                reference_asset=reference_asset,
+                coarse_surface=coarse_surface,
+                conditioning=conditioning,
+                schedule=schedule,
+                denoised=denoised,
+                decoded_volume=decoded_volume,
+                refined_surface=refined_surface,
+                exported_payload_bytes=exported_payload_bytes,
+            ),
         },
         'fallbacks': ['flash_attn->sdpa'] if denoised['attention'] == 'sdpa' else [],
         'subtrees_loaded': checkpoint_bundle['subtrees_loaded'],

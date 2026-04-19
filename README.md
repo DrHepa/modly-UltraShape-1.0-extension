@@ -12,7 +12,6 @@ The active install surface is the repo-root Python boundary only:
 - `README.md`
 - `runtime/configs/infer_dit_refine.yaml`
 - `runtime/vendor/ultrashape_runtime/**`
-- `runtime/patches/README.md`
 
 Do NOT curate a separate CommonJS payload. GitHub install validation must target the extracted repo root exactly as Modly receives it.
 
@@ -38,6 +37,8 @@ This MVP is LOCAL-FIRST and LOCAL-ONLY for execution.
 ## Readiness states
 
 `.runtime-readiness.json` is the source of truth for smoke verification and runtime behavior. It documents whether the installed runtime can execute the checkpoint-backed real-refinement closure truthfully.
+
+For this clean-room rewrite, readiness truth comes from the copied stable shell plus the vendored `runtime/vendor/ultrashape_runtime/**` closure exactly as shipped. There is no synthetic allowance layer between "install-ready" and "runtime-ready" anymore.
 
 - `ready` — required weights and the supported real-refinement dependency tier passed import smoke; the staged contract is eligible for the local-only / mc-only / glb-only path
 - `degraded` — install succeeded, but only CONDITIONAL or DEGRADABLE gaps remain; readiness must record those gaps explicitly instead of pretending the runtime closure is fully available
@@ -135,9 +136,6 @@ Missing required weights are a FATAL install failure. `setup.py` must copy or do
 
 `processor.py` reads exactly one JSON object line from stdin.
 
-Fallback fixture bundle fields remain documented as: `reference_image`, `coarse_mesh`, `output_dir`, `checkpoint`, and `params`.
-The bundled `fixtures/requests/refiner-bundle/request.json` is a documentation-only compatibility fixture for this temporary seam, NOT authoritative runtime truth.
-
 Input resolution order:
 
 1. Preferred named inputs:
@@ -161,15 +159,6 @@ This extension is a refiner, NOT a coarse-mesh generator or single-image generat
 ## Coarse-mesh policy
 
 Hunyuan is the recommended and currently validated upstream source, but it is NOT required. Any coarse mesh that satisfies the accepted mesh-format validation may be used.
-
-## Fixture layout
-
-`fixtures/requests/refiner-bundle/`
-
-- `request.json` — documentation-only compatibility fixture for the temporary local-only smoke seam
-- `assets/reference-image.png` — install-smoke reference image fixture
-- `assets/coarse-mesh.glb` — binary GLB coarse-mesh fixture used by install smoke
-- `expected/output/refined-mesh.glb` — packaged binary GLB baseline kept in the copied payload for smoke comparisons
 
 ## Future Modly seam
 

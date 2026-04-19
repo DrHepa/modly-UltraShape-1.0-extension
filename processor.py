@@ -20,7 +20,15 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 MESH_EXTENSIONS = {'.glb', '.obj', '.fbx', '.ply'}
 ALLOWED_BACKENDS = {'auto', 'local'}
 ALLOWED_OUTPUTS = {'glb'}
-PUBLIC_ERROR_CODES = {'DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'}
+PUBLIC_ERROR_CODES = {
+    'INVALID_PARAMS',
+    'MISSING_INPUT',
+    'UNREADABLE_ASSET',
+    'UNSUPPORTED_ASSET_TYPE',
+    'DEPENDENCY_MISSING',
+    'WEIGHTS_MISSING',
+    'LOCAL_RUNTIME_UNAVAILABLE',
+}
 
 
 class ProcessorError(Exception):
@@ -74,7 +82,11 @@ def read_payload() -> dict:
     if not line:
         raise ProcessorError('INVALID_PARAMS', 'Missing JSON payload line on stdin.')
 
-    payload = json.loads(line)
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise ProcessorError('INVALID_PARAMS', f'Processor payload is not valid JSON: {error}.') from error
+
     if not isinstance(payload, dict):
         raise ProcessorError('INVALID_PARAMS', 'Processor payload must be a JSON object.')
     return payload

@@ -37,7 +37,6 @@ const shellPaths = ['manifest.json', 'processor.py', 'setup.py', 'README.md'];
 
 const vendoredRuntimePaths = [
   'runtime/configs/infer_dit_refine.yaml',
-  'runtime/patches/README.md',
   'runtime/vendor/ultrashape_runtime/__init__.py',
   'runtime/vendor/ultrashape_runtime/pipelines.py',
   'runtime/vendor/ultrashape_runtime/preprocessors.py',
@@ -59,27 +58,27 @@ const vendoredRuntimePaths = [
   'runtime/vendor/ultrashape_runtime/models/autoencoders/volume_decoders.py',
 ];
 
-const fixturePaths = [
-  'fixtures/requests/refiner-bundle/request.json',
-  'fixtures/requests/refiner-bundle/assets/reference-image.png',
-  'fixtures/requests/refiner-bundle/assets/coarse-mesh.glb',
-  'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb',
-];
-
 const testPaths = [
   'tests/spec/manifest.test.ts',
   'tests/spec/request-contract.test.ts',
   'tests/spec/runtime-flow.test.ts',
-  'tests/spec/fallback-fixtures.test.ts',
   'tests/spec/repository-structure.test.ts',
 ];
 
+const removedAuthorityPaths = [
+  'runtime/patches/README.md',
+  'fixtures/requests/refiner-bundle/request.json',
+  'fixtures/requests/refiner-bundle/assets/reference-image.png',
+  'fixtures/requests/refiner-bundle/assets/coarse-mesh.glb',
+  'fixtures/requests/refiner-bundle/expected/output/refined-mesh.glb',
+  'tests/spec/fallback-fixtures.test.ts',
+];
+
 describe('UltraShape repository structure contract', () => {
-  it('keeps shell, vendored runtime, fixtures, and active specs separated by path and role', () => {
+  it('keeps shell, vendored runtime, and active specs separated by path and role', () => {
     for (const filePath of [
       ...shellPaths,
       ...vendoredRuntimePaths,
-      ...fixturePaths,
       ...testPaths,
     ]) {
       expect(existsSync(resolve(repoRoot, filePath)), `${filePath} should exist`).toBe(true);
@@ -91,12 +90,12 @@ describe('UltraShape repository structure contract', () => {
       ).toBe(false);
     }
 
-    for (const filePath of fixturePaths) {
-      expect(filePath.startsWith('fixtures/')).toBe(true);
-    }
-
     for (const filePath of testPaths) {
       expect(filePath.startsWith('tests/spec/')).toBe(true);
+    }
+
+    for (const filePath of removedAuthorityPaths) {
+      expect(existsSync(resolve(repoRoot, filePath)), `${filePath} should be removed`).toBe(false);
     }
   });
 

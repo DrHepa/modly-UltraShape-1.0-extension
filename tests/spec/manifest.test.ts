@@ -17,40 +17,9 @@ const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
     params_schema: Array<Record<string, unknown>>;
   }>;
   type: string;
-  testing_fallback_only: {
-    status: string;
-    temporary: boolean;
-    non_native: boolean;
-    semantic_contract: string;
-    bundle_schema: Record<string, string>;
-    hidden_params: {
-      checkpoint: {
-        location: string;
-        default: null;
-        reason: string;
-      };
-      preserve_scale: {
-        location: string;
-        default: boolean;
-        reason: string;
-      };
-    };
-    fallback_input_contract: {
-      primary: {
-        reference_image: string;
-        coarse_mesh: string;
-      };
-      secondary: {
-        reference_image: string;
-        coarse_mesh: string;
-      };
-      rationale: string;
-    };
-    draft_manifest_seam: {
-      reason: string;
-      forward_compatible_intent: string;
-    };
-  };
+  testing_fallback_only?: unknown;
+  fallback_input_contract?: unknown;
+  draft_manifest_seam?: unknown;
 };
 
 describe('UltraShape refiner manifest', () => {
@@ -135,43 +104,9 @@ describe('UltraShape refiner manifest', () => {
     }
   });
 
-  it('labels the testing fallback as temporary and non-native', () => {
-    expect(manifest.testing_fallback_only.status).toBe('temporary_non_native');
-    expect(manifest.testing_fallback_only.temporary).toBe(true);
-    expect(manifest.testing_fallback_only.non_native).toBe(true);
-    expect(manifest.testing_fallback_only.semantic_contract).toBe(
-      'reference_image + coarse_mesh -> refined.glb',
-    );
-    expect(manifest.testing_fallback_only.bundle_schema).toEqual({
-      reference_image: 'path',
-      coarse_mesh: 'path',
-      output_dir: 'path',
-      checkpoint: 'path|null',
-      params: 'object',
-    });
-    expect(manifest.testing_fallback_only.hidden_params).toEqual({
-      checkpoint: {
-        location: 'runtime/default metadata',
-        default: null,
-        reason: 'Deferred because checkpoint is an asset dependency better represented outside the current panel controls.',
-      },
-      preserve_scale: {
-        location: 'runtime-only default',
-        default: true,
-        reason: 'Runtime-only because the local MVP keeps preserve-scale enforced instead of advertising extra UI branches.',
-      },
-    });
-    expect(manifest.testing_fallback_only.fallback_input_contract.primary).toEqual({
-      reference_image: 'input.inputs.reference_image.filePath',
-      coarse_mesh: 'input.inputs.coarse_mesh.filePath',
-    });
-    expect(manifest.testing_fallback_only.fallback_input_contract.secondary).toMatchObject({
-      reference_image: 'input.filePath',
-      coarse_mesh: 'params.coarse_mesh',
-    });
-    expect(manifest.testing_fallback_only.fallback_input_contract.rationale).toContain('Temporary local-only fallback seam');
-    expect(manifest.testing_fallback_only.draft_manifest_seam.reason).toContain(
-      'may not yet express the ideal multi-input process contract',
-    );
+  it('does not publish fallback authority outside processor.py', () => {
+    expect(manifest).not.toHaveProperty('testing_fallback_only');
+    expect(manifest).not.toHaveProperty('fallback_input_contract');
+    expect(manifest).not.toHaveProperty('draft_manifest_seam');
   });
 });

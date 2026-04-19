@@ -819,9 +819,46 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
         field_fingerprint: expect.any(Number),
         geometry_fingerprint: expect.any(Number),
       }),
+      stage_evidence: expect.objectContaining({
+        preprocess: expect.objectContaining({
+          source: 'reference_image',
+          processor: 'ImageProcessorV2',
+          image_signature: expect.any(Number),
+          mask_signature: expect.any(Number),
+        }),
+        checkpoint: expect.objectContaining({
+          source: 'ultrashape_v1.pt',
+          subtrees_loaded: ['vae', 'dit', 'conditioner'],
+          signature: expect.any(Number),
+        }),
+        conditioning: expect.objectContaining({
+          source: 'coarse_mesh+reference_image+checkpoint',
+          surface_signature: expect.any(Number),
+          voxel_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+        }),
+        scheduler: expect.objectContaining({
+          source: 'diffusers.FlowMatchEulerDiscreteScheduler',
+          timestep_signature: expect.any(Number),
+        }),
+        denoise: expect.objectContaining({
+          source: 'RefineDiT',
+          latent_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+        }),
+        decode: expect.objectContaining({
+          source: 'ShapeVAE+VanillaVDMVolumeDecoding',
+          field_signature: expect.any(Number),
+          corner_signature: expect.any(Number),
+        }),
+        extract: expect.objectContaining({
+          source: 'cubvh.sparse_marching_cubes',
+          surface_signature: expect.any(Number),
+          payload_bytes: expect.any(Number),
+        }),
+      }),
     }),
   );
-  expect(metrics).not.toHaveProperty('stage_evidence');
 }
 
 function installProcessorRuntime(extDir: string) {
@@ -1347,7 +1384,7 @@ describe('UltraShape runtime flow', () => {
     }
   });
 
-  it('treats shorthand configs as pipeline input instead of re-authorizing a synthetic runtime contract in the adapter', () => {
+  it('rejects shorthand configs instead of re-authorizing a synthetic runtime contract in the adapter', () => {
     const fixture = createFixtureWorkspace();
 
     try {
@@ -1369,20 +1406,10 @@ describe('UltraShape runtime flow', () => {
       });
 
       expect(outcome).toEqual({
-        ok: true,
-        result: {
-          file_path: join(fixture.outputDir, 'refined.glb'),
-          format: 'glb',
-          backend: 'local',
-          metrics: expect.any(Object),
-          fallbacks: ['flash_attn->sdpa'],
-          subtrees_loaded: ['vae', 'dit', 'conditioner'],
-          warnings: [],
-        },
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        error_message: expect.stringContaining('requires_exact_closure'),
       });
-      const result = outcome.result;
-      expect(result).not.toBeNull();
-      expect((result as Record<string, unknown>)).not.toHaveProperty('runtime_contract');
     } finally {
       fixture.cleanup();
     }

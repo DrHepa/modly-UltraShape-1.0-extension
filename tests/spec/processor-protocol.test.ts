@@ -789,7 +789,7 @@ describe('UltraShape processor.py protocol', () => {
         expect(outcome.events.at(-1)).toEqual({
           type: 'error',
           message: expect.stringContaining('backend must be auto or local'),
-          code: 'LOCAL_RUNTIME_UNAVAILABLE',
+          code: 'INVALID_PARAMS',
         });
       }
     } finally {
@@ -819,7 +819,7 @@ describe('UltraShape processor.py protocol', () => {
         expect(outcome.events.at(-1)).toEqual({
           type: 'error',
           message: expect.stringContaining('output_format must be glb'),
-          code: 'LOCAL_RUNTIME_UNAVAILABLE',
+          code: 'INVALID_PARAMS',
         });
       }
     } finally {
@@ -1016,8 +1016,8 @@ describe('UltraShape processor.py protocol', () => {
 
         expect(outcome.events.at(-1)).toEqual({
           type: 'error',
-          message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
-          code: 'LOCAL_RUNTIME_UNAVAILABLE',
+          message: expect.stringContaining('backend must be auto or local'),
+          code: 'INVALID_PARAMS',
         });
       }
     } finally {
@@ -1066,10 +1066,25 @@ describe('UltraShape processor.py protocol', () => {
         '  enabled: true',
         'conditioner_config:',
         '  enabled: true',
+        'preprocess:',
+        '  image_processor: ImageProcessorV2',
         'image_processor_cfg:',
         '  enabled: true',
+        'conditioning:',
+        '  coarse_mesh_encoder: SharpEdgeSurfaceLoader',
+        '  voxelizer: voxelize_from_point',
+        'surface:',
+        '  extraction: mc',
+        '  loader: SharpEdgeSurfaceLoader',
+        'scheduler:',
+        '  family: flow-matching',
         'scheduler_cfg:',
         '  family: flow-matching',
+        'decoder:',
+        '  vae: ShapeVAE',
+        '  volume_decoder: VanillaVDMVolumeDecoding',
+        'gate:',
+        '  mode: geometric-hard-gate',
         '',
       ].join('\n'),
     );
@@ -1261,10 +1276,25 @@ describe('UltraShape processor.py protocol', () => {
         '  enabled: true',
         'conditioner_config:',
         '  enabled: true',
+        'preprocess:',
+        '  image_processor: ImageProcessorV2',
         'image_processor_cfg:',
         '  enabled: true',
+        'conditioning:',
+        '  coarse_mesh_encoder: SharpEdgeSurfaceLoader',
+        '  voxelizer: voxelize_from_point',
+        'surface:',
+        '  extraction: mc',
+        '  loader: SharpEdgeSurfaceLoader',
+        'scheduler:',
+        '  family: flow-matching',
         'scheduler_cfg:',
         '  family: flow-matching',
+        'decoder:',
+        '  vae: ShapeVAE',
+        '  volume_decoder: VanillaVDMVolumeDecoding',
+        'gate:',
+        '  mode: geometric-hard-gate',
         '',
       ].join('\n'),
     );

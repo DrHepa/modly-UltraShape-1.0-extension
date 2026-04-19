@@ -63,53 +63,5 @@
       }
       ]
     }
-  ],
-  "testing_fallback_only": {
-    "status": "temporary_non_native",
-    "temporary": true,
-    "non_native": true,
-    "authority": "documentation_only",
-    "removal_condition": "Remove this metadata when Modly ships native multi-input routing for both semantic ids.",
-    "semantic_contract": "reference_image + coarse_mesh -> refined.glb",
-    "bundle_schema": {
-      "reference_image": "path",
-      "coarse_mesh": "path",
-      "output_dir": "path",
-      "checkpoint": "path|null",
-      "params": "object"
-    },
-    "hidden_params": {
-      "checkpoint": {
-        "location": "runtime/default metadata",
-        "default": null,
-        "reason": "Deferred because checkpoint is an asset dependency better represented outside the current panel controls."
-      },
-      "preserve_scale": {
-        "location": "runtime-only default",
-        "default": true,
-        "reason": "Runtime-only because the local MVP keeps preserve-scale enforced instead of advertising extra UI branches."
-      }
-    },
-    "fallback_input_contract": {
-      "primary": {
-        "reference_image": "input.inputs.reference_image.filePath",
-        "coarse_mesh": "input.inputs.coarse_mesh.filePath"
-      },
-      "secondary": {
-        "reference_image": "input.filePath",
-        "coarse_mesh": "params.coarse_mesh"
-      },
-      "rationale": "Temporary local-only fallback seam only until Modly supplies native multi-input process routing for both semantic ids."
-    },
-    "draft_manifest_seam": {
-      "reason": "Current Modly manifest schema may not yet express the ideal multi-input process contract directly.",
-      "forward_compatible_intent": "Preserve final semantic ids and ports now so native core support can adopt them without renaming the contract."
-    },
-    "supported_execution": {
-      "backend_modes": ["auto", "local"],
-      "resolved_backend": "local",
-      "output_formats": ["glb"],
-      "remote_hybrid_supported": false
-    }
-  }
+  ]
 }
