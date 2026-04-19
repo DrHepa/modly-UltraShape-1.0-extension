@@ -17,7 +17,6 @@ const installSurfacePaths = [
   'runtime/vendor/ultrashape_runtime/local_runner.py',
   'runtime/vendor/ultrashape_runtime/pipelines.py',
   'runtime/vendor/ultrashape_runtime/preprocessors.py',
-  'runtime/vendor/ultrashape_runtime/rembg.py',
   'runtime/vendor/ultrashape_runtime/surface_loaders.py',
   'runtime/vendor/ultrashape_runtime/schedulers.py',
   'runtime/vendor/ultrashape_runtime/utils/__init__.py',

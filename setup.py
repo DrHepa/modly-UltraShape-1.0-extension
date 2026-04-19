@@ -159,7 +159,6 @@ REQUIRED_RUNTIME_FILES = [
     'ultrashape_runtime/local_runner.py',
     'ultrashape_runtime/pipelines.py',
     'ultrashape_runtime/preprocessors.py',
-    'ultrashape_runtime/rembg.py',
     'ultrashape_runtime/surface_loaders.py',
     'ultrashape_runtime/schedulers.py',
     'ultrashape_runtime/utils/__init__.py',

@@ -116,7 +116,6 @@ const extractedPayloadPaths = [
   'runtime/vendor/ultrashape_runtime/local_runner.py',
   'runtime/vendor/ultrashape_runtime/pipelines.py',
   'runtime/vendor/ultrashape_runtime/preprocessors.py',
-  'runtime/vendor/ultrashape_runtime/rembg.py',
   'runtime/vendor/ultrashape_runtime/surface_loaders.py',
   'runtime/vendor/ultrashape_runtime/schedulers.py',
   'runtime/vendor/ultrashape_runtime/utils/__init__.py',
@@ -316,6 +315,9 @@ describe('UltraShape setup.py contract', () => {
         install_success: boolean;
         failure_stage: string;
         failure_code: string;
+        runtime_assets: {
+          required_files: string[];
+        };
         dependencies: {
           required: string[];
           conditional: string[];
@@ -331,6 +333,7 @@ describe('UltraShape setup.py contract', () => {
       expect(summary.dependencies.required).toContain('cubvh');
       expect(summary.dependencies.conditional).toEqual(['rembg', 'onnxruntime']);
       expect(summary.dependencies.degradable).toEqual(['flash_attn']);
+      expect(summary.runtime_assets.required_files).not.toContain('ultrashape_runtime/rembg.py');
       expect(summary.native_install_contract).toEqual({
         order: ['core', 'cubvh', 'flash_attn'],
         cubvh_required: true,
@@ -433,12 +436,16 @@ describe('UltraShape setup.py contract', () => {
         attempted_weight_sources: string[];
         resolved_weight_source_kind: string;
         resolved_weight_source: string;
+        runtime_assets: {
+          required_files: string[];
+        };
       } & SetupSummaryWithNative;
       expect(summary.install_success).toBe(true);
       expect(summary.install_ready).toBe(true);
       expect(summary.runtime_ready).toBe(true);
       expect(summary.runtime_closure_ready).toBe(true);
       expect(summary.runtime_closure_reason).toContain('ported upstream MVP closure');
+      expect(summary.runtime_assets.required_files).not.toContain('ultrashape_runtime/rembg.py');
       expect(summary.attempted_weight_source_kinds).toEqual(['ext-dir']);
       expect(summary.attempted_weight_sources).toEqual([weightPath]);
       expect(summary.resolved_weight_source_kind).toBe('ext-dir');
