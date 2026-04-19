@@ -537,6 +537,44 @@ def _cpu_python_rows(values: object) -> list[object]:
     return list(values) if isinstance(values, (list, tuple)) else []
 
 
+def _tensor_shape(values: list[tuple[float, ...]] | list[tuple[int, ...]], tensor: object) -> tuple[int, ...]:
+    raw_shape = getattr(tensor, 'shape', None)
+    if isinstance(raw_shape, (list, tuple)) and raw_shape:
+        return tuple(int(axis) for axis in raw_shape)
+    column_count = len(values[0]) if values else 0
+    return (len(values), column_count)
+
+
+def _flatten_numeric_rows(values: list[tuple[float, ...]] | list[tuple[int, ...]]) -> list[float]:
+    return [float(value) for row in values for value in row]
+
+
+def _cubvh_input_diagnostics(
+    *,
+    coords: list[tuple[int, int, int]],
+    corners: list[tuple[float, float, float, float, float, float, float, float]],
+    coords_tensor: object,
+    corners_tensor: object,
+    iso: float,
+) -> str:
+    flat_coords = _flatten_numeric_rows(coords)
+    flat_corners = _flatten_numeric_rows(corners)
+    return (
+        'cubvh_inputs('
+        f'coords_shape={_tensor_shape(coords, coords_tensor)}, '
+        f'coords_dtype={getattr(coords_tensor, "dtype", None)}, '
+        f'coords_min={min(flat_coords) if flat_coords else 0.0}, '
+        f'coords_max={max(flat_coords) if flat_coords else 0.0}, '
+        f'corners_shape={_tensor_shape(corners, corners_tensor)}, '
+        f'corners_dtype={getattr(corners_tensor, "dtype", None)}, '
+        f'corners_min={round(min(flat_corners), 6) if flat_corners else 0.0}, '
+        f'corners_max={round(max(flat_corners), 6) if flat_corners else 0.0}, '
+        f'cell_count={len(coords)}, '
+        f'iso={round(float(iso), 6)}'
+        ')'
+    )
+
+
 class MCSurfaceExtractor:
     extractor = 'cubvh.sparse_marching_cubes'
 
@@ -605,13 +643,23 @@ class MCSurfaceExtractor:
 
         coords_tensor = torch.tensor(normalized_coords, dtype=torch.int32)
         corners_tensor = torch.tensor(normalized_corners, dtype=torch.float32)
-
-        raw_vertices, raw_faces = sparse_marching_cubes(
-            coords_tensor,
-            corners_tensor,
-            float(iso),
-            ensure_consistency=False,
+        cubvh_diagnostics = _cubvh_input_diagnostics(
+            coords=normalized_coords,
+            corners=normalized_corners,
+            coords_tensor=coords_tensor,
+            corners_tensor=corners_tensor,
+            iso=float(iso),
         )
+
+        try:
+            raw_vertices, raw_faces = sparse_marching_cubes(
+                coords_tensor,
+                corners_tensor,
+                float(iso),
+                ensure_consistency=False,
+            )
+        except Exception as error:
+            raise SurfaceExtractionError(f'cubvh.sparse_marching_cubes failed: {error} [{cubvh_diagnostics}]') from error
         raw_vertices = _cpu_python_rows(raw_vertices)
         raw_faces = _cpu_python_rows(raw_faces)
         vertices = [tuple(float(axis) for axis in vertex[:3]) for vertex in raw_vertices if isinstance(vertex, (list, tuple)) and len(vertex) >= 3]

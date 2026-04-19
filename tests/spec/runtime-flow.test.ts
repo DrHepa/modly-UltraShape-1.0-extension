@@ -100,6 +100,9 @@ function cubvhStubSource() {
     'def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):',
     '    coords = coords.int()',
     '    corners = corners.float()',
+    '    error_message = os.environ.get("ULTRASHAPE_TEST_CUBVH_ERROR_MESSAGE")',
+    '    if error_message:',
+    '        raise RuntimeError(error_message)',
     '    trace_path = os.environ.get("ULTRASHAPE_TEST_CUBVH_TRACE_PATH")',
     '    if trace_path:',
     '        Path(trace_path).write_text(json.dumps({',
@@ -107,6 +110,7 @@ function cubvhStubSource() {
     '            "corners_type": type(corners).__name__,',
     '            "coords_dtype": getattr(coords, "dtype", None),',
     '            "corners_dtype": getattr(corners, "dtype", None),',
+    '            "cuda_launch_blocking": os.environ.get("CUDA_LAUNCH_BLOCKING"),',
     '            "coords": len(coords),',
     '            "corners": len(corners),',
     '            "iso": iso,',
@@ -2192,6 +2196,121 @@ describe('UltraShape runtime flow', () => {
           source_corner_signature: (metrics.decode as Record<string, unknown>).corner_signature,
         }),
       );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('forces CUDA_LAUNCH_BLOCKING=1 for the local runner path without overwriting an explicit value', () => {
+    const fixture = createFixtureWorkspace();
+    const defaultTracePath = join(fixture.root, 'cubvh-default-trace.json');
+    const preservedTracePath = join(fixture.root, 'cubvh-preserved-trace.json');
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const defaultOutcome = runLocalRunner(
+        {
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: fixture.outputDir,
+          output_format: 'glb',
+          checkpoint: null,
+          config_path: fixture.configPath,
+          ext_dir: fixture.root,
+          backend: 'local',
+          steps: 30,
+          guidance_scale: 5.5,
+          seed: 7,
+          preserve_scale: true,
+        },
+        {
+          env: {
+            ULTRASHAPE_TEST_CUBVH_TRACE_PATH: defaultTracePath,
+          },
+        },
+      );
+      expect(defaultOutcome?.ok).toBe(true);
+      expect(JSON.parse(readFileSync(defaultTracePath, 'utf8'))).toEqual(
+        expect.objectContaining({
+          cuda_launch_blocking: '1',
+        }),
+      );
+
+      const preservedOutcome = runLocalRunner(
+        {
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: fixture.outputDir,
+          output_format: 'glb',
+          checkpoint: null,
+          config_path: fixture.configPath,
+          ext_dir: fixture.root,
+          backend: 'local',
+          steps: 30,
+          guidance_scale: 5.5,
+          seed: 7,
+          preserve_scale: true,
+        },
+        {
+          env: {
+            CUDA_LAUNCH_BLOCKING: '0',
+            ULTRASHAPE_TEST_CUBVH_TRACE_PATH: preservedTracePath,
+          },
+        },
+      );
+      expect(preservedOutcome?.ok).toBe(true);
+      expect(JSON.parse(readFileSync(preservedTracePath, 'utf8'))).toEqual(
+        expect.objectContaining({
+          cuda_launch_blocking: '0',
+        }),
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('surfaces cubvh input diagnostics while preserving LOCAL_RUNTIME_UNAVAILABLE at the runner seam', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const outcome = runLocalRunner(
+        {
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: fixture.outputDir,
+          output_format: 'glb',
+          checkpoint: null,
+          config_path: fixture.configPath,
+          ext_dir: fixture.root,
+          backend: 'local',
+          steps: 30,
+          guidance_scale: 5.5,
+          seed: 7,
+          preserve_scale: true,
+        },
+        {
+          env: {
+            ULTRASHAPE_TEST_CUBVH_ERROR_MESSAGE: 'CUDA error: out of memory',
+          },
+        },
+      );
+
+      expect(outcome).toEqual(
+        expect.objectContaining({
+          ok: false,
+          error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+          error_message: expect.stringContaining('cubvh.sparse_marching_cubes failed: CUDA error: out of memory'),
+        }),
+      );
+      expect(outcome.error_message).toEqual(expect.stringContaining('coords_shape='));
+      expect(outcome.error_message).toEqual(expect.stringContaining('corners_shape='));
+      expect(outcome.error_message).toEqual(expect.stringContaining('coords_dtype=int32'));
+      expect(outcome.error_message).toEqual(expect.stringContaining('corners_dtype=float32'));
+      expect(outcome.error_message).toEqual(expect.stringContaining('cell_count='));
+      expect(outcome.error_message).toEqual(expect.stringContaining('iso=0.0'));
     } finally {
       fixture.cleanup();
     }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -102,6 +103,8 @@ def run_refine_job(
         raise LocalRunnerError('seed must be an integer or null.')
     if not isinstance(preserve_scale, bool):
         raise LocalRunnerError('preserve_scale must be a boolean.')
+
+    os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '1')
 
     Path(ext_dir)
     load_runtime_config(config_path)
