@@ -46,6 +46,13 @@ checkpoint:
     - vae
     - dit
     - conditioner
+  checkpoint_contract:
+    state_dict_metadata: required
+    required_subtree_state:
+      - state_dict
+      - tensors
+      - tensor_count
+      - value_count
 vae_config:
   target: ultrashape_runtime.models.autoencoders.model.ShapeVAE
 dit_cfg:
@@ -57,6 +64,14 @@ weights:
 preprocess:
   image_processor: ImageProcessorV2
   require_cutout: conditional
+  tensor_contract:
+    image_tensor: [batch, height, width, rgba]
+    mask_tensor: [batch, height, width, alpha]
+    image_meta:
+      - width
+      - height
+      - pixel_count
+      - source_format
   evidence:
     - mean_intensity
     - mask_coverage
@@ -66,18 +81,39 @@ image_processor_cfg:
 conditioning:
   coarse_mesh_encoder: SharpEdgeSurfaceLoader
   voxelizer: voxelize_from_point
+  voxel_contract:
+    voxel_cond:
+      - coords
+      - occupancies
+      - resolution
+      - bounds
   evidence:
     - image_mean
     - mesh_extent_sum
     - occupied_ratio
 scheduler:
   family: flow-matching
+  target: diffusers.FlowMatchEulerDiscreteScheduler
+  contract:
+    object_type: FlowMatchEulerDiscreteScheduler
+    consumed_state:
+      - timesteps
+      - sigmas
   evidence:
     - timestep_count
     - sigma_start
     - sigma_end
 scheduler_cfg:
   target: diffusers.FlowMatchEulerDiscreteScheduler
+denoise:
+  target: ultrashape_runtime.models.denoisers.dit_mask.RefineDiT
+  moe_target: ultrashape_runtime.models.denoisers.moe_layers
+  input_contract:
+    - latents
+    - timestep
+    - context
+    - context_mask
+    - voxel_cond
 decoder:
   vae: ShapeVAE
   volume_decoder: VanillaVDMVolumeDecoding
@@ -87,6 +123,12 @@ decoder:
 surface:
   extraction: mc
   loader: SharpEdgeSurfaceLoader
+  surface_contract:
+    sampled_surface_points: required
+    mesh_state:
+      - vertices
+      - faces
+      - bounds
   evidence:
     - source_cell_count
     - vertex_count

@@ -11,6 +11,33 @@ from .utils.voxelize import mesh_geometry_from_glb, sample_surface_points, voxel
 GLB_MAGIC = b'glTF'
 
 
+class _CompatState(dict):
+    def __init__(self, *args, compat: dict[str, object] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._compat = compat or {}
+
+    def _resolve(self, key: str):
+        value = self._compat[key]
+        return value(self) if callable(value) else value
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.get(self, key, default)
+        if key in self._compat:
+            return self._resolve(key)
+        return default
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        if key in self._compat:
+            return self._resolve(key)
+        raise KeyError(key)
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or key in self._compat
+
+
 class SurfaceLoadError(Exception):
     code = 'LOCAL_RUNTIME_UNAVAILABLE'
 
@@ -30,7 +57,7 @@ def _read_glb_payload(surface_path: Path) -> dict[str, object]:
     geometry_tokens = geometry.get('tokens') if isinstance(geometry.get('tokens'), list) else []
     surface_signature = geometry.get('signature') if isinstance(geometry.get('signature'), int) else stable_signature(geometry_tokens)
 
-    return {
+    return _CompatState({
         'kind': 'coarse-glb-mesh',
         'path': str(surface_path),
         'bytes': payload,
@@ -42,16 +69,18 @@ def _read_glb_payload(surface_path: Path) -> dict[str, object]:
         'face_count': len(faces),
         'bounds': bounds,
         'extents': extents,
-        'tokens': geometry_tokens,
-        'signature': surface_signature,
-        'surface_points': surface_points,
+        'sampled_surface_points': surface_points,
         'surface_point_count': len(surface_points),
         'evidence': {
             'vertex_count': len(vertices),
             'face_count': len(faces),
             'surface_point_count': len(surface_points),
         },
-    }
+    }, compat={
+        'tokens': lambda state: list(geometry_tokens),
+        'signature': lambda state: surface_signature,
+        'surface_points': lambda state: list(state['sampled_surface_points']),
+    })
 
 
 class SharpEdgeSurfaceLoader:
@@ -67,14 +96,17 @@ class SharpEdgeSurfaceLoader:
             )
 
         mesh = _read_glb_payload(surface_path)
-        voxels = voxelize_from_point(mesh)
-        return {
+        voxel_cond = voxelize_from_point(mesh)
+        return _CompatState({
             'path': str(surface_path),
             'suffix': suffix,
             'loader': self.__class__.__name__,
             'mesh': mesh,
-            'voxels': voxels,
-        }
+            'sampled_surface_points': mesh['sampled_surface_points'],
+            'voxel_cond': voxel_cond,
+        }, compat={
+            'voxels': lambda state: state['voxel_cond'],
+        })
 
 
 def load_coarse_surface(path: str) -> dict[str, object]:

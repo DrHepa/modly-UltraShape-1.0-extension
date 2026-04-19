@@ -104,9 +104,9 @@ def _mc_corners(
 
 class VanillaVDMVolumeDecoding:
     def decode(self, decoded_latents: dict[str, object]) -> dict[str, object]:
-        values = _numeric_values(decoded_latents.get('volume_tokens'))
+        values = _numeric_values(decoded_latents.get('field_logits'))
         if not values:
-            values = _numeric_values(decoded_latents.get('mesh_seed'))
+            values = _numeric_values(decoded_latents.get('occupancy_field'))
         if not values:
             values = _numeric_values(decoded_latents.get('decoded_latents'))
 
@@ -120,13 +120,17 @@ class VanillaVDMVolumeDecoding:
             coords = [(x_axis, y_axis, z_axis) for z_axis in range(fallback_resolution) for y_axis in range(fallback_resolution) for x_axis in range(fallback_resolution)]
         corners = _mc_corners(dense_field, coords, set(voxel_coords))
         flattened_coords = [float(axis) / max(int(resolution) or 1, 1) for point in coords for axis in point]
+        corner_signature = stable_signature([value for corner in corners for value in corner])
         return {
             'decoder': self.__class__.__name__,
+            'authority': 'field_logits',
             'coords': coords,
             'corners': corners,
             'iso': 0.0,
             'field_density': clamp_unit(sum(dense_field) / len(dense_field) if dense_field else 0.0),
-            'field_signature': stable_signature(dense_field + flattened_coords[:64]),
+            'field_signature': int(decoded_latents.get('field_signature')) if isinstance(decoded_latents.get('field_signature'), int) else stable_signature(dense_field + flattened_coords[:64]),
+            'field_value_count': len(values),
+            'corner_signature': corner_signature,
             'mesh_signature': stable_signature(flattened_coords[:128]),
             'cell_count': len(coords),
             'corner_count': len(corners),

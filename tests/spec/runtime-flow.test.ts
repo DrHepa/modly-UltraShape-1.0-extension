@@ -283,6 +283,15 @@ function expectUpstreamRuntimeGraph(configText: string) {
   expect(configText).toContain('- onnxruntime');
   expect(configText).toContain('degradable:');
   expect(configText).toContain('- flash_attn');
+  expect(configText).toContain('tensor_contract:');
+  expect(configText).toContain('image_tensor');
+  expect(configText).toContain('mask_tensor');
+  expect(configText).toContain('surface_contract:');
+  expect(configText).toContain('sampled_surface_points');
+  expect(configText).toContain('voxel_contract:');
+  expect(configText).toContain('voxel_cond');
+  expect(configText).toContain('checkpoint_contract:');
+  expect(configText).toContain('state_dict_metadata');
 }
 
 function createBinaryGlbBytes() {
@@ -621,6 +630,15 @@ function getRunnerMetrics(result: Record<string, unknown> | null): Record<string
   return metrics as Record<string, unknown>;
 }
 
+function getCausalityMetrics(metrics: Record<string, unknown>) {
+  const causality = metrics.causality;
+  if (!causality || typeof causality !== 'object') {
+    throw new Error('Expected runner causality metrics to be present.');
+  }
+
+  return causality as Record<string, unknown>;
+}
+
 function createFixtureWorkspace() {
   const root = mkdtempSync(join(tmpdir(), 'ultrashape-runtime-'));
   const outputDir = join(root, 'output');
@@ -735,12 +753,19 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
         surface_point_count: expect.any(Number),
         voxel_count: expect.any(Number),
         voxel_resolution: expect.any(Number),
-        mask_tokens: expect.any(Number),
-        image_mean: expect.any(Number),
-        mesh_extent_sum: expect.any(Number),
-        occupied_ratio: expect.any(Number),
-        checkpoint_signature: expect.any(Number),
-        conditioning_mean: expect.any(Number),
+        context_token_count: expect.any(Number),
+        context_mask_token_count: expect.any(Number),
+        cfg_pairing: expect.objectContaining({
+          mode: 'classifier-free-guidance',
+          positive_context_tokens: expect.any(Number),
+          negative_context_tokens: expect.any(Number),
+        }),
+        conditioner_metadata: expect.objectContaining({
+          image_signature: expect.any(Number),
+          mesh_signature: expect.any(Number),
+          voxel_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+        }),
       }),
       scheduler: expect.objectContaining({
         family: 'flow-matching-euler-discrete',
@@ -760,7 +785,10 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
       decode: expect.objectContaining({
         vae: 'ShapeVAE',
         decoder: expect.stringMatching(/VDMVolumeDecoding|VolumeDecoder/u),
+        authority: 'field_logits',
         field_density: expect.any(Number),
+        field_value_count: expect.any(Number),
+        corner_signature: expect.any(Number),
         cell_count: expect.any(Number),
         grid_resolution: expect.any(Number),
         corner_count: expect.any(Number),
@@ -769,22 +797,27 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
       extract: expect.objectContaining({
         extractor: 'cubvh.sparse_marching_cubes',
         marching_cubes: 'cubvh.sparse_marching_cubes',
+        authority: 'decoded_field',
         vertex_count: expect.any(Number),
         face_count: expect.any(Number),
         payload_bytes: expect.any(Number),
         source_cell_count: expect.any(Number),
+        source_field_signature: expect.any(Number),
+        source_corner_signature: expect.any(Number),
       }),
-      stage_evidence: expect.objectContaining({
-        coarse_vertex_count: expect.any(Number),
-        refined_vertex_count: expect.any(Number),
-        coarse_face_count: expect.any(Number),
-        refined_face_count: expect.any(Number),
-        coarse_geometry_changed: true,
-        image_dependency_proven: true,
-        checkpoint_dependency_proven: true,
+      causality: expect.objectContaining({
+        proof: 'fingerprint-causality',
+        image_fingerprint: expect.any(Number),
+        mesh_fingerprint: expect.any(Number),
+        checkpoint_fingerprint: expect.any(Number),
+        context_fingerprint: expect.any(Number),
+        latent_fingerprint: expect.any(Number),
+        field_fingerprint: expect.any(Number),
+        geometry_fingerprint: expect.any(Number),
       }),
     }),
   );
+  expect(metrics).not.toHaveProperty('stage_evidence');
 }
 
 function installProcessorRuntime(extDir: string) {
@@ -1513,12 +1546,16 @@ describe('UltraShape runtime flow', () => {
         expect.objectContaining({
           representation: 'checkpoint-subtree-v1',
           value_count: 16,
-          tokens: expect.any(Array),
           state_dict: expect.objectContaining({
             tensors: expect.any(Object),
           }),
+          state_dict_metadata: expect.objectContaining({
+            tensor_count: 1,
+            value_count: 16,
+          }),
         }),
       );
+      expect(vae).not.toHaveProperty('tokens');
       expect(latentBasis).toEqual(
         expect.objectContaining({
           sample_count: 8,
@@ -1528,7 +1565,45 @@ describe('UltraShape runtime flow', () => {
         }),
       );
       expect((latentBasis.sample as unknown[])).toHaveLength(8);
-      expect(vae.tokens).toEqual(latentBasis.sample);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('exposes voxel conditioning truth with sampled surface points instead of synthetic voxel token summaries', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      const outcome = runPythonSnippet(
+        [
+          'import json, sys',
+          'from ultrashape_runtime.surface_loaders import SharpEdgeSurfaceLoader',
+          'surface_state = SharpEdgeSurfaceLoader().load(sys.argv[1])',
+          'payload = {',
+          '  "surface_keys": sorted(surface_state.keys()),',
+          '  "mesh_keys": sorted(surface_state["mesh"].keys()),',
+          '  "voxel_keys": sorted(surface_state["voxel_cond"].keys()),',
+          '  "sampled_surface_points": len(surface_state["sampled_surface_points"]),',
+          '  "voxel_count": surface_state["voxel_cond"]["voxel_count"],',
+          '}',
+          'print(json.dumps(payload))',
+        ].join('\n'),
+        [fixture.coarseMesh],
+        [fixture.stubDir],
+      );
+
+      expect(outcome.status).toBe(0);
+      const payload = JSON.parse(outcome.stdout) as Record<string, unknown>;
+      expect(payload.surface_keys).toEqual(expect.arrayContaining(['mesh', 'sampled_surface_points', 'voxel_cond']));
+      expect(payload.mesh_keys).toEqual(expect.arrayContaining(['sampled_surface_points', 'surface_point_count']));
+      expect(payload.mesh_keys).not.toEqual(expect.arrayContaining(['tokens']));
+      expect(payload.voxel_keys).toEqual(
+        expect.arrayContaining(['bounds', 'coords', 'occupancies', 'occupied_ratio', 'resolution', 'surface_point_count', 'voxel_count']),
+      );
+      expect(payload.voxel_keys).not.toEqual(expect.arrayContaining(['tokens', 'voxel_coords', 'voxel_values']));
+      expect(payload.sampled_surface_points).toEqual(expect.any(Number));
+      expect(Number(payload.sampled_surface_points)).toBeGreaterThan(8);
+      expect(Number(payload.voxel_count)).toBeGreaterThan(0);
     } finally {
       fixture.cleanup();
     }
@@ -1703,7 +1778,7 @@ describe('UltraShape runtime flow', () => {
     }
   });
 
-  it('changes mesh-conditioned downstream metadata when only the coarse mesh changes', () => {
+  it('mesh-only variation changes geometry and causality fingerprints', () => {
     const fixture = createFixtureWorkspace();
 
     try {
@@ -1744,6 +1819,8 @@ describe('UltraShape runtime flow', () => {
 
       const firstMetrics = getRunnerMetrics(firstOutcome);
       const secondMetrics = getRunnerMetrics(secondOutcome);
+      const firstCausality = getCausalityMetrics(firstMetrics);
+      const secondCausality = getCausalityMetrics(secondMetrics);
       const secondPositions = getGlbPositions(join(secondOutputDir, 'refined.glb'));
 
       expect(firstMetrics.preprocess).toEqual(secondMetrics.preprocess);
@@ -1775,18 +1852,20 @@ describe('UltraShape runtime flow', () => {
           attribution_signature: expect.any(Number),
         }),
       );
-      expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
-      expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
-      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
-      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
-      expect(firstMetrics.gate).not.toEqual(secondMetrics.gate);
+      expect(firstCausality.image_fingerprint).toBe(secondCausality.image_fingerprint);
+      expect(firstCausality.checkpoint_fingerprint).toBe(secondCausality.checkpoint_fingerprint);
+      expect(firstCausality.mesh_fingerprint).not.toBe(secondCausality.mesh_fingerprint);
+      expect(firstCausality.context_fingerprint).not.toBe(secondCausality.context_fingerprint);
+      expect(firstCausality.latent_fingerprint).not.toBe(secondCausality.latent_fingerprint);
+      expect(firstCausality.field_fingerprint).not.toBe(secondCausality.field_fingerprint);
+      expect(firstCausality.geometry_fingerprint).not.toBe(secondCausality.geometry_fingerprint);
       expect(firstPositions).not.toEqual(secondPositions);
     } finally {
       fixture.cleanup();
     }
   });
 
-  it('changes image-conditioned downstream metadata when only the reference image changes', () => {
+  it('image-only variation changes geometry and causality fingerprints', () => {
     const fixture = createFixtureWorkspace();
 
     try {
@@ -1806,13 +1885,16 @@ describe('UltraShape runtime flow', () => {
         seed: 7,
         preserve_scale: true,
       });
+      const firstPositions = getGlbPositions(join(fixture.outputDir, 'refined.glb'));
 
       writeFileSync(fixture.referenceImage, createReferenceImageBytes('b'));
+      const secondOutputDir = join(fixture.root, 'output-image-b');
+      mkdirSync(secondOutputDir);
 
       const secondOutcome = runLocalRunner({
         reference_image: fixture.referenceImage,
         coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
+        output_dir: secondOutputDir,
         output_format: 'glb',
         checkpoint: null,
         config_path: fixture.configPath,
@@ -1826,6 +1908,9 @@ describe('UltraShape runtime flow', () => {
 
       const firstMetrics = getRunnerMetrics(firstOutcome);
       const secondMetrics = getRunnerMetrics(secondOutcome);
+      const firstCausality = getCausalityMetrics(firstMetrics);
+      const secondCausality = getCausalityMetrics(secondMetrics);
+      const secondPositions = getGlbPositions(join(secondOutputDir, 'refined.glb'));
 
       expect(firstMetrics.preprocess).toEqual(
         expect.objectContaining({
@@ -1848,12 +1933,14 @@ describe('UltraShape runtime flow', () => {
           attribution_signature: expect.any(Number),
         }),
       );
-      expect(firstMetrics.preprocess).not.toEqual(secondMetrics.preprocess);
-      expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
-      expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
-      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
-      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
-      expect(firstMetrics.gate).not.toEqual(secondMetrics.gate);
+      expect(firstCausality.mesh_fingerprint).toBe(secondCausality.mesh_fingerprint);
+      expect(firstCausality.checkpoint_fingerprint).toBe(secondCausality.checkpoint_fingerprint);
+      expect(firstCausality.image_fingerprint).not.toBe(secondCausality.image_fingerprint);
+      expect(firstCausality.context_fingerprint).not.toBe(secondCausality.context_fingerprint);
+      expect(firstCausality.latent_fingerprint).not.toBe(secondCausality.latent_fingerprint);
+      expect(firstCausality.field_fingerprint).not.toBe(secondCausality.field_fingerprint);
+      expect(firstCausality.geometry_fingerprint).not.toBe(secondCausality.geometry_fingerprint);
+      expect(firstPositions).not.toEqual(secondPositions);
     } finally {
       fixture.cleanup();
     }
@@ -1885,11 +1972,21 @@ describe('UltraShape runtime flow', () => {
           encoder: 'SingleImageEncoder',
           surface_vertex_count: 8,
           surface_face_count: 12,
-          image_token_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-          checkpoint_tensor_count: expect.any(Number),
-          checkpoint_value_count: expect.any(Number),
-          conditioning_signature: expect.any(Number),
+          context_token_count: expect.any(Number),
+          context_mask_token_count: expect.any(Number),
+          cfg_pairing: expect.objectContaining({
+            mode: 'classifier-free-guidance',
+            positive_context_tokens: expect.any(Number),
+            negative_context_tokens: expect.any(Number),
+          }),
+          conditioner_metadata: expect.objectContaining({
+            image_signature: expect.any(Number),
+            mesh_signature: expect.any(Number),
+            voxel_signature: expect.any(Number),
+            checkpoint_signature: expect.any(Number),
+            checkpoint_tensor_count: expect.any(Number),
+            checkpoint_value_count: expect.any(Number),
+          }),
           state_hydrated: true,
           hydration: expect.objectContaining({
             module: 'SingleImageEncoder',
@@ -1898,6 +1995,7 @@ describe('UltraShape runtime flow', () => {
           }),
         }),
       );
+      expect(getRunnerMetrics(outcome).conditioning).not.toHaveProperty('mask_tokens');
     } finally {
       fixture.cleanup();
     }
@@ -1947,16 +2045,41 @@ describe('UltraShape runtime flow', () => {
           family: 'flow-matching-euler-discrete',
           target: 'diffusers.FlowMatchEulerDiscreteScheduler',
           step_count: 12,
+          object_type: 'FlowMatchEulerDiscreteScheduler',
+          consumed_timesteps: expect.any(Array),
+          consumed_sigmas: expect.any(Array),
           sigma_start: expect.any(Number),
           sigma_end: expect.any(Number),
           timestep_signature: expect.any(Number),
         }),
       );
+      expect((firstMetrics.scheduler as Record<string, unknown>).consumed_timesteps).toHaveLength(12);
+      expect((firstMetrics.scheduler as Record<string, unknown>).consumed_sigmas).toHaveLength(12);
       expect(firstMetrics.denoise).toEqual(
         expect.objectContaining({
           model: 'RefineDiT',
-          scheduler_signature: expect.any(Number),
-          conditioning_signature: expect.any(Number),
+          inputs: expect.objectContaining({
+            latents: expect.objectContaining({
+              count: expect.any(Number),
+              signature: expect.any(Number),
+            }),
+            timestep: expect.objectContaining({
+              count: 12,
+              signature: expect.any(Number),
+            }),
+            context: expect.objectContaining({
+              count: expect.any(Number),
+              signature: expect.any(Number),
+            }),
+            context_mask: expect.objectContaining({
+              count: expect.any(Number),
+              signature: expect.any(Number),
+            }),
+            voxel_cond: expect.objectContaining({
+              voxel_count: expect.any(Number),
+              signature: expect.any(Number),
+            }),
+          }),
           timestep_count: 12,
           state_hydrated: true,
           hydration: expect.objectContaining({
@@ -1964,6 +2087,12 @@ describe('UltraShape runtime flow', () => {
             load_style: 'load_state_dict',
             strict: false,
           }),
+        }),
+      );
+      expect(firstMetrics.denoise).not.toEqual(
+        expect.objectContaining({
+          scheduler_signature: expect.any(Number),
+          conditioning_signature: expect.any(Number),
         }),
       );
       expect(firstMetrics.scheduler).not.toEqual(secondMetrics.scheduler);
@@ -2019,8 +2148,20 @@ describe('UltraShape runtime flow', () => {
         expect.objectContaining({
           event: 'set_timesteps',
           step_count: 30,
+          timesteps: expect.any(Array),
         }),
       );
+      const diffusersTrace = JSON.parse(readFileSync(diffusersTracePath, 'utf8')) as {
+        timesteps: number[];
+      };
+      expect(metrics.scheduler).toEqual(
+        expect.objectContaining({
+          object_type: 'FlowMatchEulerDiscreteScheduler',
+          consumed_timesteps: diffusersTrace.timesteps,
+          consumed_sigmas: expect.any(Array),
+        }),
+      );
+      expect(((metrics.scheduler as Record<string, unknown>).consumed_sigmas as unknown[])).toHaveLength(diffusersTrace.timesteps.length);
       expect(JSON.parse(readFileSync(cubvhTracePath, 'utf8'))).toEqual(
         expect.objectContaining({
           coords_type: 'Tensor',
@@ -2037,6 +2178,20 @@ describe('UltraShape runtime flow', () => {
       expect(cubvhTrace.coords).toBeGreaterThanOrEqual(64);
       expect(cubvhTrace.corners).toBe(cubvhTrace.coords);
       expect((metrics.decode as Record<string, unknown>).cell_count).toBeGreaterThanOrEqual(64);
+      expect(metrics.decode).toEqual(
+        expect.objectContaining({
+          authority: 'field_logits',
+          field_value_count: expect.any(Number),
+          corner_signature: expect.any(Number),
+        }),
+      );
+      expect(metrics.extract).toEqual(
+        expect.objectContaining({
+          authority: 'decoded_field',
+          source_field_signature: (metrics.decode as Record<string, unknown>).field_signature,
+          source_corner_signature: (metrics.decode as Record<string, unknown>).corner_signature,
+        }),
+      );
     } finally {
       fixture.cleanup();
     }
@@ -2174,7 +2329,7 @@ describe('UltraShape runtime flow', () => {
     }
   });
 
-  it('changes checkpoint-backed refine metrics and output bytes when only checkpoint subtree content changes', () => {
+  it('checkpoint-only variation changes geometry and causality fingerprints', () => {
     const fixture = createFixtureWorkspace();
 
     try {
@@ -2215,10 +2370,16 @@ describe('UltraShape runtime flow', () => {
       });
       const firstMetrics = getRunnerMetrics(firstOutcome);
       const secondMetrics = getRunnerMetrics(secondOutcome);
+      const firstCausality = getCausalityMetrics(firstMetrics);
+      const secondCausality = getCausalityMetrics(secondMetrics);
+      const firstPositions = getGlbPositions(join(fixture.outputDir, 'refined.glb'));
+      const secondPositions = getGlbPositions(join(secondOutputDir, 'refined.glb'));
 
       expect(firstMetrics.conditioning).toEqual(
         expect.objectContaining({
-          checkpoint_signature: expect.any(Number),
+          conditioner_metadata: expect.objectContaining({
+            checkpoint_signature: expect.any(Number),
+          }),
         }),
       );
       expect(firstMetrics.denoise).toEqual(
@@ -2242,9 +2403,14 @@ describe('UltraShape runtime flow', () => {
           attribution_signature: expect.any(Number),
         }),
       );
-      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
-      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
-      expect(firstMetrics.gate).not.toEqual(secondMetrics.gate);
+      expect(firstCausality.image_fingerprint).toBe(secondCausality.image_fingerprint);
+      expect(firstCausality.mesh_fingerprint).toBe(secondCausality.mesh_fingerprint);
+      expect(firstCausality.checkpoint_fingerprint).not.toBe(secondCausality.checkpoint_fingerprint);
+      expect(firstCausality.context_fingerprint).not.toBe(secondCausality.context_fingerprint);
+      expect(firstCausality.latent_fingerprint).not.toBe(secondCausality.latent_fingerprint);
+      expect(firstCausality.field_fingerprint).not.toBe(secondCausality.field_fingerprint);
+      expect(firstCausality.geometry_fingerprint).not.toBe(secondCausality.geometry_fingerprint);
+      expect(firstPositions).not.toEqual(secondPositions);
     } finally {
       fixture.cleanup();
     }

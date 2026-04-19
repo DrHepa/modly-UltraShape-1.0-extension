@@ -13,6 +13,33 @@ from .utils import blend_sequences, bytes_to_unit_floats, clamp_unit, stable_sig
 PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
 
 
+class _CompatState(dict):
+    def __init__(self, *args, compat: dict[str, object] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._compat = compat or {}
+
+    def _resolve(self, key: str):
+        value = self._compat[key]
+        return value(self) if callable(value) else value
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.get(self, key, default)
+        if key in self._compat:
+            return self._resolve(key)
+        return default
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        if key in self._compat:
+            return self._resolve(key)
+        raise KeyError(key)
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or key in self._compat
+
+
 class ReferencePreprocessError(Exception):
     code = 'LOCAL_RUNTIME_UNAVAILABLE'
 
@@ -30,7 +57,8 @@ class ImageProcessorV2:
         mask_tokens = image_data['mask_features']
         conditioning_tokens = blend_sequences(image_tokens, mask_tokens)[:8]
 
-        return {
+        conditioning_tokens = blend_sequences(image_tokens, mask_tokens)[:8]
+        return _CompatState({
             'path': str(asset_path),
             'processor': self.__class__.__name__,
             'byte_length': len(processed_bytes),
@@ -40,14 +68,11 @@ class ImageProcessorV2:
             'source_format': image_data['source_format'],
             'image_tensor': image_data['image_tensor'],
             'image_tensor_shape': image_data['image_tensor_shape'],
+            'mask_tensor': image_data['mask_tensor'],
+            'mask_tensor_shape': image_data['mask_tensor_shape'],
+            'image_meta': image_data['image_meta'],
             'image_features': image_tokens,
             'mask_features': mask_tokens,
-            'tokens': conditioning_tokens,
-            'image_tokens': image_tokens,
-            'mask_tokens': mask_tokens,
-            'image_signature': stable_signature(image_tokens),
-            'mask_signature': stable_signature(mask_tokens),
-            'signature': stable_signature(conditioning_tokens),
             'mean_intensity': image_data['mean_intensity'],
             'mask_coverage': image_data['mask_coverage'],
             'cutout_applied': cutout_applied,
@@ -57,7 +82,14 @@ class ImageProcessorV2:
                 'mask_coverage': image_data['mask_coverage'],
                 'cutout_applied': cutout_applied,
             },
-        }
+        }, compat={
+            'tokens': lambda state: conditioning_tokens,
+            'image_tokens': lambda state: list(state['image_features']),
+            'mask_tokens': lambda state: list(state['mask_features']),
+            'image_signature': lambda state: stable_signature(state['image_features']),
+            'mask_signature': lambda state: stable_signature(state['mask_features']),
+            'signature': lambda state: stable_signature(conditioning_tokens),
+        })
 
 
 def normalize_reference_asset(path: str) -> dict[str, object]:
@@ -166,6 +198,7 @@ def _build_image_data(
     rgba_pixels: list[list[float]], *, width: int, height: int, source_format: str
 ) -> dict[str, object]:
     image_tensor = [[[list(pixel) for pixel in rgba_pixels[(row * width) : ((row + 1) * width)]] for row in range(height)]]
+    mask_tensor = [[[[pixel[3]] for pixel in rgba_pixels[(row * width) : ((row + 1) * width)]] for row in range(height)]]
     image_features = _pool_image_features(rgba_pixels, width, height)
     mask_features = _pool_mask_features(rgba_pixels, width, height)
     mean_intensity = clamp_unit(sum(_pixel_luminance(pixel) for pixel in rgba_pixels) / len(rgba_pixels) if rgba_pixels else 0.0)
@@ -175,6 +208,14 @@ def _build_image_data(
         'pixel_count': len(rgba_pixels),
         'image_tensor': image_tensor,
         'image_tensor_shape': [1, height, width, 4],
+        'mask_tensor': mask_tensor,
+        'mask_tensor_shape': [1, height, width, 1],
+        'image_meta': {
+            'width': width,
+            'height': height,
+            'pixel_count': len(rgba_pixels),
+            'source_format': source_format,
+        },
         'image_features': image_features,
         'mask_features': mask_features,
         'mean_intensity': mean_intensity,

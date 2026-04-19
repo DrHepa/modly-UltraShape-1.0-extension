@@ -13,6 +13,33 @@ JSON_CHUNK_TYPE = 0x4E4F534A
 BIN_CHUNK_TYPE = 0x004E4942
 
 
+class _CompatState(dict):
+    def __init__(self, *args, compat: dict[str, object] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._compat = compat or {}
+
+    def _resolve(self, key: str):
+        value = self._compat[key]
+        return value(self) if callable(value) else value
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.get(self, key, default)
+        if key in self._compat:
+            return self._resolve(key)
+        return default
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        if key in self._compat:
+            return self._resolve(key)
+        raise KeyError(key)
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or key in self._compat
+
+
 def _read_glb_chunks(payload: bytes) -> tuple[dict[str, object] | None, bytes | None]:
     if len(payload) < 20 or payload[:4] != GLB_MAGIC:
         return None, None
@@ -180,15 +207,16 @@ def mesh_geometry_from_glb(payload: bytes) -> dict[str, object]:
     bounds = _bounds(vertices)
     point_values = [axis for vertex in vertices for axis in vertex]
     geometry_tokens = [clamp_unit((axis + 1.5) / 3.0) for axis in point_values[:24]]
-    return {
+    return _CompatState({
         'vertices': vertices,
         'faces': faces,
         'bounds': bounds,
         'vertex_count': len(vertices),
         'face_count': len(faces),
-        'tokens': geometry_tokens,
-        'signature': stable_signature(geometry_tokens),
-    }
+    }, compat={
+        'tokens': lambda state: list(geometry_tokens),
+        'signature': lambda state: stable_signature(geometry_tokens),
+    })
 
 
 def _triangle_centroid(
@@ -251,15 +279,20 @@ def voxelize_from_point(mesh_payload: dict[str, object], *, resolution: int = 12
         voxel_tokens.extend([coord / max(resolution, 1) for coord in coords])
         voxel_tokens.append(count / max(len(points), 1))
     voxel_signature = stable_signature([round(value, 6) for value in voxel_tokens[:24]])
-    return {
+    compat_tokens = [round(value, 6) for value in voxel_tokens[:8]]
+    voxel_signature = stable_signature([round(value, 6) for value in voxel_tokens[:24]])
+    return _CompatState({
         'voxelizer': 'voxelize_from_point',
         'resolution': resolution,
         'surface_point_count': len(points),
-        'voxel_coords': voxel_coords,
-        'voxel_values': voxel_values,
+        'coords': voxel_coords,
+        'occupancies': voxel_values,
         'voxel_count': len(occupied),
         'bounds': bounds,
-        'tokens': [round(value, 6) for value in voxel_tokens[:8]],
-        'voxel_signature': voxel_signature,
         'occupied_ratio': clamp_unit(len(occupied) / max(len(points), 1)),
-    }
+    }, compat={
+        'voxel_coords': lambda state: list(state['coords']),
+        'voxel_values': lambda state: list(state['occupancies']),
+        'tokens': lambda state: list(compat_tokens),
+        'voxel_signature': lambda state: voxel_signature,
+    })

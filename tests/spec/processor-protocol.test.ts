@@ -625,7 +625,148 @@ function runLocalRunner(
   };
 }
 
+function runPythonSnippet(source: string, args: string[] = [], pythonPathEntries: string[] = []) {
+  return spawnSync('python3', ['-c', source, ...args], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PYTHONPATH: [...pythonPathEntries, resolve(repoRoot, 'runtime', 'vendor'), process.env.PYTHONPATH]
+        .filter(Boolean)
+        .join(':'),
+    },
+  });
+}
+
 describe('UltraShape processor.py protocol', () => {
+  it('exposes tensor-first preprocess and surface state without first-class synthetic token keys', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      const outcome = runPythonSnippet(
+        [
+          'import json, sys',
+          'from ultrashape_runtime.preprocessors import ImageProcessorV2',
+          'from ultrashape_runtime.surface_loaders import SharpEdgeSurfaceLoader',
+          'reference_asset = ImageProcessorV2().process(sys.argv[1])',
+          'surface_state = SharpEdgeSurfaceLoader().load(sys.argv[2])',
+          'payload = {',
+          '  "preprocess_keys": sorted(reference_asset.keys()),',
+          '  "surface_keys": sorted(surface_state.keys()),',
+          '  "mesh_keys": sorted(surface_state["mesh"].keys()),',
+          '  "voxel_keys": sorted(surface_state["voxel_cond"].keys()),',
+          '  "image_tensor_shape": reference_asset.get("image_tensor_shape"),',
+          '  "mask_tensor_shape": reference_asset.get("mask_tensor_shape"),',
+          '  "image_meta": reference_asset.get("image_meta"),',
+          '}',
+          'print(json.dumps(payload))',
+        ].join('\n'),
+        [fixture.referenceImage, fixture.namedCoarseMesh],
+        [join(fixture.root, 'py-stubs')],
+      );
+
+      expect(outcome.status).toBe(0);
+      const payload = JSON.parse(outcome.stdout) as Record<string, unknown>;
+      expect(payload.preprocess_keys).toEqual(
+        expect.arrayContaining(['image_meta', 'image_tensor', 'image_tensor_shape', 'mask_tensor', 'mask_tensor_shape']),
+      );
+      expect(payload.preprocess_keys).not.toEqual(
+        expect.arrayContaining(['tokens', 'image_tokens', 'mask_tokens']),
+      );
+      expect(payload.surface_keys).toEqual(expect.arrayContaining(['mesh', 'sampled_surface_points', 'voxel_cond']));
+      expect(payload.mesh_keys).toEqual(
+        expect.arrayContaining(['bounds', 'faces', 'sampled_surface_points', 'surface_point_count', 'vertex_count', 'vertices']),
+      );
+      expect(payload.mesh_keys).not.toEqual(expect.arrayContaining(['tokens']));
+      expect(payload.voxel_keys).toEqual(
+        expect.arrayContaining(['bounds', 'coords', 'occupancies', 'occupied_ratio', 'resolution', 'surface_point_count']),
+      );
+      expect(payload.voxel_keys).not.toEqual(expect.arrayContaining(['tokens', 'voxel_coords', 'voxel_values']));
+      expect(payload.image_tensor_shape).toEqual([1, 2, 2, 4]);
+      expect(payload.mask_tensor_shape).toEqual([1, 2, 2, 1]);
+      expect(payload.image_meta).toEqual(
+        expect.objectContaining({
+          width: 2,
+          height: 2,
+          pixel_count: 4,
+          source_format: 'png',
+        }),
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('exposes a real conditioner contract with cfg-ready context and traceable source metadata', () => {
+    const fixture = createFixtureWorkspace();
+    const checkpointPath = join(fixture.root, 'ultrashape_v1.pt');
+    writeBinaryCheckpointBundle(checkpointPath, checkpointBundlePayload());
+
+    try {
+      const outcome = runPythonSnippet(
+        [
+          'import json, sys',
+          'from ultrashape_runtime.preprocessors import ImageProcessorV2',
+          'from ultrashape_runtime.surface_loaders import SharpEdgeSurfaceLoader',
+          'from ultrashape_runtime.models.conditioner_mask import SingleImageEncoder',
+          'from ultrashape_runtime.utils.checkpoint import load_checkpoint_subtrees',
+          'reference_asset = ImageProcessorV2().process(sys.argv[1])',
+          'surface_state = SharpEdgeSurfaceLoader().load(sys.argv[2])',
+          'checkpoint_bundle = load_checkpoint_subtrees(sys.argv[3], None, sys.argv[4])',
+          'conditioning = SingleImageEncoder(checkpoint_state=checkpoint_bundle["bundle"]["conditioner"]).build(',
+          '  reference_asset=reference_asset,',
+          '  coarse_surface=surface_state,',
+          ')',
+          'payload = {',
+          '  "conditioning_keys": sorted(conditioning.keys()),',
+          '  "metadata_keys": sorted(conditioning["metadata"].keys()),',
+          '  "context_length": len(conditioning["context"]),',
+          '  "context_mask_length": len(conditioning["context_mask"]),',
+          '  "cfg_pairing": conditioning["cfg_pairing"],',
+          '  "metadata": conditioning["metadata"],',
+          '}',
+          'print(json.dumps(payload))',
+        ].join('\n'),
+        [fixture.referenceImage, fixture.namedCoarseMesh, checkpointPath, fixture.root],
+        [join(fixture.root, 'py-stubs')],
+      );
+
+      expect(outcome.status).toBe(0);
+      const payload = JSON.parse(outcome.stdout) as Record<string, unknown>;
+      expect(payload.conditioning_keys).toEqual(
+        expect.arrayContaining(['cfg_pairing', 'context', 'context_mask', 'metadata']),
+      );
+      expect(payload.conditioning_keys).not.toEqual(
+        expect.arrayContaining(['tokens', 'mask_tokens', 'image_token_signature', 'conditioning_signature']),
+      );
+      expect(payload.metadata_keys).toEqual(
+        expect.arrayContaining(['checkpoint_signature', 'image_signature', 'mesh_signature', 'voxel_signature']),
+      );
+      expect(payload.context_length).toEqual(expect.any(Number));
+      expect(Number(payload.context_length)).toBeGreaterThan(0);
+      expect(payload.context_mask_length).toBe(payload.context_length);
+      expect(payload.cfg_pairing).toEqual(
+        expect.objectContaining({
+          mode: 'classifier-free-guidance',
+          positive_context_tokens: expect.any(Number),
+          negative_context_tokens: expect.any(Number),
+        }),
+      );
+      expect(payload.metadata).toEqual(
+        expect.objectContaining({
+          image_signature: expect.any(Number),
+          mesh_signature: expect.any(Number),
+          voxel_signature: expect.any(Number),
+          checkpoint_signature: expect.any(Number),
+          voxel_count: expect.any(Number),
+          surface_point_count: expect.any(Number),
+        }),
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it('rejects deferred backend requests as invalid processor params under the local-only shell', () => {
     const fixture = createFixtureWorkspace();
 
@@ -988,9 +1129,21 @@ describe('UltraShape processor.py protocol', () => {
           }),
           conditioning: expect.objectContaining({
             voxel_count: expect.any(Number),
-            mask_tokens: expect.any(Number),
-            checkpoint_tensor_count: expect.any(Number),
-            checkpoint_value_count: expect.any(Number),
+            context_token_count: expect.any(Number),
+            context_mask_token_count: expect.any(Number),
+            cfg_pairing: expect.objectContaining({
+              mode: 'classifier-free-guidance',
+              positive_context_tokens: expect.any(Number),
+              negative_context_tokens: expect.any(Number),
+            }),
+            conditioner_metadata: expect.objectContaining({
+              checkpoint_signature: expect.any(Number),
+              checkpoint_tensor_count: expect.any(Number),
+              checkpoint_value_count: expect.any(Number),
+              image_signature: expect.any(Number),
+              mesh_signature: expect.any(Number),
+              voxel_signature: expect.any(Number),
+            }),
             state_hydrated: true,
             hydration: expect.objectContaining({
               module: 'SingleImageEncoder',
@@ -1005,9 +1158,32 @@ describe('UltraShape processor.py protocol', () => {
             sigma_end: expect.any(Number),
           }),
           denoise: expect.objectContaining({
+            model: 'RefineDiT',
             attention: expect.any(String),
+            checkpoint_signature: expect.any(Number),
+            inputs: expect.objectContaining({
+              latents: expect.objectContaining({
+                count: expect.any(Number),
+                signature: expect.any(Number),
+              }),
+              timestep: expect.objectContaining({
+                count: 30,
+                signature: expect.any(Number),
+              }),
+              context: expect.objectContaining({
+                count: expect.any(Number),
+                signature: expect.any(Number),
+              }),
+              context_mask: expect.objectContaining({
+                count: expect.any(Number),
+                signature: expect.any(Number),
+              }),
+              voxel_cond: expect.objectContaining({
+                voxel_count: expect.any(Number),
+                signature: expect.any(Number),
+              }),
+            }),
             latent_signature: expect.any(Number),
-            conditioning_signature: expect.any(Number),
             timestep_count: 30,
             state_hydrated: true,
             hydration: expect.objectContaining({
@@ -1030,6 +1206,11 @@ describe('UltraShape processor.py protocol', () => {
             extractor: expect.any(String),
             payload_bytes: expect.any(Number),
           }),
+        }),
+      );
+      expect(metrics.denoise).not.toEqual(
+        expect.objectContaining({
+          conditioning_signature: expect.any(Number),
         }),
       );
       expect(Number(metrics.rms)).toBeGreaterThan(0.01);

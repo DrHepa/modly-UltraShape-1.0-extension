@@ -569,6 +569,10 @@ class MCSurfaceExtractor:
         if not isinstance(field_signature, int):
             raise SurfaceExtractionError('decoded_volume.field_signature must be an integer.')
 
+        corner_signature = decoded_volume.get('corner_signature') if isinstance(decoded_volume.get('corner_signature'), int) else None
+        if not isinstance(corner_signature, int):
+            raise SurfaceExtractionError('decoded_volume.corner_signature must be an integer.')
+
         iso = decoded_volume.get('iso', 0.0)
         if not isinstance(iso, (int, float)):
             raise SurfaceExtractionError('decoded_volume.iso must be numeric.')
@@ -636,11 +640,14 @@ class MCSurfaceExtractor:
         return {
             'extractor': self.extractor,
             'marching_cubes': self.extractor,
+            'authority': 'decoded_field',
             'preserve_scale': preserve_scale,
             'payload': renderable_payload,
             'reference_bytes': reference_asset['byte_length'],
             'payload_bytes': 0,
             'source_cell_count': len(normalized_coords),
+            'source_field_signature': field_signature,
+            'source_corner_signature': corner_signature,
             'surface_signature': surface_signature,
             'vertex_count': len(vertices),
             'face_count': len(faces),

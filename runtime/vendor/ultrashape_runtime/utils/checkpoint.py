@@ -94,13 +94,18 @@ def load_checkpoint_subtrees(
         compact_tokens = subtree_tokens[:MAX_TENSOR_SAMPLES]
         summary_tokens.extend(compact_tokens)
         value_count += subtree_value_count
+        state_dict_metadata = {
+            'tensor_count': len(tensors),
+            'value_count': subtree_value_count,
+            'tensor_names': sorted(tensors.keys()),
+        }
         bundle[name] = {
             'state_dict': dict(subtree),
+            'state_dict_metadata': state_dict_metadata,
             'tensors': tensors,
             'representation': 'checkpoint-subtree-v1',
             'tensor_count': len(tensors),
             'value_count': subtree_value_count,
-            'tokens': compact_tokens,
             'signature': stable_signature(compact_tokens),
             'evidence': {
                 'tensor_count': len(tensors),
