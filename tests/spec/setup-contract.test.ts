@@ -58,6 +58,13 @@ type SetupSummary = {
     cubvh_required: boolean;
     flash_attn_optional: boolean;
   };
+  native_install: {
+    cubvh: {
+      commands: string[];
+      pinned_ref: string;
+      source: string;
+    };
+  };
 };
 
 type SetupReadiness = {
@@ -205,6 +212,35 @@ describe('UltraShape setup.py contract', () => {
       expect(readiness.missing_degradable).toEqual([]);
       expect(readiness.failure_stage).toBeNull();
       expect(readiness.failure_code).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('bootstraps the cubvh build backend before the pinned source install', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ultrashape-cubvh-bootstrap-'));
+    const installDir = join(root, 'extension-root');
+    const weightPath = join(installDir, 'models', 'ultrashape', 'ultrashape_v1.pt');
+    mkdirSync(join(installDir, 'models', 'ultrashape'), { recursive: true });
+    writeFileSync(weightPath, 'test-weight');
+
+    try {
+      const outcome = runSetup({
+        python_exe: 'python3',
+        ext_dir: installDir,
+        gpu_sm: 90,
+        cuda_version: 12.8,
+      });
+
+      expect(outcome.status).toBe(0);
+
+      const { summary } = readSetupArtifacts(installDir);
+      expect(summary.native_install.cubvh.commands).toEqual([
+        expect.stringContaining('-m pip install --upgrade pip setuptools wheel'),
+        expect.stringContaining('-m pip install --no-build-isolation git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f'),
+      ]);
+      expect(summary.native_install.cubvh.source).toBe('git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f');
+      expect(summary.native_install.cubvh.pinned_ref).toBe('7855c000f95e43742081060d869702b2b2b33d1f');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

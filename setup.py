@@ -656,6 +656,13 @@ def build_cubvh_import_failure(overrides: dict[str, object]) -> tuple[dict[str, 
     )
 
 
+def build_cubvh_stage_commands(venv_python: Path) -> list[list[str]]:
+    return [
+        [str(venv_python), '-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'],
+        [str(venv_python), '-m', 'pip', 'install', '--no-build-isolation', CUBVH_SOURCE],
+    ]
+
+
 def build_flash_attn_stage_summary(
     *,
     attempted: bool,
@@ -678,8 +685,8 @@ def build_flash_attn_stage_summary(
 
 def install_cubvh_stage(venv_dir: Path, ext_dir: str, profile: dict[str, str]) -> tuple[dict[str, object], dict[str, object] | None]:
     venv_python = get_venv_python(venv_dir)
-    command = [str(venv_python), '-m', 'pip', 'install', '--no-build-isolation', CUBVH_SOURCE]
-    rendered_command = render_command(command)
+    commands = build_cubvh_stage_commands(venv_python)
+    rendered_commands = [render_command(command) for command in commands]
     cuda_toolkit = resolve_expected_cuda_toolkit(profile)
     stage_environment, environment_overrides = build_cuda_environment(cuda_toolkit.get('root'))
     stage_cuda_toolkit = {
@@ -698,14 +705,15 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: str, profile: dict[str, str]) -
             site_packages.mkdir(parents=True, exist_ok=True)
             create_stub_package(site_packages, 'cubvh')
     else:
-        subprocess.run(command, check=True, env=stage_environment)
+        for command in commands:
+            subprocess.run(command, check=True, env=stage_environment)
 
     import_smoke_missing = run_import_smoke(venv_dir, ext_dir, ['cubvh'])
     if import_smoke_missing:
         stage_summary = build_cubvh_stage_summary(
             attempted=True,
             status='blocked',
-            commands=[rendered_command],
+            commands=rendered_commands,
             cuda_toolkit=stage_cuda_toolkit,
             import_smoke_missing=import_smoke_missing,
             failure_message=CUBVH_IMPORT_FAILURE_MESSAGE,
@@ -716,7 +724,7 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: str, profile: dict[str, str]) -
         build_cubvh_stage_summary(
             attempted=True,
             status='ready',
-            commands=[rendered_command],
+            commands=rendered_commands,
             cuda_toolkit=stage_cuda_toolkit,
         ),
         None,
