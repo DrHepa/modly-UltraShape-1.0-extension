@@ -1,315 +1,138 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-const processorPath = resolve(process.cwd(), 'processor.py');
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const processorPath = path.join(repoRoot, 'processor.py');
 
-function createFixtureWorkspace() {
-  const root = mkdtempSync(join(tmpdir(), 'ultrashape-refiner-'));
-  const outputDir = join(root, 'output');
-  mkdirSync(outputDir);
-
-  const referenceImage = join(root, 'reference.png');
-  const coarseMesh = join(root, 'coarse.glb');
-
-  writeFileSync(referenceImage, 'image');
-  writeFileSync(coarseMesh, 'mesh');
-
-  return {
-    root,
-    outputDir,
-    referenceImage,
-    coarseMesh,
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+function runProcessor(args: string[], payload: unknown) {
+  return spawnSync('python3', [processorPath, ...args], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    input: JSON.stringify(payload),
+  });
 }
 
-function parseEvents(stdout: string) {
-  return stdout
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
-}
+describe('processor request contract', () => {
+  it('accepts the preferred top-level shell truth directly', () => {
+    const result = runProcessor(['--validate-request'], {
+      reference_image: 'inputs/reference.png',
+      coarse_mesh: 'inputs/coarse.glb',
+    });
 
-describe('UltraShape request contract', () => {
-  it('reads exactly one JSON object line from stdin, prioritizes named inputs, and ignores trailing lines', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      const outcome = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input:
-          `${JSON.stringify({
-            input: {
-              filePath: join(fixture.root, 'missing-reference.png'),
-              inputs: {
-                reference_image: { filePath: fixture.referenceImage },
-                coarse_mesh: { filePath: fixture.coarseMesh },
-              },
-            },
-            params: { coarse_mesh: join(fixture.root, 'missing-fallback.glb') },
-            workspaceDir: fixture.outputDir,
-          })}\n${JSON.stringify({ should_be_ignored: true })}\n`,
-      });
-
-      const events = parseEvents(outcome.stdout);
-
-      expect(outcome.status).toBe(0);
-      expect(events.at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
-      });
-    } finally {
-      fixture.cleanup();
-    }
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: true,
+      normalized_request: {
+        reference_image: 'inputs/reference.png',
+        coarse_mesh: 'inputs/coarse.glb',
+      },
+    });
   });
 
-  it('fails fast when the secondary fallback payload omits params.coarse_mesh', () => {
-    const fixture = createFixtureWorkspace();
+  it('rejects requests missing the coarse mesh truthfully', () => {
+    const result = runProcessor(['--validate-request'], {
+      reference_image: 'inputs/reference.png',
+    });
 
-    try {
-      const outcome = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: { filePath: fixture.referenceImage },
-          params: {},
-          workspaceDir: fixture.outputDir,
-        })}\n`,
-      });
-
-      const events = parseEvents(outcome.stdout);
-
-      expect(outcome.status).toBe(0);
-      expect(events.at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('coarse_mesh'),
-        code: 'MISSING_INPUT',
-      });
-    } finally {
-      fixture.cleanup();
-    }
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'reference_image and coarse_mesh are both required for process-refiner requests.',
+      },
+    });
   });
 
-  it('rejects missing named inputs with field-specific public errors', () => {
-    const fixture = createFixtureWorkspace();
+  it('allows the temporary fallback seam only inside processor.py', () => {
+    const result = runProcessor(['--validate-request'], {
+      input: { filePath: 'inputs/reference.png' },
+      params: { coarse_mesh: 'inputs/coarse.glb' },
+    });
 
-    try {
-      const missingReference = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: {
-            inputs: {
-              coarse_mesh: { filePath: fixture.coarseMesh },
-            },
-          },
-          workspaceDir: fixture.outputDir,
-        })}\n`,
-      });
-      const missingCoarse = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: {
-            filePath: fixture.referenceImage,
-          },
-          workspaceDir: fixture.outputDir,
-        })}\n`,
-      });
-
-      expect(missingReference.status).toBe(0);
-      expect(parseEvents(missingReference.stdout).at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('reference_image'),
-        code: 'MISSING_INPUT',
-      });
-
-      expect(missingCoarse.status).toBe(0);
-      expect(parseEvents(missingCoarse.stdout).at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('coarse_mesh'),
-        code: 'MISSING_INPUT',
-      });
-    } finally {
-      fixture.cleanup();
-    }
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: true,
+      normalized_request: {
+        reference_image: 'inputs/reference.png',
+        coarse_mesh: 'inputs/coarse.glb',
+      },
+    });
   });
 
-  it('rejects invalid params before runtime starts', () => {
-    const fixture = createFixtureWorkspace();
+  it('prefers top-level values over fallback aliases when both are present', () => {
+    const result = runProcessor(['--validate-request'], {
+      reference_image: 'inputs/preferred-reference.png',
+      coarse_mesh: 'inputs/preferred-coarse.glb',
+      input: { filePath: 'inputs/fallback-reference.png' },
+      params: { coarse_mesh: 'inputs/fallback-coarse.glb' },
+    });
 
-    try {
-      const invalidSteps = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: {
-            inputs: {
-              reference_image: { filePath: fixture.referenceImage },
-              coarse_mesh: { filePath: fixture.coarseMesh },
-            },
-          },
-          params: {
-            steps: 0,
-          },
-          workspaceDir: fixture.outputDir,
-        })}\n`,
-      });
-      const invalidOutput = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: {
-            inputs: {
-              reference_image: { filePath: fixture.referenceImage },
-              coarse_mesh: { filePath: fixture.coarseMesh },
-            },
-          },
-          params: {
-            output_format: 'obj',
-          },
-          workspaceDir: fixture.outputDir,
-        })}\n`,
-      });
-
-      expect(invalidSteps.status).toBe(0);
-      expect(parseEvents(invalidSteps.stdout).at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('steps must be a positive integer'),
-        code: 'INVALID_PARAMS',
-      });
-
-      expect(invalidOutput.status).toBe(0);
-      expect(parseEvents(invalidOutput.stdout).at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('output_format must be glb'),
-        code: 'INVALID_PARAMS',
-      });
-    } finally {
-      fixture.cleanup();
-    }
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: true,
+      normalized_request: {
+        reference_image: 'inputs/preferred-reference.png',
+        coarse_mesh: 'inputs/preferred-coarse.glb',
+      },
+    });
   });
 
-  it('accepts both named-input and temporary fallback payload shapes up to runtime readiness checks', () => {
-    const fixture = createFixtureWorkspace();
+  it('rejects partially-fallback requests instead of mixing shell truths', () => {
+    const result = runProcessor(['--validate-request'], {
+      reference_image: 'inputs/reference.png',
+      params: { coarse_mesh: 'inputs/coarse.glb' },
+    });
 
-    try {
-      const namedOutcome = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: {
-            inputs: {
-              reference_image: { filePath: fixture.referenceImage },
-              coarse_mesh: { filePath: fixture.coarseMesh },
-            },
-          },
-          params: {
-            backend: 'local',
-            steps: 40,
-            guidance_scale: 6,
-            preserve_scale: false,
-            output_format: 'glb',
-          },
-          workspaceDir: fixture.outputDir,
-        })}\n`,
-      });
-      const fallbackOutcome = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: {
-            filePath: fixture.referenceImage,
-          },
-          params: {
-            coarse_mesh: fixture.coarseMesh,
-            backend: 'local',
-            steps: 40,
-            guidance_scale: 6,
-            preserve_scale: false,
-            output_format: 'glb',
-          },
-          workspaceDir: fixture.outputDir,
-        })}\n`,
-      });
-
-      expect(namedOutcome.status).toBe(0);
-      expect(parseEvents(namedOutcome.stdout).at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
-      });
-
-      expect(fallbackOutcome.status).toBe(0);
-      expect(parseEvents(fallbackOutcome.stdout).at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
-      });
-    } finally {
-      fixture.cleanup();
-    }
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'reference_image and coarse_mesh are both required for process-refiner requests.',
+      },
+    });
   });
 
-  it('rejects remote and hybrid backend values at the public processor boundary', () => {
-    const fixture = createFixtureWorkspace();
+  it('rejects unsupported params keys', () => {
+    const result = runProcessor(['--validate-request'], {
+      reference_image: 'inputs/reference.png',
+      coarse_mesh: 'inputs/coarse.glb',
+      params: {
+        backend: 'local',
+        unexpected: true,
+      },
+    });
 
-    try {
-      const remoteOutcome = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: {
-            inputs: {
-              reference_image: { filePath: fixture.referenceImage },
-              coarse_mesh: { filePath: fixture.coarseMesh },
-            },
-          },
-          params: {
-            backend: 'remote',
-          },
-          workspaceDir: fixture.outputDir,
-        })}\n`,
-      });
-      const hybridOutcome = spawnSync('python3', [processorPath], {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        input: `${JSON.stringify({
-          input: {
-            inputs: {
-              reference_image: { filePath: fixture.referenceImage },
-              coarse_mesh: { filePath: fixture.coarseMesh },
-            },
-          },
-          params: {
-            backend: 'hybrid',
-          },
-          workspaceDir: fixture.outputDir,
-        })}\n`,
-      });
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Unsupported params for the stable shell: unexpected.',
+      },
+    });
+  });
 
-      expect(remoteOutcome.status).toBe(0);
-      expect(parseEvents(remoteOutcome.stdout).at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('backend must be auto or local'),
-        code: 'INVALID_PARAMS',
-      });
+  it('rejects non-local backends', () => {
+    const result = runProcessor(['--validate-request'], {
+      reference_image: 'inputs/reference.png',
+      coarse_mesh: 'inputs/coarse.glb',
+      params: {
+        backend: 'remote',
+      },
+    });
 
-      expect(hybridOutcome.status).toBe(0);
-      expect(parseEvents(hybridOutcome.stdout).at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('backend must be auto or local'),
-        code: 'INVALID_PARAMS',
-      });
-    } finally {
-      fixture.cleanup();
-    }
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Only local execution is allowed in this clean-room shell.',
+      },
+    });
   });
 });

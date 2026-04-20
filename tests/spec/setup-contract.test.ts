@@ -1,248 +1,115 @@
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-const repoRoot = process.cwd();
-const setupPath = resolve(repoRoot, 'setup.py');
-const extractedPayloadPaths = [
-  'manifest.json',
-  'setup.py',
-  'processor.py',
-  'README.md',
-  'runtime/configs/infer_dit_refine.yaml',
-  'runtime/vendor/ultrashape_runtime/__init__.py',
-  'runtime/vendor/ultrashape_runtime/local_runner.py',
-  'runtime/vendor/ultrashape_runtime/pipelines.py',
-  'runtime/vendor/ultrashape_runtime/preprocessors.py',
-  'runtime/vendor/ultrashape_runtime/surface_loaders.py',
-  'runtime/vendor/ultrashape_runtime/schedulers.py',
-  'runtime/vendor/ultrashape_runtime/utils/__init__.py',
-  'runtime/vendor/ultrashape_runtime/utils/checkpoint.py',
-  'runtime/vendor/ultrashape_runtime/utils/voxelize.py',
-  'runtime/vendor/ultrashape_runtime/models/conditioner_mask.py',
-  'runtime/vendor/ultrashape_runtime/models/denoisers/__init__.py',
-  'runtime/vendor/ultrashape_runtime/models/denoisers/dit_mask.py',
-  'runtime/vendor/ultrashape_runtime/models/denoisers/moe_layers.py',
-  'runtime/vendor/ultrashape_runtime/models/autoencoders/__init__.py',
-  'runtime/vendor/ultrashape_runtime/models/autoencoders/model.py',
-  'runtime/vendor/ultrashape_runtime/models/autoencoders/attention_blocks.py',
-  'runtime/vendor/ultrashape_runtime/models/autoencoders/attention_processors.py',
-  'runtime/vendor/ultrashape_runtime/models/autoencoders/surface_extractors.py',
-  'runtime/vendor/ultrashape_runtime/models/autoencoders/volume_decoders.py',
-] as const;
+import { copyInstallSurface, repoRoot, stageCheckpoint, writeRuntimeStubModules } from './install-test-helpers.js';
 
-type InstallSurfaceSummary = {
-  layout: string;
-  entry: string;
-  backend_modes: string[];
-  resolved_backend: string;
-  output_formats: string[];
-  remote_hybrid_supported: boolean;
-};
-
-type SetupSummary = {
-  install_success: boolean;
-  install_ready: boolean;
-  runtime_ready: boolean;
-  runtime_closure_ready: boolean;
-  runtime_closure_reason: string | null;
-  failure_stage: string | null;
-  failure_code: string | null;
+type Readiness = {
+  backend: string;
+  checkpoint: string;
+  config_path: string;
+  ext_dir: string;
   missing_required: string[];
-  install_surface: InstallSurfaceSummary;
-  native_install_contract: {
-    order: string[];
-    cubvh_required: boolean;
-    flash_attn_optional: boolean;
-  };
-  native_install: {
-    cubvh: {
-      commands: string[];
-      pinned_ref: string;
-      source: string;
-    };
-  };
-};
-
-type SetupReadiness = {
-  status: string;
-  install_success: boolean;
-  install_ready: boolean;
-  runtime_ready: boolean;
-  runtime_closure_ready: boolean;
-  runtime_closure_reason: string | null;
-  weights_ready: boolean;
   required_imports_ok: boolean;
-  missing_required: string[];
-  missing_optional: string[];
-  missing_conditional: string[];
-  missing_degradable: string[];
-  failure_stage: string | null;
-  failure_code: string | null;
+  status: string;
+  weights_ready: boolean;
 };
 
-function runSetup(argument: Record<string, unknown>, cwd = repoRoot) {
-  return spawnSync('python3', [cwd === repoRoot ? setupPath : 'setup.py', JSON.stringify(argument)], {
+function runSetup(cwd: string, extDir: string, env: NodeJS.ProcessEnv = {}) {
+  return spawnSync('python3', ['-S', 'setup.py', '--ext-dir', extDir], {
     cwd,
     encoding: 'utf8',
     env: {
       ...process.env,
-      ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+      ...env,
     },
   });
 }
 
-function readSetupArtifacts(installDir: string) {
-  return {
-    summary: JSON.parse(readFileSync(join(installDir, '.setup-summary.json'), 'utf8')) as SetupSummary,
-    readiness: JSON.parse(readFileSync(join(installDir, '.runtime-readiness.json'), 'utf8')) as SetupReadiness,
-  };
+function readReadiness(extDir: string) {
+  return JSON.parse(readFileSync(path.join(extDir, '.runtime-readiness.json'), 'utf8')) as Readiness;
 }
 
-function copyFileOrDirectory(relativePath: string, installDir: string) {
-  cpSync(resolve(repoRoot, relativePath), resolve(installDir, relativePath), { recursive: true });
+function readSetupSummary(extDir: string) {
+  return readFileSync(path.join(extDir, '.setup-summary.json'), 'utf8');
 }
 
-describe('UltraShape setup.py contract', () => {
-  it('marks ext_dir installs runtime-ready when the stable shell includes the vendored upstream closure', () => {
-    const root = mkdtempSync(join(tmpdir(), 'ultrashape-setup-shell-'));
-    const installDir = join(root, 'extension-root');
-    const weightPath = join(installDir, 'models', 'ultrashape', 'ultrashape_v1.pt');
-    mkdirSync(join(installDir, 'models', 'ultrashape'), { recursive: true });
-    writeFileSync(weightPath, 'test-weight');
+describe('setup.py install truth', () => {
+  it('blocks readiness when required imports or the checkpoint are missing', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-contract-'));
+    const checkout = path.join(sandbox, 'repo');
+    copyInstallSurface(checkout);
 
     try {
-      const outcome = runSetup({
-        python_exe: 'python3',
-        ext_dir: installDir,
-        gpu_sm: 90,
-        cuda_version: 12.8,
-      });
+      const result = runSetup(checkout, checkout);
 
-      expect(outcome.status).toBe(0);
-      expect(existsSync(join(installDir, 'runtime', 'ultrashape_runtime', '__init__.py'))).toBe(true);
+      expect(result.status).toBe(1);
 
-      const { summary, readiness } = readSetupArtifacts(installDir);
-      expect(summary.install_success).toBe(true);
-      expect(summary.install_ready).toBe(true);
-      expect(summary.runtime_ready).toBe(true);
-      expect(summary.runtime_closure_ready).toBe(true);
-      expect(summary.runtime_closure_reason).toContain('clean-room upstream closure');
-      expect(summary.failure_stage).toBeNull();
-      expect(summary.failure_code).toBeNull();
-      expect(summary.missing_required).toEqual([]);
-      expect(summary.install_surface).toEqual({
-        layout: 'repo-root-python-only',
-        entry: 'processor.py',
-        backend_modes: ['auto', 'local'],
-        resolved_backend: 'local',
-        output_formats: ['glb'],
-        remote_hybrid_supported: false,
+      const readiness = readReadiness(checkout);
+      expect(readiness).toMatchObject({
+        backend: 'local',
+        ext_dir: checkout,
+        config_path: path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'),
+        checkpoint: path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'),
+        required_imports_ok: false,
+        weights_ready: false,
+        status: 'blocked',
       });
-      expect(summary.native_install_contract).toEqual({
-        order: ['core', 'cubvh', 'flash_attn'],
-        cubvh_required: true,
-        flash_attn_optional: true,
-      });
-
-      expect(readiness.status).toBe('ready');
-      expect(readiness.install_success).toBe(true);
-      expect(readiness.install_ready).toBe(true);
-      expect(readiness.runtime_ready).toBe(true);
-      expect(readiness.runtime_closure_ready).toBe(true);
-      expect(readiness.runtime_closure_reason).toContain('clean-room upstream closure');
-      expect(readiness.weights_ready).toBe(true);
-      expect(readiness.required_imports_ok).toBe(true);
-      expect(readiness.missing_required).toEqual([]);
-      expect(readiness.missing_optional).toEqual([]);
-      expect(readiness.missing_conditional).toEqual([]);
-      expect(readiness.missing_degradable).toEqual([]);
-      expect(readiness.failure_stage).toBeNull();
-      expect(readiness.failure_code).toBeNull();
+      expect(readiness.missing_required).toContain('import:torch');
+      expect(readiness.missing_required).toContain('weight:models/ultrashape/ultrashape_v1.pt');
+      expect(result.stdout).not.toContain('filePath');
+      expect(result.stdout).not.toContain('params.coarse_mesh');
+      expect(result.stdout).not.toContain('fallback');
+      expect(JSON.stringify(readiness)).not.toContain('filePath');
+      expect(JSON.stringify(readiness)).not.toContain('params.coarse_mesh');
+      expect(JSON.stringify(readiness)).not.toContain('fallback');
+      expect(readSetupSummary(checkout)).not.toContain('filePath');
+      expect(readSetupSummary(checkout)).not.toContain('params.coarse_mesh');
+      expect(readSetupSummary(checkout)).not.toContain('fallback');
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(sandbox, { recursive: true, force: true });
     }
   });
 
-  it('marks copied payload installs runtime-ready when the copied stable shell includes the vendored upstream closure', () => {
-    const root = mkdtempSync(join(tmpdir(), 'ultrashape-copied-shell-'));
-    const installDir = join(root, 'modly-UltraShape-1.0-extension');
-    const weightPath = join(root, 'weight-cache', 'models', 'ultrashape', 'ultrashape_v1.pt');
-    mkdirSync(join(root, 'weight-cache', 'models', 'ultrashape'), { recursive: true });
-    writeFileSync(weightPath, 'test-weight');
-
-    for (const relativePath of extractedPayloadPaths) {
-      copyFileOrDirectory(relativePath, installDir);
-    }
+  it('reports ready only when staged config, required imports, and weights are all present', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-ready-'));
+    const checkout = path.join(sandbox, 'repo');
+    const stubRoot = path.join(sandbox, 'stubs');
+    copyInstallSurface(checkout);
+    writeRuntimeStubModules(stubRoot);
+    stageCheckpoint(checkout);
 
     try {
-      const outcome = runSetup({
-        python_exe: 'python3',
-        ext_dir: installDir,
-        gpu_sm: 90,
-        required_weight_path: weightPath,
-      }, installDir);
+      const result = runSetup(checkout, checkout, { PYTHONPATH: stubRoot });
 
-      expect(outcome.status).toBe(0);
+      expect(result.status).toBe(0);
 
-      const { summary, readiness } = readSetupArtifacts(installDir);
-      expect(summary.install_success).toBe(true);
-      expect(summary.install_ready).toBe(true);
-      expect(summary.runtime_ready).toBe(true);
-      expect(summary.runtime_closure_ready).toBe(true);
-      expect(summary.runtime_closure_reason).toContain('clean-room upstream closure');
-      expect(summary.failure_stage).toBeNull();
-      expect(summary.failure_code).toBeNull();
-      expect(summary.missing_required).toEqual([]);
-
-      expect(readiness.status).toBe('ready');
-      expect(readiness.install_success).toBe(true);
-      expect(readiness.install_ready).toBe(true);
-      expect(readiness.runtime_ready).toBe(true);
-      expect(readiness.runtime_closure_ready).toBe(true);
-      expect(readiness.runtime_closure_reason).toContain('clean-room upstream closure');
-      expect(readiness.weights_ready).toBe(true);
-      expect(readiness.required_imports_ok).toBe(true);
-      expect(readiness.missing_required).toEqual([]);
-      expect(readiness.missing_optional).toEqual([]);
-      expect(readiness.missing_conditional).toEqual([]);
-      expect(readiness.missing_degradable).toEqual([]);
-      expect(readiness.failure_stage).toBeNull();
-      expect(readiness.failure_code).toBeNull();
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it('bootstraps the cubvh build backend before the pinned source install', () => {
-    const root = mkdtempSync(join(tmpdir(), 'ultrashape-cubvh-bootstrap-'));
-    const installDir = join(root, 'extension-root');
-    const weightPath = join(installDir, 'models', 'ultrashape', 'ultrashape_v1.pt');
-    mkdirSync(join(installDir, 'models', 'ultrashape'), { recursive: true });
-    writeFileSync(weightPath, 'test-weight');
-
-    try {
-      const outcome = runSetup({
-        python_exe: 'python3',
-        ext_dir: installDir,
-        gpu_sm: 90,
-        cuda_version: 12.8,
+      const readiness = readReadiness(checkout);
+      expect(readiness).toMatchObject({
+        backend: 'local',
+        ext_dir: checkout,
+        config_path: path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'),
+        checkpoint: path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'),
+        required_imports_ok: true,
+        weights_ready: true,
+        status: 'ready',
+        missing_required: [],
       });
-
-      expect(outcome.status).toBe(0);
-
-      const { summary } = readSetupArtifacts(installDir);
-      expect(summary.native_install.cubvh.commands).toEqual([
-        expect.stringContaining('-m pip install --upgrade pip setuptools wheel'),
-        expect.stringContaining('-m pip install --no-build-isolation git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f'),
-      ]);
-      expect(summary.native_install.cubvh.source).toBe('git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f');
-      expect(summary.native_install.cubvh.pinned_ref).toBe('7855c000f95e43742081060d869702b2b2b33d1f');
+      expect(existsSync(path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime', 'local_runner.py'))).toBe(true);
+      expect(result.stdout).not.toContain('filePath');
+      expect(result.stdout).not.toContain('params.coarse_mesh');
+      expect(result.stdout).not.toContain('fallback');
+      expect(JSON.stringify(readiness)).not.toContain('filePath');
+      expect(JSON.stringify(readiness)).not.toContain('params.coarse_mesh');
+      expect(JSON.stringify(readiness)).not.toContain('fallback');
+      expect(readSetupSummary(checkout)).not.toContain('filePath');
+      expect(readSetupSummary(checkout)).not.toContain('params.coarse_mesh');
+      expect(readSetupSummary(checkout)).not.toContain('fallback');
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(sandbox, { recursive: true, force: true });
     }
   });
 });

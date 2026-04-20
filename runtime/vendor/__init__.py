@@ -1,0 +1,1 @@
+"""Vendored runtime namespace package."""

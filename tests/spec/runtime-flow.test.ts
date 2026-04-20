@@ -1,2800 +1,346 @@
-import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { deflateSync } from 'node:zlib';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 import { describe, expect, it } from 'vitest';
 
-const repoRoot = process.cwd();
-const processorPath = resolve(repoRoot, 'processor.py');
-const runtimeVendorPath = resolve(repoRoot, 'runtime', 'vendor');
-const runtimeConfigSourcePath = resolve(repoRoot, 'runtime', 'configs', 'infer_dit_refine.yaml');
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const configPath = path.join(repoRoot, 'runtime/configs/infer_dit_refine.yaml');
+const runtimeVendorPath = path.join(repoRoot, 'runtime/vendor');
+const PNG_1X1_BASE64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==';
 
-function torchCheckpointStubSource() {
-  return [
-    '__version__ = "0.0-test"',
-    'import json',
-    'import zipfile',
-    '',
-    'int32 = "int32"',
-    'float32 = "float32"',
-    '',
-    'class Tensor:',
-    '    def __init__(self, values, dtype=None):',
-    '        self._values = values',
-    '        self.dtype = dtype',
-    '',
-    '    def int(self):',
-    '        return Tensor([[int(value) for value in row] for row in self._values], int32)',
-    '',
-    '    def float(self):',
-    '        return Tensor([[float(value) for value in row] for row in self._values], float32)',
-    '',
-    '    def __iter__(self):',
-    '        return iter(self._values)',
-    '',
-    '    def __len__(self):',
-    '        return len(self._values)',
-    '',
-    '    def __getitem__(self, index):',
-    '        return self._values[index]',
-    '',
-    '    def cpu(self):',
-    '        return self',
-    '',
-    '    def tolist(self):',
-    '        return [list(row) if isinstance(row, (list, tuple)) else row for row in self._values]',
-    '',
-    'def tensor(values, dtype=None):',
-    '    normalized = [list(row) for row in values]',
-    '    return Tensor(normalized, dtype)',
-    '',
-    'def load(path, map_location=None, weights_only=False):',
-    '    with zipfile.ZipFile(path, "r") as archive:',
-    '        return json.loads(archive.read("checkpoint.json").decode("utf8"))',
-    '',
-  ].join('\n');
-}
-
-function diffusersStubSource() {
-  return [
-    '__version__ = "0.0-test"',
-    'import json',
-    'import os',
-    'from pathlib import Path',
-    '',
-    'def _trace(payload):',
-    '    trace_path = os.environ.get("ULTRASHAPE_TEST_DIFFUSERS_TRACE_PATH")',
-    '    if not trace_path:',
-    '        return',
-    '    Path(trace_path).write_text(json.dumps(payload), encoding="utf8")',
-    '',
-    'class FlowMatchEulerDiscreteScheduler:',
-    '    def __init__(self, **config):',
-    '        self.config = dict(config)',
-    '        self.timesteps = []',
-    '        _trace({"event": "init", "config": self.config})',
-    '',
-    '    @classmethod',
-    '    def from_config(cls, config):',
-    '        payload = dict(config) if isinstance(config, dict) else {"value": config}',
-    '        _trace({"event": "from_config", "config": payload})',
-    '        return cls(**payload)',
-    '',
-    '    def set_timesteps(self, step_count):',
-    '        self.timesteps = list(range(int(step_count)))',
-    '        _trace({"event": "set_timesteps", "step_count": int(step_count), "timesteps": self.timesteps})',
-    '',
-  ].join('\n');
-}
-
-function cubvhStubSource() {
-  return [
-    '__version__ = "0.0-test"',
-    'import json',
-    'import os',
-    'import torch',
-    'from pathlib import Path',
-    '',
-    'def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):',
-    '    coords = coords.int()',
-    '    corners = corners.float()',
-    '    error_message = os.environ.get("ULTRASHAPE_TEST_CUBVH_ERROR_MESSAGE")',
-    '    if error_message:',
-    '        raise RuntimeError(error_message)',
-    '    trace_path = os.environ.get("ULTRASHAPE_TEST_CUBVH_TRACE_PATH")',
-    '    if trace_path:',
-    '        Path(trace_path).write_text(json.dumps({',
-    '            "coords_type": type(coords).__name__,',
-    '            "corners_type": type(corners).__name__,',
-    '            "coords_dtype": getattr(coords, "dtype", None),',
-    '            "corners_dtype": getattr(corners, "dtype", None),',
-    '            "cuda_launch_blocking": os.environ.get("CUDA_LAUNCH_BLOCKING"),',
-    '            "coords": len(coords),',
-    '            "corners": len(corners),',
-    '            "iso": iso,',
-    '            "ensure_consistency": ensure_consistency,',
-    '        }), encoding="utf8")',
-    '    vertices = []',
-    '    for point, cube in zip(coords, corners):',
-    '        offset = sum(float(value) for value in cube) / max(len(cube), 1)',
-    '        vertices.append((',
-    '            float(point[0]) + offset,',
-    '            float(point[1]) - (offset / 2.0),',
-    '            float(point[2]) + (offset / 3.0),',
-    '        ))',
-    '    faces = []',
-    '    for index in range(1, max(len(vertices) - 1, 1)):',
-    '        if index + 1 >= len(vertices):',
-    '            break',
-    '        faces.append((0, index, index + 1))',
-    '    if os.environ.get("ULTRASHAPE_TEST_CUBVH_RETURNS_TENSORS") == "1":',
-    '        return torch.tensor(vertices, dtype=torch.float32), torch.tensor(faces, dtype=torch.int32)',
-    '    return vertices, faces',
-    '',
-  ].join('\n');
-}
-
-function trimeshStubSource() {
-  return [
-    'import json',
-    'import struct',
-    '',
-    'def _pad(payload, pad_byte=b" "):',
-    '    padding = (-len(payload)) % 4',
-    '    return payload + (pad_byte * padding)',
-    '',
-    'class Trimesh:',
-    '    def __init__(self, vertices, faces, process=False):',
-    '        self.vertices = [tuple(float(axis) for axis in vertex) for vertex in vertices]',
-    '        self.faces = [tuple(int(index) for index in face) for face in faces]',
-    '',
-    'class Scene:',
-    '    def __init__(self):',
-    '        self._items = []',
-    '',
-    '    def add_geometry(self, mesh, node_name=None):',
-    '        self._items.append((mesh, node_name or "mesh"))',
-    '',
-    '    def export(self, file_type="glb"):',
-    '        if file_type != "glb":',
-    '            raise ValueError("Stub trimesh exporter supports only glb")',
-    '        if not self._items:',
-    '            raise ValueError("Scene has no geometry")',
-    '        mesh, node_name = self._items[0]',
-    '        vertex_bytes = b"".join(struct.pack("<3f", *vertex) for vertex in mesh.vertices)',
-    '        index_bytes = b"".join(struct.pack("<3I", *face) for face in mesh.faces)',
-    '        vertex_view_offset = 0',
-    '        index_view_offset = len(vertex_bytes)',
-    '        binary_blob = _pad(vertex_bytes, b"\\x00") + _pad(index_bytes, b"\\x00")',
-    '        json_doc = {',
-    '            "asset": {"version": "2.0", "generator": "trimesh-test-stub"},',
-    '            "scene": 0,',
-    '            "scenes": [{"nodes": [0]}],',
-    '            "nodes": [{"mesh": 0, "name": node_name}],',
-    '            "meshes": [{"name": node_name, "primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],',
-    '            "buffers": [{"byteLength": len(binary_blob)}],',
-    '            "bufferViews": [',
-    '                {"buffer": 0, "byteOffset": vertex_view_offset, "byteLength": len(vertex_bytes), "target": 34962},',
-    '                {"buffer": 0, "byteOffset": len(_pad(vertex_bytes, b"\\x00")), "byteLength": len(index_bytes), "target": 34963},',
-    '            ],',
-    '            "accessors": [',
-    '                {',
-    '                    "bufferView": 0,',
-    '                    "componentType": 5126,',
-    '                    "count": len(mesh.vertices),',
-    '                    "type": "VEC3",',
-    '                    "min": [min(vertex[index] for vertex in mesh.vertices) for index in range(3)],',
-    '                    "max": [max(vertex[index] for vertex in mesh.vertices) for index in range(3)],',
-    '                },',
-    '                {"bufferView": 1, "componentType": 5125, "count": len(mesh.faces) * 3, "type": "SCALAR"},',
-    '            ],',
-    '        }',
-    '        json_bytes = _pad(json.dumps(json_doc, separators=(",", ":")).encode("utf8"))',
-    '        total_length = 12 + 8 + len(json_bytes) + 8 + len(binary_blob)',
-    '        return b"".join([',
-    '            b"glTF",',
-    '            struct.pack("<I", 2),',
-    '            struct.pack("<I", total_length),',
-    '            struct.pack("<I", len(json_bytes)),',
-    '            struct.pack("<I", 0x4E4F534A),',
-    '            json_bytes,',
-    '            struct.pack("<I", len(binary_blob)),',
-    '            struct.pack("<I", 0x004E4942),',
-    '            binary_blob,',
-    '        ])',
-    '',
-  ].join('\n');
-}
-
-function writeBinaryCheckpointBundle(path: string, payload: Record<string, unknown>) {
-  const outcome = spawnSync(
-    'python3',
-    [
-      '-c',
-      [
-        'import sys, json, zipfile',
-        'path = sys.argv[1]',
-        'payload = sys.argv[2]',
-        'with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:',
-        '    archive.writestr("checkpoint.json", payload)',
-      ].join('\n'),
-      path,
-      JSON.stringify(payload),
-    ],
-    { encoding: 'utf8' },
+function createBinaryGlb() {
+  const jsonChunk = Buffer.from(
+    JSON.stringify({
+      asset: { version: '2.0' },
+      scenes: [{ nodes: [0] }],
+      scene: 0,
+      nodes: [{ mesh: 0 }],
+      meshes: [
+        {
+          primitives: [
+            {
+              attributes: { POSITION: 0 },
+              indices: 1,
+            },
+          ],
+        },
+      ],
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: 4, type: 'VEC3' },
+        { bufferView: 1, componentType: 5125, count: 6, type: 'SCALAR' },
+      ],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: 48 },
+        { buffer: 0, byteOffset: 48, byteLength: 24 },
+      ],
+      buffers: [{ byteLength: 72 }],
+    }),
+    'utf8',
   );
-
-  if (outcome.status !== 0) {
-    throw new Error(outcome.stderr || 'Failed to write binary checkpoint bundle.');
-  }
-}
-
-function inspectCheckpointBundle(checkpointPath: string, extDir: string, stubDir: string) {
-  const outcome = spawnSync(
-    'python3',
-    [
-      '-c',
-      [
-        'import json, sys',
-        'from ultrashape_runtime.utils.checkpoint import load_checkpoint_subtrees',
-        'result = load_checkpoint_subtrees(sys.argv[1], None, sys.argv[2])',
-        'print(json.dumps(result))',
-      ].join('\n'),
-      checkpointPath,
-      extDir,
-    ],
-    {
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        PYTHONPATH: [stubDir, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
-      },
-    },
-  );
-
-  if (outcome.status !== 0) {
-    throw new Error(outcome.stderr || 'Failed to inspect checkpoint bundle.');
-  }
-
-  return JSON.parse(outcome.stdout) as Record<string, unknown>;
-}
-
-function expectUpstreamRuntimeGraph(configText: string) {
-  expect(configText).toContain('checkpoint:');
-  expect(configText).toContain('vae_config:');
-  expect(configText).toContain('dit_cfg:');
-  expect(configText).toContain('conditioner_config:');
-  expect(configText).toContain('preprocess:');
-  expect(configText).toContain('image_processor_cfg:');
-  expect(configText).toContain('conditioning:');
-  expect(configText).toContain('scheduler:');
-  expect(configText).toContain('scheduler_cfg:');
-  expect(configText).toContain('decoder:');
-  expect(configText).toContain('surface:');
-  expect(configText).toContain('gate:');
-  expect(configText).toContain('export:');
-  expect(configText).toContain('scope: mc-only');
-  expect(configText).toContain('backend: local');
-  expect(configText).toContain('format: glb');
-  expect(configText).toContain('requires_exact_closure: true');
-  expect(configText).toContain('required:');
-  expect(configText).toContain('- diffusers');
-  expect(configText).toContain('- cubvh');
-  expect(configText).toContain('conditional:');
-  expect(configText).toContain('- rembg');
-  expect(configText).toContain('- onnxruntime');
-  expect(configText).toContain('degradable:');
-  expect(configText).toContain('- flash_attn');
-  expect(configText).toContain('tensor_contract:');
-  expect(configText).toContain('image_tensor');
-  expect(configText).toContain('mask_tensor');
-  expect(configText).toContain('surface_contract:');
-  expect(configText).toContain('sampled_surface_points');
-  expect(configText).toContain('voxel_contract:');
-  expect(configText).toContain('voxel_cond');
-  expect(configText).toContain('checkpoint_contract:');
-  expect(configText).toContain('state_dict_metadata');
-}
-
-function createBinaryGlbBytes() {
-  const jsonChunk = Buffer.from('{"asset":{"version":"2.0"}}   ', 'utf8');
-  const binaryChunk = Buffer.from([0x00, 0x80, 0x00, 0x00]);
-  const totalLength = 12 + 8 + jsonChunk.length + 8 + binaryChunk.length;
-
-  return Buffer.concat([
-    Buffer.from('glTF', 'ascii'),
-    Buffer.from(Uint32Array.of(2, totalLength).buffer),
-    Buffer.from(Uint32Array.of(jsonChunk.length, 0x4e4f534a).buffer),
-    jsonChunk,
-    Buffer.from(Uint32Array.of(binaryChunk.length, 0x004e4942).buffer),
-    binaryChunk,
-  ]);
-}
-
-function makeCrc32Table() {
-  const table = new Uint32Array(256);
-  for (let index = 0; index < 256; index += 1) {
-    let value = index;
-    for (let bit = 0; bit < 8; bit += 1) {
-      value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
-    }
-    table[index] = value >>> 0;
-  }
-  return table;
-}
-
-const crc32Table = makeCrc32Table();
-
-function crc32(buffer: Buffer) {
-  let value = 0xffffffff;
-  for (const byte of buffer) {
-    value = crc32Table[(value ^ byte) & 0xff] ^ (value >>> 8);
-  }
-  return (value ^ 0xffffffff) >>> 0;
-}
-
-function pngChunk(type: string, data: Buffer) {
-  const typeBuffer = Buffer.from(type, 'ascii');
-  const lengthBuffer = Buffer.alloc(4);
-  lengthBuffer.writeUInt32BE(data.length, 0);
-  const checksumBuffer = Buffer.alloc(4);
-  checksumBuffer.writeUInt32BE(crc32(Buffer.concat([typeBuffer, data])), 0);
-  return Buffer.concat([lengthBuffer, typeBuffer, data, checksumBuffer]);
-}
-
-function createRgbaPngBytes(width: number, height: number, pixels: number[][]) {
-  const scanlines: Buffer[] = [];
-  for (let rowIndex = 0; rowIndex < height; rowIndex += 1) {
-    const row = Buffer.alloc(1 + width * 4);
-    row[0] = 0;
-    for (let columnIndex = 0; columnIndex < width; columnIndex += 1) {
-      const pixel = pixels[(rowIndex * width) + columnIndex] ?? [0, 0, 0, 255];
-      const offset = 1 + (columnIndex * 4);
-      row[offset + 0] = pixel[0] ?? 0;
-      row[offset + 1] = pixel[1] ?? 0;
-      row[offset + 2] = pixel[2] ?? 0;
-      row[offset + 3] = pixel[3] ?? 255;
-    }
-    scanlines.push(row);
-  }
-
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8;
-  ihdr[9] = 6;
-
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', ihdr),
-    pngChunk('IDAT', deflateSync(Buffer.concat(scanlines))),
-    pngChunk('IEND', Buffer.alloc(0)),
-  ]);
-}
-
-function createReferenceImageBytes(variant: 'a' | 'b' = 'a') {
-  const pixels =
-    variant === 'a'
-      ? [
-          [255, 32, 32, 255],
-          [32, 255, 32, 255],
-          [32, 32, 255, 255],
-          [240, 220, 48, 160],
-        ]
-      : [
-          [20, 20, 20, 255],
-          [220, 120, 40, 255],
-          [180, 40, 200, 200],
-          [40, 220, 240, 96],
-        ];
-
-  return createRgbaPngBytes(2, 2, pixels);
-}
-
-function createMeshGlbBytes(vertices: Array<[number, number, number]>, faces: Array<[number, number, number]>) {
-  const vertexBytes = Buffer.alloc(vertices.length * 12);
-  vertices.forEach((vertex, index) => {
-    vertexBytes.writeFloatLE(vertex[0], index * 12);
-    vertexBytes.writeFloatLE(vertex[1], (index * 12) + 4);
-    vertexBytes.writeFloatLE(vertex[2], (index * 12) + 8);
+  const paddedJson = Buffer.concat([jsonChunk, Buffer.alloc((4 - (jsonChunk.length % 4)) % 4, 0x20)]);
+  const binaryChunk = Buffer.alloc(72);
+  const vertices = [
+    [0, 0, 0],
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+  ];
+  const faces = [0, 1, 2, 0, 1, 3];
+  vertices.forEach((vertex, vertexIndex) => {
+    vertex.forEach((axis, axisIndex) => {
+      binaryChunk.writeFloatLE(axis, vertexIndex * 12 + axisIndex * 4);
+    });
   });
-
-  const indexBytes = Buffer.alloc(faces.length * 12);
-  faces.forEach((face, index) => {
-    indexBytes.writeUInt32LE(face[0], index * 12);
-    indexBytes.writeUInt32LE(face[1], (index * 12) + 4);
-    indexBytes.writeUInt32LE(face[2], (index * 12) + 8);
+  faces.forEach((index, faceIndex) => {
+    binaryChunk.writeUInt32LE(index, 48 + faceIndex * 4);
   });
-
-  const paddedVertexBytes = Buffer.concat([vertexBytes, Buffer.alloc((4 - (vertexBytes.length % 4)) % 4)]);
-  const paddedIndexBytes = Buffer.concat([indexBytes, Buffer.alloc((4 - (indexBytes.length % 4)) % 4)]);
-  const binaryBlob = Buffer.concat([paddedVertexBytes, paddedIndexBytes]);
-  const jsonDocument = {
-    asset: { version: '2.0', generator: 'runtime-flow-test-fixture' },
-    scene: 0,
-    scenes: [{ nodes: [0] }],
-    nodes: [{ mesh: 0, name: 'coarse-mesh' }],
-    meshes: [{ name: 'coarse-mesh', primitives: [{ attributes: { POSITION: 0 }, indices: 1 }] }],
-    buffers: [{ byteLength: binaryBlob.length }],
-    bufferViews: [
-      { buffer: 0, byteOffset: 0, byteLength: vertexBytes.length, target: 34962 },
-      { buffer: 0, byteOffset: paddedVertexBytes.length, byteLength: indexBytes.length, target: 34963 },
-    ],
-    accessors: [
-      {
-        bufferView: 0,
-        componentType: 5126,
-        count: vertices.length,
-        type: 'VEC3',
-        min: [
-          Math.min(...vertices.map((vertex) => vertex[0])),
-          Math.min(...vertices.map((vertex) => vertex[1])),
-          Math.min(...vertices.map((vertex) => vertex[2])),
-        ],
-        max: [
-          Math.max(...vertices.map((vertex) => vertex[0])),
-          Math.max(...vertices.map((vertex) => vertex[1])),
-          Math.max(...vertices.map((vertex) => vertex[2])),
-        ],
-      },
-      { bufferView: 1, componentType: 5125, count: faces.length * 3, type: 'SCALAR' },
-    ],
-  };
-
-  const jsonBytes = Buffer.from(JSON.stringify(jsonDocument), 'utf8');
-  const paddedJsonBytes = Buffer.concat([jsonBytes, Buffer.alloc((4 - (jsonBytes.length % 4)) % 4, 0x20)]);
-  const totalLength = 12 + 8 + paddedJsonBytes.length + 8 + binaryBlob.length;
-
+  const totalLength = 12 + 8 + paddedJson.length + 8 + binaryChunk.length;
   const header = Buffer.alloc(12);
   header.write('glTF', 0, 'ascii');
   header.writeUInt32LE(2, 4);
   header.writeUInt32LE(totalLength, 8);
-
   const jsonHeader = Buffer.alloc(8);
-  jsonHeader.writeUInt32LE(paddedJsonBytes.length, 0);
+  jsonHeader.writeUInt32LE(paddedJson.length, 0);
   jsonHeader.writeUInt32LE(0x4e4f534a, 4);
-
   const binHeader = Buffer.alloc(8);
-  binHeader.writeUInt32LE(binaryBlob.length, 0);
+  binHeader.writeUInt32LE(binaryChunk.length, 0);
   binHeader.writeUInt32LE(0x004e4942, 4);
-
-  return Buffer.concat([header, jsonHeader, paddedJsonBytes, binHeader, binaryBlob]);
+  return Buffer.concat([header, jsonHeader, paddedJson, binHeader, binaryChunk]);
 }
 
-function createCoarseMeshBytes(variant: 'a' | 'b' = 'a') {
-  if (variant === 'a') {
-    return createMeshGlbBytes(
-      [
-        [-0.9, -0.7, -0.5],
-        [0.8, -0.6, -0.4],
-        [0.9, 0.7, -0.3],
-        [-0.8, 0.8, -0.2],
-        [-0.6, -0.5, 0.7],
-        [0.7, -0.4, 0.9],
-        [0.6, 0.5, 0.8],
-        [-0.7, 0.6, 0.6],
-      ],
-      [
-        [0, 1, 2],
-        [0, 2, 3],
-        [4, 6, 5],
-        [4, 7, 6],
-        [0, 4, 5],
-        [0, 5, 1],
-        [1, 5, 6],
-        [1, 6, 2],
-        [2, 6, 7],
-        [2, 7, 3],
-        [3, 7, 4],
-        [3, 4, 0],
-      ],
-    );
-  }
+function writeRuntimeStubModules(root: string) {
+  const modules = [
+    'torchvision.py',
+    'cv2.py',
+    'omegaconf.py',
+    'einops.py',
+    'transformers.py',
+    'accelerate.py',
+    'safetensors.py',
+  ];
 
-  return createMeshGlbBytes(
-    [
-      [-0.4, -0.9, -0.7],
-      [0.9, -0.7, -0.2],
-      [1.1, 0.1, -0.1],
-      [0.5, 0.9, 0.3],
-      [-0.3, 1.0, 0.6],
-      [-1.0, 0.2, 0.4],
-      [-0.8, -0.2, 0.9],
-      [0.2, -0.4, 1.0],
-    ],
-    [
-      [0, 1, 7],
-      [1, 2, 7],
-      [2, 3, 7],
-      [3, 4, 7],
-      [4, 5, 6],
-      [4, 6, 7],
-      [5, 0, 6],
-      [0, 7, 6],
-      [0, 1, 5],
-      [1, 2, 3],
-      [1, 3, 5],
-      [3, 4, 5],
-    ],
+  mkdirSync(path.join(root, 'skimage'), { recursive: true });
+  writeFileSync(path.join(root, 'skimage', '__init__.py'), '');
+  modules.forEach((modulePath) => writeFileSync(path.join(root, modulePath), '\n', 'utf8'));
+
+  writeFileSync(
+    path.join(root, 'diffusers.py'),
+    `class FlowMatchEulerDiscreteScheduler:\n    def __init__(self, **config):\n        self.config = config\n        self.timesteps = []\n        self.sigmas = []\n\n    @classmethod\n    def from_config(cls, config):\n        return cls(**config)\n\n    def set_timesteps(self, step_count):\n        self.timesteps = [float(index) for index in range(step_count)]\n        if step_count <= 1:\n            self.sigmas = [1.0]\n            return\n        self.sigmas = [round(1.0 - (index / (step_count - 1)), 6) for index in range(step_count)]\n`,
+    'utf8',
+  );
+
+  writeFileSync(
+    path.join(root, 'torch.py'),
+    `import json\n\nint32 = 'int32'\nfloat32 = 'float32'\n\nclass Tensor:\n    def __init__(self, values, dtype=None):\n        self._values = values\n        self.dtype = dtype\n        self.shape = _shape(values)\n\n    def cpu(self):\n        return self\n\n    def tolist(self):\n        return self._values\n\n    def reshape(self, *_shape_args):\n        return Tensor(_flatten(self._values), dtype=self.dtype)\n\n    def flatten(self):\n        return Tensor(_flatten(self._values), dtype=self.dtype)\n\n    def numel(self):\n        return len(_flatten(self._values))\n\n    def __getitem__(self, index):\n        return _flatten(self._values)[index]\n\n    def min(self):\n        return min(_flatten(self._values))\n\n    def max(self):\n        return max(_flatten(self._values))\n\n    def mean(self):\n        flat = _flatten(self._values)\n        return sum(flat) / len(flat) if flat else 0.0\n\ndef tensor(values, dtype=None):\n    return Tensor(values, dtype=dtype)\n\ndef load(path, map_location=None):\n    del map_location\n    with open(path, 'r', encoding='utf8') as handle:\n        return json.load(handle)\n\ndef _flatten(values):\n    if isinstance(values, (list, tuple)):\n        flattened = []\n        for value in values:\n            flattened.extend(_flatten(value))\n        return flattened\n    return [values]\n\ndef _shape(values):\n    if isinstance(values, (list, tuple)) and values:\n        return (len(values), *_shape(values[0]))\n    if isinstance(values, (list, tuple)):\n        return (0,)\n    return ()\n`,
+    'utf8',
+  );
+
+  writeFileSync(
+    path.join(root, 'cubvh.py'),
+    `def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    vertices = [\n        [0.0, 0.0, 0.0],\n        [1.0, 0.0, 0.0],\n        [0.0, 1.0, 0.0],\n        [0.0, 0.0, 1.0],\n        [1.0, 1.0, 0.0],\n        [1.0, 0.0, 1.0],\n        [0.0, 1.0, 1.0],\n        [1.0, 1.0, 1.0],\n        [0.5, 0.5, 1.02],\n    ]\n    faces = [\n        [0, 1, 4],\n        [0, 4, 2],\n        [0, 1, 5],\n        [0, 5, 3],\n        [2, 4, 7],\n        [2, 7, 6],\n        [3, 5, 8],\n        [3, 8, 6],\n    ]\n    return vertices, faces\n`,
+    'utf8',
+  );
+
+  writeFileSync(
+    path.join(root, 'trimesh.py'),
+    `import json\nimport struct\n\nclass Trimesh:\n    def __init__(self, vertices, faces, process=False):\n        del process\n        self.vertices = vertices\n        self.faces = faces\n\nclass Scene:\n    def __init__(self):\n        self.mesh = None\n\n    def add_geometry(self, mesh, node_name=None):\n        del node_name\n        self.mesh = mesh\n\n    def export(self, file_type='glb'):\n        if file_type != 'glb':\n            raise ValueError('Only glb export is supported in tests.')\n        if self.mesh is None:\n            raise ValueError('Scene has no mesh.')\n        return _build_glb(self.mesh.vertices, self.mesh.faces)\n\ndef _build_glb(vertices, faces):\n    document = {\n        'asset': {'version': '2.0'},\n        'scenes': [{'nodes': [0]}],\n        'scene': 0,\n        'nodes': [{'mesh': 0}],\n        'meshes': [{'primitives': [{'attributes': {'POSITION': 0}, 'indices': 1}]}],\n        'accessors': [\n            {'bufferView': 0, 'componentType': 5126, 'count': len(vertices), 'type': 'VEC3'},\n            {'bufferView': 1, 'componentType': 5125, 'count': len(faces) * 3, 'type': 'SCALAR'},\n        ],\n        'bufferViews': [\n            {'buffer': 0, 'byteOffset': 0, 'byteLength': len(vertices) * 12},\n            {'buffer': 0, 'byteOffset': len(vertices) * 12, 'byteLength': len(faces) * 12},\n        ],\n        'buffers': [{'byteLength': (len(vertices) * 12) + (len(faces) * 12)}],\n    }\n    json_chunk = json.dumps(document).encode('utf8')\n    json_chunk += b' ' * ((4 - (len(json_chunk) % 4)) % 4)\n    binary = bytearray()\n    for vertex in vertices:\n        binary.extend(struct.pack('<3f', float(vertex[0]), float(vertex[1]), float(vertex[2])))\n    for face in faces:\n        binary.extend(struct.pack('<3I', int(face[0]), int(face[1]), int(face[2])))\n    header = struct.pack('<4sII', b'glTF', 2, 12 + 8 + len(json_chunk) + 8 + len(binary))\n    json_header = struct.pack('<II', len(json_chunk), 0x4E4F534A)\n    bin_header = struct.pack('<II', len(binary), 0x004E4942)\n    return header + json_header + json_chunk + bin_header + bytes(binary)\n`,
+    'utf8',
   );
 }
 
-function readGlbJson(path: string) {
-  const payload = readFileSync(path);
-  expect(payload.subarray(0, 4).toString('ascii')).toBe('glTF');
-  expect(payload.length).toBeGreaterThanOrEqual(24);
-  const jsonLength = payload.readUInt32LE(12);
-  const jsonChunkType = payload.readUInt32LE(16);
-  expect(jsonChunkType).toBe(0x4e4f534a);
-  return JSON.parse(payload.subarray(20, 20 + jsonLength).toString('utf8').trim().replace(/\u0000+$/u, '')) as {
-    asset?: { version?: string };
-    scenes?: unknown[];
-    nodes?: unknown[];
-    meshes?: Array<{ primitives?: Array<{ attributes?: { POSITION?: unknown }; indices?: unknown }> }>;
-    accessors?: unknown[];
-    bufferViews?: unknown[];
-    buffers?: unknown[];
-  };
-}
-
-function getGlbPositionAccessorCount(path: string) {
-  const document = readGlbJson(path);
-  const primitive = document.meshes?.[0]?.primitives?.[0];
-  const positionAccessorIndex = primitive?.attributes?.POSITION;
-  expect(positionAccessorIndex).toEqual(expect.any(Number));
-  const accessor = document.accessors?.[positionAccessorIndex as number] as { count?: unknown } | undefined;
-  expect(accessor?.count).toEqual(expect.any(Number));
-  return accessor?.count as number;
-}
-
-function getGlbPositions(path: string) {
-  const payload = readFileSync(path);
-  const document = readGlbJson(path);
-  const primitive = document.meshes?.[0]?.primitives?.[0];
-  const positionAccessorIndex = primitive?.attributes?.POSITION;
-  expect(positionAccessorIndex).toEqual(expect.any(Number));
-
-  const accessor = document.accessors?.[positionAccessorIndex as number] as
-    | { bufferView?: unknown; byteOffset?: unknown; count?: unknown; componentType?: unknown; type?: unknown }
-    | undefined;
-  expect(accessor).toEqual(
-    expect.objectContaining({
-      bufferView: expect.any(Number),
-      count: expect.any(Number),
-      componentType: 5126,
-      type: 'VEC3',
-    }),
-  );
-
-  const bufferView = document.bufferViews?.[accessor?.bufferView as number] as
-    | { byteOffset?: unknown; byteLength?: unknown; byteStride?: unknown }
-    | undefined;
-  expect(bufferView).toEqual(
-    expect.objectContaining({
-      byteOffset: expect.any(Number),
-      byteLength: expect.any(Number),
-    }),
-  );
-
-  const jsonLength = payload.readUInt32LE(12);
-  const binChunkHeaderOffset = 20 + jsonLength;
-  const binChunkLength = payload.readUInt32LE(binChunkHeaderOffset);
-  const binChunkType = payload.readUInt32LE(binChunkHeaderOffset + 4);
-  expect(binChunkType).toBe(0x004e4942);
-  const binary = payload.subarray(binChunkHeaderOffset + 8, binChunkHeaderOffset + 8 + binChunkLength);
-
-  const positions: Array<[number, number, number]> = [];
-  const count = Number(accessor?.count ?? 0);
-  const offset = Number(bufferView?.byteOffset ?? 0) + Number(accessor?.byteOffset ?? 0);
-  const stride = Number(bufferView?.byteStride ?? 12) || 12;
-  for (let index = 0; index < count; index += 1) {
-    const start = offset + (index * stride);
-    positions.push([
-      Number(binary.readFloatLE(start).toFixed(6)),
-      Number(binary.readFloatLE(start + 4).toFixed(6)),
-      Number(binary.readFloatLE(start + 8).toFixed(6)),
-    ]);
-  }
-
-  return positions;
- }
-
-function expectRenderableGlbMesh(path: string) {
-  const document = readGlbJson(path);
-  expect(document.asset?.version).toBe('2.0');
-  expect(document.scenes?.length ?? 0).toBeGreaterThan(0);
-  expect(document.nodes?.length ?? 0).toBeGreaterThan(0);
-  expect(document.meshes?.length ?? 0).toBeGreaterThan(0);
-  expect(document.bufferViews?.length ?? 0).toBeGreaterThanOrEqual(2);
-  expect(document.accessors?.length ?? 0).toBeGreaterThanOrEqual(2);
-  expect(document.buffers?.length ?? 0).toBe(1);
-  expect(document.meshes?.[0]?.primitives?.[0]).toEqual(
-    expect.objectContaining({
-      attributes: expect.objectContaining({
-        POSITION: expect.any(Number),
-      }),
-      indices: expect.any(Number),
-    }),
-  );
-}
-
-function getRunnerMetrics(result: Record<string, unknown> | null): Record<string, unknown> {
-  const envelope = result?.result;
-  if (!envelope || typeof envelope !== 'object' || !('metrics' in envelope)) {
-    throw new Error('Expected runner success metrics to be present.');
-  }
-
-  const metrics = envelope.metrics;
-  if (!metrics || typeof metrics !== 'object') {
-    throw new Error('Expected runner metrics to be an object.');
-  }
-
-  return metrics as Record<string, unknown>;
-}
-
-function getCausalityMetrics(metrics: Record<string, unknown>) {
-  const causality = metrics.causality;
-  if (!causality || typeof causality !== 'object') {
-    throw new Error('Expected runner causality metrics to be present.');
-  }
-
-  return causality as Record<string, unknown>;
-}
-
-function createFixtureWorkspace() {
-  const root = mkdtempSync(join(tmpdir(), 'ultrashape-runtime-'));
-  const outputDir = join(root, 'output');
-  const modelsDir = join(root, 'models', 'ultrashape');
-  const stubDir = join(root, 'py-stubs');
-  mkdirSync(outputDir);
+function createRuntimeFixture() {
+  const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-runtime-flow-'));
+  const stubRoot = path.join(sandbox, 'stubs');
+  const extDir = path.join(sandbox, 'ext');
+  const modelsDir = path.join(extDir, 'models', 'ultrashape');
+  mkdirSync(stubRoot, { recursive: true });
   mkdirSync(modelsDir, { recursive: true });
-  mkdirSync(stubDir, { recursive: true });
+  writeRuntimeStubModules(stubRoot);
 
-  const referenceImage = join(root, 'reference.png');
-  const coarseMesh = join(root, 'coarse.glb');
-  const binaryCoarseMesh = join(root, 'binary-coarse.glb');
-  const packagedArtifact = join(root, 'artifact.glb');
-  const checkpoint = join(modelsDir, 'ultrashape_v1.pt');
-  const configPath = join(root, 'infer_dit_refine.yaml');
-
-  writeFileSync(referenceImage, createReferenceImageBytes('a'));
-  writeFileSync(coarseMesh, createCoarseMeshBytes('a'));
-  writeFileSync(binaryCoarseMesh, createCoarseMeshBytes('b'));
-  writeFileSync(packagedArtifact, 'refined-mesh');
-  writeFileSync(join(stubDir, 'cubvh.py'), cubvhStubSource());
-  writeFileSync(join(stubDir, 'diffusers.py'), diffusersStubSource());
-  writeFileSync(join(stubDir, 'torch.py'), torchCheckpointStubSource());
-  writeFileSync(join(stubDir, 'trimesh.py'), trimeshStubSource());
-  writeCheckpointBundle(checkpoint);
-
-  return {
-    root,
-    outputDir,
-     referenceImage,
-     coarseMesh,
-     binaryCoarseMesh,
-      packagedArtifact,
-      checkpoint,
-      configPath,
-      stubDir,
-      cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
-}
-
-function checkpointBundlePayload(variant: 'a' | 'b' = 'a') {
-  const values =
-    variant === 'a'
-      ? {
-          vae: [0.11, 0.33, 0.55, 0.77],
-          dit: [0.21, 0.41, 0.61, 0.81],
-          conditioner: [0.14, 0.24, 0.64, 0.74],
-        }
-      : {
-          vae: [0.77, 0.55, 0.33, 0.11],
-          dit: [0.81, 0.61, 0.41, 0.21],
-          conditioner: [0.74, 0.64, 0.24, 0.14],
-        };
-
-  return {
-    format: 'ultrashape-checkpoint-bundle/v1',
-    vae: {
-      tensors: {
-        latent_basis: values.vae,
-      },
-    },
-    dit: {
-      tensors: {
-        attention_bias: values.dit,
-      },
-    },
-    conditioner: {
-      tensors: {
-        mask_bias: values.conditioner,
-      },
-    },
-  };
-}
-
-function checkpointBundleWithout(...missingSubtrees: Array<'vae' | 'dit' | 'conditioner'>) {
-  const payload = checkpointBundlePayload('a') as Record<string, unknown>;
-  for (const subtree of missingSubtrees) {
-    delete payload[subtree];
-  }
-  return payload;
-}
-
-function writeCheckpointBundle(path: string, variant: 'a' | 'b' = 'a') {
-  writeBinaryCheckpointBundle(path, checkpointBundlePayload(variant));
-}
-
-function expectRealClosureMetrics(metrics: Record<string, unknown>) {
-  expect(metrics).toEqual(
-    expect.objectContaining({
-      chamfer: expect.any(Number),
-      rms: expect.any(Number),
-      topology_changed: true,
-      extent_ratio: [1, 1, 1],
-      execution_trace: ['preprocess', 'conditioning', 'scheduler', 'denoise', 'decode', 'extract'],
-      preprocess: expect.objectContaining({
-        processor: 'ImageProcessorV2',
-        byte_length: expect.any(Number),
-        normalized_channels: 4,
-        image_tensor_shape: [1, 2, 2, 4],
-        image_feature_count: expect.any(Number),
-        mask_feature_count: expect.any(Number),
-        mean_intensity: expect.any(Number),
-        mask_coverage: expect.any(Number),
-        cutout_applied: expect.any(Boolean),
-      }),
-      conditioning: expect.objectContaining({
-        surface_loader: 'SharpEdgeSurfaceLoader',
-        encoder: 'SingleImageEncoder',
-        voxelizer: 'voxelize_from_point',
-        surface_vertex_count: expect.any(Number),
-        surface_face_count: expect.any(Number),
-        surface_point_count: expect.any(Number),
-        voxel_count: expect.any(Number),
-        voxel_resolution: expect.any(Number),
-        context_token_count: expect.any(Number),
-        context_mask_token_count: expect.any(Number),
-        cfg_pairing: expect.objectContaining({
-          mode: 'classifier-free-guidance',
-          positive_context_tokens: expect.any(Number),
-          negative_context_tokens: expect.any(Number),
-        }),
-        conditioner_metadata: expect.objectContaining({
-          image_signature: expect.any(Number),
-          mesh_signature: expect.any(Number),
-          voxel_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-        }),
-      }),
-      scheduler: expect.objectContaining({
-        family: 'flow-matching-euler-discrete',
-        target: 'diffusers.FlowMatchEulerDiscreteScheduler',
-        step_count: expect.any(Number),
-        timestep_count: expect.any(Number),
-        sigma_start: expect.any(Number),
-        sigma_end: expect.any(Number),
-      }),
-      denoise: expect.objectContaining({
-        model: 'RefineDiT',
-        attention: expect.any(String),
-        checkpoint_signature: expect.any(Number),
-        latent_count: expect.any(Number),
-        latent_mean: expect.any(Number),
-      }),
-      decode: expect.objectContaining({
-        vae: 'ShapeVAE',
-        decoder: expect.stringMatching(/VDMVolumeDecoding|VolumeDecoder/u),
-        authority: 'occupancy_field_grid',
-        field_density: expect.any(Number),
-        field_value_count: expect.any(Number),
-        field_grid_shape: [expect.any(Number), expect.any(Number), expect.any(Number)],
-        field_grid_signature: expect.any(Number),
-        corner_signature: expect.any(Number),
-        cell_count: expect.any(Number),
-        grid_resolution: expect.any(Number),
-        corner_count: expect.any(Number),
-        occupied_cell_count: expect.any(Number),
-        occupied_grid_cells: expect.any(Number),
-      }),
-      extract: expect.objectContaining({
-        extractor: 'cubvh.sparse_marching_cubes',
-        marching_cubes: 'cubvh.sparse_marching_cubes',
-        authority: 'decoded_field',
-        vertex_count: expect.any(Number),
-        face_count: expect.any(Number),
-        payload_bytes: expect.any(Number),
-        source_cell_count: expect.any(Number),
-        source_field_signature: expect.any(Number),
-        source_corner_signature: expect.any(Number),
-      }),
-      causality: expect.objectContaining({
-        proof: 'fingerprint-causality',
-        image_fingerprint: expect.any(Number),
-        mesh_fingerprint: expect.any(Number),
-        checkpoint_fingerprint: expect.any(Number),
-        context_fingerprint: expect.any(Number),
-        latent_fingerprint: expect.any(Number),
-        field_fingerprint: expect.any(Number),
-        geometry_fingerprint: expect.any(Number),
-      }),
-      stage_evidence: expect.objectContaining({
-        preprocess: expect.objectContaining({
-          source: 'reference_image',
-          processor: 'ImageProcessorV2',
-          image_signature: expect.any(Number),
-          mask_signature: expect.any(Number),
-        }),
-        checkpoint: expect.objectContaining({
-          source: 'ultrashape_v1.pt',
-          subtrees_loaded: ['vae', 'dit', 'conditioner'],
-          signature: expect.any(Number),
-        }),
-        conditioning: expect.objectContaining({
-          source: 'coarse_mesh+reference_image+checkpoint',
-          surface_signature: expect.any(Number),
-          voxel_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-        }),
-        scheduler: expect.objectContaining({
-          source: 'diffusers.FlowMatchEulerDiscreteScheduler',
-          timestep_signature: expect.any(Number),
-        }),
-        denoise: expect.objectContaining({
-          source: 'RefineDiT',
-          latent_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-        }),
-        decode: expect.objectContaining({
-          source: 'ShapeVAE+VanillaVDMVolumeDecoding',
-          field_signature: expect.any(Number),
-          corner_signature: expect.any(Number),
-        }),
-        extract: expect.objectContaining({
-          source: 'cubvh.sparse_marching_cubes',
-          surface_signature: expect.any(Number),
-          payload_bytes: expect.any(Number),
-        }),
-      }),
+  const referenceImage = path.join(sandbox, 'reference.png');
+  const coarseMesh = path.join(sandbox, 'coarse.glb');
+  const checkpoint = path.join(modelsDir, 'ultrashape_v1.pt');
+  writeFileSync(referenceImage, Buffer.from(PNG_1X1_BASE64, 'base64'));
+  writeFileSync(coarseMesh, createBinaryGlb());
+  writeFileSync(
+    checkpoint,
+    JSON.stringify({
+      vae: { tensors: { weights: [0.1, 0.2, 0.3, 0.4] } },
+      dit: { tensors: { weights: [0.5, 0.6, 0.7, 0.8] } },
+      conditioner: { tensors: { weights: [0.2, 0.4, 0.6, 0.8] } },
     }),
+    'utf8',
   );
+
+  return { sandbox, stubRoot, extDir, referenceImage, coarseMesh, checkpoint };
 }
 
-function installProcessorRuntime(extDir: string) {
-  const runtimeDir = join(extDir, 'runtime');
-  const runtimePackageDir = join(runtimeDir, 'ultrashape_runtime');
-  const runtimeConfigDir = join(runtimeDir, 'configs');
-  const venvBinDir = join(extDir, 'venv', 'bin');
-  const modelsDir = join(extDir, 'models', 'ultrashape');
-  const pythonShimPath = join(venvBinDir, 'python');
-
-  mkdirSync(runtimeConfigDir, { recursive: true });
-  mkdirSync(venvBinDir, { recursive: true });
-  mkdirSync(modelsDir, { recursive: true });
-
-  cpSync(resolve(repoRoot, 'runtime', 'vendor', 'ultrashape_runtime'), runtimePackageDir, { recursive: true });
-  writeFileSync(join(runtimeDir, 'torch.py'), torchCheckpointStubSource());
-  writeFileSync(join(runtimeDir, 'torchvision.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'numpy.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'trimesh.py'), trimeshStubSource());
-  mkdirSync(join(runtimeDir, 'PIL'), { recursive: true });
-  writeFileSync(join(runtimeDir, 'PIL', '__init__.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'cv2.py'), '__version__ = "0.0-test"\n');
-  mkdirSync(join(runtimeDir, 'skimage'), { recursive: true });
-  writeFileSync(join(runtimeDir, 'skimage', '__init__.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'yaml.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'omegaconf.py'), 'class OmegaConf:\n    pass\n');
-  writeFileSync(join(runtimeDir, 'einops.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'transformers.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'huggingface_hub.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'accelerate.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'cubvh.py'), cubvhStubSource());
-  writeFileSync(join(runtimeDir, 'diffusers.py'), diffusersStubSource());
-  writeFileSync(join(runtimeDir, 'safetensors.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeDir, 'tqdm.py'), '__version__ = "0.0-test"\n');
-  writeFileSync(join(runtimeConfigDir, 'infer_dit_refine.yaml'), readFileSync(runtimeConfigSourcePath, 'utf8'));
-  writeCheckpointBundle(join(modelsDir, 'ultrashape_v1.pt'));
-  writeFileSync(
-    pythonShimPath,
-    ['#!/usr/bin/env bash', 'set -euo pipefail', 'exec python3 "$@"', ''].join('\n'),
-  );
-  chmodSync(pythonShimPath, 0o755);
-}
-
-function writeRuntimeConfig(
-  path: string,
-  overrides: Partial<{
-    scope: string;
-    backend: string;
-    extraction: string;
-    primaryWeight: string;
-    requiredImports: string[];
-  }> = {},
-) {
-  const requiredImports = overrides.requiredImports ?? [];
-  writeFileSync(
-    path,
-    [
-      'model:',
-      `  scope: ${overrides.scope ?? 'mc-only'}`,
-      'runtime:',
-      `  backend: ${overrides.backend ?? 'local'}`,
-      '  requires_exact_closure: true',
-      'public_contract:',
-      '  backend_modes:',
-      '    - auto',
-      '    - local',
-      '  success_output_formats:',
-      '    - glb',
-      '  public_error_codes:',
-      '    - DEPENDENCY_MISSING',
-      '    - WEIGHTS_MISSING',
-      '    - LOCAL_RUNTIME_UNAVAILABLE',
-      'checkpoint:',
-      '  primary: models/ultrashape/ultrashape_v1.pt',
-      '  required_subtrees:',
-      '    - vae',
-      '    - dit',
-      '    - conditioner',
-      'vae_config:',
-      '  target: ultrashape_runtime.models.autoencoders.model.ShapeVAE',
-      'dit_cfg:',
-      '  target: ultrashape_runtime.models.denoisers.dit_mask.RefineDiT',
-      'conditioner_config:',
-      '  target: ultrashape_runtime.models.conditioner_mask.SingleImageEncoder',
-      'preprocess:',
-      '  image_processor: ImageProcessorV2',
-      '  require_cutout: conditional',
-      'image_processor_cfg:',
-      '  target: ultrashape_runtime.preprocessors.ImageProcessorV2',
-      'conditioning:',
-      '  coarse_mesh_encoder: SharpEdgeSurfaceLoader',
-      '  voxelizer: voxelize_from_point',
-      'surface:',
-      `  extraction: ${overrides.extraction ?? 'mc'}`,
-      '  loader: SharpEdgeSurfaceLoader',
-      'scheduler:',
-      '  family: flow-matching',
-      'scheduler_cfg:',
-      '  target: diffusers.FlowMatchEulerDiscreteScheduler',
-      'decoder:',
-      '  vae: ShapeVAE',
-      '  volume_decoder: VanillaVDMVolumeDecoding',
-      'weights:',
-      `  primary: ${overrides.primaryWeight ?? 'models/ultrashape/ultrashape_v1.pt'}`,
-      'gate:',
-      '  mode: geometric-hard-gate',
-      'export:',
-      '  format: glb',
-      'dependencies:',
-      '  required:',
-      '    imports:',
-      '      - diffusers',
-      ...requiredImports.map((entry) => `      - ${entry}`),
-      '      - cubvh',
-      '  conditional:',
-      '    - rembg',
-      '    - onnxruntime',
-      '  degradable:',
-      '    - flash_attn',
-      '',
-    ].join('\n'),
-  );
-}
-
-function writeSyntheticSuccessConfig(path: string) {
-  writeFileSync(
-    path,
-    [
-      'model:',
-      '  scope: mc-only',
-      'runtime:',
-      '  backend: local',
-      'surface:',
-      '  extraction: mc',
-      'weights:',
-      '  primary: models/ultrashape/ultrashape_v1.pt',
-      '',
-    ].join('\n'),
-  );
-}
-
-function writeReadiness(
-  root: string,
-  overrides: Partial<{
-    status: 'ready' | 'degraded' | 'blocked';
-    backend: 'local';
-    mvp_scope: 'mc-only';
-    weights_ready: boolean;
-    required_imports_ok: boolean;
-    missing_required: string[];
-    missing_optional: string[];
-    expected_weights: string[];
-  }> = {},
-) {
-  writeFileSync(
-    join(root, '.runtime-readiness.json'),
-    JSON.stringify(
-      {
-        status: 'ready',
-        backend: 'local',
-        mvp_scope: 'mc-only',
-        weights_ready: true,
-        required_imports_ok: true,
-        missing_required: [],
-        missing_optional: [],
-        expected_weights: ['models/ultrashape/ultrashape_v1.pt'],
-        ...overrides,
-      },
-      null,
-      2,
-    ),
-  );
-}
-
-function runProcessor(
-  payload: Record<string, unknown>,
-  options: { env?: NodeJS.ProcessEnv; cwd?: string; processorPath?: string } = {},
-) {
-  const outcome = spawnSync('python3', [options.processorPath ?? processorPath], {
-    cwd: options.cwd ?? repoRoot,
-    encoding: 'utf8',
-    input: `${JSON.stringify(payload)}\n`,
-    env: {
-      ...process.env,
-      ...options.env,
-    },
-  });
-
-  return outcome.stdout
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
-}
-
-function runLocalRunner(payload: Record<string, unknown>, options: { env?: NodeJS.ProcessEnv; cwd?: string } = {}) {
-  const extDir = typeof payload.ext_dir === 'string' ? payload.ext_dir : null;
-  const stubDir = extDir ? join(extDir, 'py-stubs') : null;
-  const pythonPath = [stubDir, runtimeVendorPath, options.env?.PYTHONPATH].filter(Boolean).join(':');
-
-  const outcome = spawnSync('python3', ['-m', 'ultrashape_runtime.local_runner'], {
-    cwd: options.cwd ?? repoRoot,
-    encoding: 'utf8',
-    input: `${JSON.stringify(payload)}\n`,
-    env: {
-      ...process.env,
-      PYTHONPATH: pythonPath,
-      ...options.env,
-    },
-  });
-
-  if (!outcome.stdout) {
-    throw new Error('Expected local_runner to emit a JSON result.');
-  }
-
-  return JSON.parse(outcome.stdout) as Record<string, unknown>;
-}
-
-function runPythonSnippet(source: string, args: string[] = [], pythonPathEntries: string[] = []) {
+function runPythonSnippet(source: string, args: string[] = []) {
   return spawnSync('python3', ['-c', source, ...args], {
     cwd: repoRoot,
     encoding: 'utf8',
     env: {
       ...process.env,
-      PYTHONPATH: [...pythonPathEntries, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+      PYTHONPATH: [runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
     },
   });
 }
 
-describe('UltraShape runtime flow', () => {
-  it('ships an upstream-style runtime graph that truthfully encodes the real-refinement dependency tiers', () => {
-    expectUpstreamRuntimeGraph(readFileSync(runtimeConfigSourcePath, 'utf8'));
+function runLocalRunner(job: Record<string, unknown>, stubRoot: string) {
+  return spawnSync('python3', ['-m', 'ultrashape_runtime.local_runner'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    input: JSON.stringify(job),
+    env: {
+      ...process.env,
+      PYTHONPATH: [stubRoot, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+    },
+  });
+}
+
+describe('runtime closure authority', () => {
+  it('publishes upstream-style stage evidence from the vendored closure', () => {
+    const result = runPythonSnippet(
+      [
+        'import json, sys',
+        'from ultrashape_runtime import CHECKPOINT_REQUIRED_SUBTREES, RUNTIME_LAYOUT, RUNTIME_SCOPE, UPSTREAM_CLOSURE_READY',
+        'from ultrashape_runtime.local_runner import PUBLIC_ERROR_CODES',
+        'from ultrashape_runtime.pipelines import build_refine_pipeline, load_runtime_config',
+        'from ultrashape_runtime.preprocessors import ImageProcessorV2',
+        'from ultrashape_runtime.surface_loaders import SharpEdgeSurfaceLoader',
+        'from ultrashape_runtime.schedulers import default_scheduler_name',
+        'from ultrashape_runtime.models.conditioner_mask import SingleImageEncoder',
+        'from ultrashape_runtime.models.denoisers.dit_mask import RefineDiT',
+        'from ultrashape_runtime.models.autoencoders.model import ShapeVAE',
+        'config = load_runtime_config(sys.argv[1])',
+        'payload = {',
+        '  "runtime": {',
+        '    "scope": RUNTIME_SCOPE,',
+        '    "layout": RUNTIME_LAYOUT,',
+        '    "ready": UPSTREAM_CLOSURE_READY,',
+        '    "checkpoint_required_subtrees": list(CHECKPOINT_REQUIRED_SUBTREES),',
+        '    "public_error_codes": sorted(PUBLIC_ERROR_CODES),',
+        '  },',
+        '  "config": {',
+        '    "scope": config["model"]["scope"],',
+        '    "requires_exact_closure": config["runtime"]["requires_exact_closure"],',
+        '    "scheduler_target": config["scheduler"]["target"],',
+        '    "conditioner_target": config["conditioner_config"]["target"],',
+        '    "dit_target": config["dit_cfg"]["target"],',
+        '    "vae_target": config["vae_config"]["target"],',
+        '    "surface_extraction": config["surface"]["extraction"],',
+        '    "export_format": config["export"]["format"],',
+        '  },',
+        '  "stages": {',
+        '    "pipeline": build_refine_pipeline(),',
+        '    "preprocess": {"class": ImageProcessorV2.__name__, "method": "process"},',
+        '    "conditioning": {"class": SingleImageEncoder.__name__, "method": "build"},',
+        '    "surface": {"class": SharpEdgeSurfaceLoader.__name__, "method": "load"},',
+        '    "scheduler": {"family": default_scheduler_name()},',
+        '    "denoise": {"class": RefineDiT.__name__, "method": "denoise"},',
+        '    "decode": {"class": ShapeVAE.__name__, "method": "decode_latents"},',
+        '  },',
+        '}',
+        'print(json.dumps(payload))',
+      ].join('\n'),
+      [configPath],
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      runtime: {
+        scope: 'mc-only',
+        layout: 'vendored-upstream-closure',
+        ready: true,
+        checkpoint_required_subtrees: ['vae', 'dit', 'conditioner'],
+        public_error_codes: ['DEPENDENCY_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE', 'WEIGHTS_MISSING'],
+      },
+      config: {
+        scope: 'mc-only',
+        requires_exact_closure: true,
+        scheduler_target: 'diffusers.FlowMatchEulerDiscreteScheduler',
+        conditioner_target: 'ultrashape_runtime.models.conditioner_mask.SingleImageEncoder',
+        dit_target: 'ultrashape_runtime.models.denoisers.dit_mask.RefineDiT',
+        vae_target: 'ultrashape_runtime.models.autoencoders.model.ShapeVAE',
+        surface_extraction: 'mc',
+        export_format: 'glb',
+      },
+      stages: {
+        pipeline: { name: 'ultrashape-refine', scope: 'mc-only' },
+        preprocess: { class: 'ImageProcessorV2', method: 'process' },
+        conditioning: { class: 'SingleImageEncoder', method: 'build' },
+        surface: { class: 'SharpEdgeSurfaceLoader', method: 'load' },
+        scheduler: { family: 'flow-matching-euler-discrete' },
+        denoise: { class: 'RefineDiT', method: 'denoise' },
+        decode: { class: 'ShapeVAE', method: 'decode_latents' },
+      },
+    });
   });
 
-  it('runs the repo-root Python boundary from the named-input contract and packages refined.<format> without any JS install artifact', () => {
-    const fixture = createFixtureWorkspace();
+  it('rejects shorthand closure configs instead of re-authorizing synthetic runtime allowances', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-runtime-config-'));
+    const shorthandConfigPath = path.join(sandbox, 'shorthand.yaml');
+    writeFileSync(
+      shorthandConfigPath,
+      ['model:', '  scope: mc-only', 'runtime:', '  backend: local', '  requires_exact_closure: false'].join('\n'),
+      'utf8',
+    );
+
+    const result = runPythonSnippet(
+      [
+        'import json, sys',
+        'from ultrashape_runtime.pipelines import load_runtime_config',
+        'try:',
+        '    load_runtime_config(sys.argv[1])',
+        'except Exception as error:',
+        '    print(json.dumps({"ok": False, "code": getattr(error, "code", None), "message": str(error)}))',
+        'else:',
+        '    print(json.dumps({"ok": True}))',
+      ].join('\n'),
+      [shorthandConfigPath],
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: false,
+      code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      message: 'Runtime config requires_exact_closure: true for the upstream closure path.',
+    });
+  });
+
+  it('executes the vendored local runner and writes output_dir/refined.glb', () => {
+    const fixture = createRuntimeFixture();
+    const outputDir = path.join(fixture.sandbox, 'output');
 
     try {
-      installProcessorRuntime(fixture.root);
-      writeReadiness(fixture.root);
-
-      const events = runProcessor(
+      const result = runLocalRunner(
         {
-          extDir: fixture.root,
-          input: {
-            inputs: {
-              reference_image: {
-                filePath: fixture.referenceImage,
-              },
-              coarse_mesh: {
-                filePath: fixture.coarseMesh,
-              },
-            },
-          },
-          params: {
-            backend: 'local',
-            output_format: 'glb',
-          },
-          workspaceDir: fixture.outputDir,
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: outputDir,
+          output_format: 'glb',
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
         },
-        {
-          cwd: fixture.root,
-        },
+        fixture.stubRoot,
       );
 
-      expect(existsSync(resolve(repoRoot, 'processor.js'))).toBe(false);
-      expect(existsSync(resolve(repoRoot, 'runtime/modly'))).toBe(false);
-      expect(events.at(-1)).toEqual({
-        type: 'done',
-        result: {
-          filePath: join(fixture.outputDir, 'refined.glb'),
-        },
-      });
-      expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('keeps the fallback seam compatible when named inputs are absent and validation still succeeds', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeReadiness(fixture.root, {
-        status: 'blocked',
-        required_imports_ok: false,
-        missing_required: ['onnxruntime'],
-      });
-
-      const events = runProcessor(
-        {
-          extDir: fixture.root,
-          input: {
-            filePath: fixture.referenceImage,
-          },
-          params: {
-            coarse_mesh: fixture.coarseMesh,
-            backend: 'auto',
-          },
-          workspaceDir: fixture.outputDir,
-        },
-        {
-          cwd: fixture.root,
-        },
-      );
-
-      expect(events.at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('DEPENDENCY_MISSING'),
-        code: 'DEPENDENCY_MISSING',
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('prefers the installed extension directory from processor.py before cwd fallback when extDir is omitted', () => {
-    const fixture = createFixtureWorkspace();
-    const installedExtDir = join(fixture.root, 'installed-extension');
-    const installedProcessorPath = join(installedExtDir, 'processor.py');
-
-    try {
-      mkdirSync(installedExtDir);
-      writeFileSync(installedProcessorPath, readFileSync(processorPath, 'utf8'));
-      installProcessorRuntime(installedExtDir);
-      writeReadiness(installedExtDir);
-
-      const events = runProcessor(
-        {
-          input: {
-            inputs: {
-              reference_image: {
-                filePath: fixture.referenceImage,
-              },
-              coarse_mesh: {
-                filePath: fixture.coarseMesh,
-              },
-            },
-          },
-          params: {
-            backend: 'local',
-            output_format: 'glb',
-          },
-          workspaceDir: fixture.outputDir,
-        },
-        {
-          cwd: fixture.root,
-          processorPath: installedProcessorPath,
-        },
-      );
-
-      expect(events.at(-1)).toEqual({
-        type: 'done',
-        result: {
-          filePath: join(fixture.outputDir, 'refined.glb'),
-        },
-      });
-      expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('maps blocked local readiness without missing deps or weights to LOCAL_RUNTIME_UNAVAILABLE', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeReadiness(fixture.root, {
-        status: 'blocked',
-      });
-
-      const events = runProcessor(
-        {
-          extDir: fixture.root,
-          input: {
-            inputs: {
-              reference_image: {
-                filePath: fixture.referenceImage,
-              },
-              coarse_mesh: {
-                filePath: fixture.coarseMesh,
-              },
-            },
-          },
-          params: {
-            backend: 'auto',
-          },
-          workspaceDir: fixture.outputDir,
-        },
-        {
-          cwd: fixture.root,
-        },
-      );
-
-      expect(events.at(-1)).toEqual({
-        type: 'error',
-        message: expect.stringContaining('LOCAL_RUNTIME_UNAVAILABLE'),
-        code: 'LOCAL_RUNTIME_UNAVAILABLE',
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('runs the vendored local runner to generate refined.glb inside the requested output directory', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      expect(outcome).toEqual({
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
         ok: true,
         result: {
-          file_path: join(fixture.outputDir, 'refined.glb'),
-          format: 'glb',
           backend: 'local',
-          metrics: expect.any(Object),
-          fallbacks: ['flash_attn->sdpa'],
+          format: 'glb',
+          file_path: path.join(outputDir, 'refined.glb'),
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
-          warnings: [],
         },
       });
-      const result = outcome.result;
-      expect(result).not.toBeNull();
-      expect((result as Record<string, unknown>)).not.toHaveProperty('runtime_contract');
-      expectRealClosureMetrics(getRunnerMetrics(outcome));
-      expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
-      expect(getGlbPositionAccessorCount(join(fixture.outputDir, 'refined.glb'))).toBeGreaterThan(8);
+      expect(existsSync(path.join(outputDir, 'refined.glb'))).toBe(true);
     } finally {
-      fixture.cleanup();
+      rmSync(fixture.sandbox, { recursive: true, force: true });
     }
   });
 
-  it('accepts binary glb coarse meshes without utf8 decode failures and writes a binary refined.glb', () => {
-    const fixture = createFixtureWorkspace();
+  it('maps unreadable checkpoints to WEIGHTS_MISSING through the real runner path', () => {
+    const fixture = createRuntimeFixture();
 
     try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.binaryCoarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      expect(outcome).toEqual({
-        ok: true,
-        result: {
-          file_path: join(fixture.outputDir, 'refined.glb'),
-          format: 'glb',
+      const result = runLocalRunner(
+        {
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: path.join(fixture.sandbox, 'output'),
+          output_format: 'glb',
+          checkpoint: path.join(fixture.sandbox, 'missing.pt'),
+          config_path: configPath,
+          ext_dir: fixture.extDir,
           backend: 'local',
-          metrics: expect.any(Object),
-          fallbacks: ['flash_attn->sdpa'],
-          subtrees_loaded: ['vae', 'dit', 'conditioner'],
-          warnings: [],
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
         },
-      });
-      const result = outcome.result;
-      expect(result).not.toBeNull();
-      expect((result as Record<string, unknown>)).not.toHaveProperty('runtime_contract');
-      expectRealClosureMetrics(getRunnerMetrics(outcome));
-      expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
-      expect(getGlbPositionAccessorCount(join(fixture.outputDir, 'refined.glb'))).toBeGreaterThan(8);
-    } finally {
-      fixture.cleanup();
-    }
-  });
+        fixture.stubRoot,
+      );
 
-  it('rejects non-mc scope configs at the vendored runner seam as LOCAL_RUNTIME_UNAVAILABLE', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath, {
-        scope: 'full-volume',
-      });
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: null,
-        preserve_scale: true,
-      });
-
-      expect(outcome).toEqual({
-        ok: false,
-        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('mc-only'),
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('rejects shorthand configs instead of re-authorizing a synthetic runtime contract in the adapter', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeSyntheticSuccessConfig(fixture.configPath);
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: null,
-        preserve_scale: true,
-      });
-
-      expect(outcome).toEqual({
-        ok: false,
-        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('requires_exact_closure'),
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('rejects non-glb output requests at the vendored runner seam as LOCAL_RUNTIME_UNAVAILABLE', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'obj',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: null,
-        preserve_scale: true,
-      });
-
-      expect(outcome).toEqual({
-        ok: false,
-        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('glb-only'),
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('maps missing checkpoint drift after config resolution to WEIGHTS_MISSING at the vendored runner seam', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-      rmSync(fixture.checkpoint);
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: null,
-        preserve_scale: true,
-      });
-
-      expect(outcome).toEqual({
+      expect(result.status).toBe(1);
+      expect(JSON.parse(result.stdout)).toEqual({
         ok: false,
         error_code: 'WEIGHTS_MISSING',
-        error_message: expect.stringContaining('ultrashape_v1.pt'),
+        error_message: `Required checkpoint is not readable: ${path.join(fixture.sandbox, 'missing.pt')}.`,
       });
     } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('rejects checkpoints that do not contain the required vae/dit/conditioner subtrees', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      for (const missingSubtree of ['vae', 'dit', 'conditioner'] as const) {
-        writeBinaryCheckpointBundle(fixture.checkpoint, checkpointBundleWithout(missingSubtree));
-
-        const outcome = runLocalRunner({
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: null,
-          preserve_scale: true,
-        });
-
-        expect(outcome).toEqual({
-          ok: false,
-          error_code: 'WEIGHTS_MISSING',
-          error_message: expect.stringContaining(missingSubtree),
-        });
-        expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
-      }
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('rejects plain JSON subtree stubs that do not satisfy the real checkpoint tensor contract', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-      writeBinaryCheckpointBundle(fixture.checkpoint, {
-        vae: { weights: 'fixture-vae' },
-        dit: { weights: 'fixture-dit' },
-        conditioner: { weights: 'fixture-conditioner' },
-      });
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: null,
-        preserve_scale: true,
-      });
-
-      expect(outcome).toEqual({
-        ok: false,
-        error_code: 'WEIGHTS_MISSING',
-        error_message: expect.stringContaining('tensor'),
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('stores compact checkpoint summaries instead of full tensor float lists', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeBinaryCheckpointBundle(fixture.checkpoint, {
-        vae: { tensors: { latent_basis: Array.from({ length: 16 }, (_, index) => (index + 1) / 20) } },
-        dit: { tensors: { attention_bias: Array.from({ length: 12 }, (_, index) => (index + 2) / 20) } },
-        conditioner: { tensors: { mask_bias: Array.from({ length: 10 }, (_, index) => (index + 3) / 20) } },
-      });
-
-      const inspected = inspectCheckpointBundle(fixture.checkpoint, fixture.root, fixture.stubDir);
-      const bundle = inspected.bundle as Record<string, unknown>;
-      const vae = bundle.vae as Record<string, unknown>;
-      const tensors = vae.tensors as Record<string, unknown>;
-      const latentBasis = tensors.latent_basis as Record<string, unknown>;
-
-      expect(inspected.summary).toEqual(
-        expect.objectContaining({
-          representation: 'tensor-summary-v1',
-          tensor_count: 3,
-          value_count: 38,
-        }),
-      );
-      expect(vae).toEqual(
-        expect.objectContaining({
-          representation: 'checkpoint-subtree-v1',
-          value_count: 16,
-          state_dict: expect.objectContaining({
-            tensors: expect.any(Object),
-          }),
-          state_dict_metadata: expect.objectContaining({
-            tensor_count: 1,
-            value_count: 16,
-          }),
-        }),
-      );
-      expect(vae).not.toHaveProperty('tokens');
-      expect(latentBasis).toEqual(
-        expect.objectContaining({
-          sample_count: 8,
-          value_count: 16,
-          sample: expect.any(Array),
-          mean: expect.any(Number),
-        }),
-      );
-      expect((latentBasis.sample as unknown[])).toHaveLength(8);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('exposes voxel conditioning truth with sampled surface points instead of synthetic voxel token summaries', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      const outcome = runPythonSnippet(
-        [
-          'import json, sys',
-          'from ultrashape_runtime.surface_loaders import SharpEdgeSurfaceLoader',
-          'surface_state = SharpEdgeSurfaceLoader().load(sys.argv[1])',
-          'payload = {',
-          '  "surface_keys": sorted(surface_state.keys()),',
-          '  "mesh_keys": sorted(surface_state["mesh"].keys()),',
-          '  "voxel_keys": sorted(surface_state["voxel_cond"].keys()),',
-          '  "sampled_surface_points": len(surface_state["sampled_surface_points"]),',
-          '  "voxel_count": surface_state["voxel_cond"]["voxel_count"],',
-          '}',
-          'print(json.dumps(payload))',
-        ].join('\n'),
-        [fixture.coarseMesh],
-        [fixture.stubDir],
-      );
-
-      expect(outcome.status).toBe(0);
-      const payload = JSON.parse(outcome.stdout) as Record<string, unknown>;
-      expect(payload.surface_keys).toEqual(expect.arrayContaining(['mesh', 'sampled_surface_points', 'voxel_cond']));
-      expect(payload.mesh_keys).toEqual(expect.arrayContaining(['sampled_surface_points', 'surface_point_count']));
-      expect(payload.mesh_keys).not.toEqual(expect.arrayContaining(['tokens']));
-      expect(payload.voxel_keys).toEqual(
-        expect.arrayContaining(['bounds', 'coords', 'occupancies', 'occupied_ratio', 'resolution', 'surface_point_count', 'voxel_count']),
-      );
-      expect(payload.voxel_keys).not.toEqual(expect.arrayContaining(['tokens', 'voxel_coords', 'voxel_values']));
-      expect(payload.sampled_surface_points).toEqual(expect.any(Number));
-      expect(Number(payload.sampled_surface_points)).toBeGreaterThan(8);
-      expect(Number(payload.voxel_count)).toBeGreaterThan(0);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('maps missing config bootstrap failures to LOCAL_RUNTIME_UNAVAILABLE at the vendored runner seam', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: fixture.checkpoint,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: null,
-        preserve_scale: true,
-      });
-
-      expect(outcome).toEqual({
-        ok: false,
-        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('config_path'),
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('maps missing required runtime imports to DEPENDENCY_MISSING at the vendored runner seam', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath, {
-        requiredImports: ['module_that_does_not_exist_for_ultrashape_tests'],
-      });
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: null,
-        preserve_scale: true,
-      });
-
-      expect(outcome).toEqual({
-        ok: false,
-        error_code: 'DEPENDENCY_MISSING',
-        error_message: expect.stringContaining('module_that_does_not_exist_for_ultrashape_tests'),
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('maps missing output generation to LOCAL_RUNTIME_UNAVAILABLE at the vendored runner seam', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner(
-        {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: null,
-          preserve_scale: true,
-        },
-        {
-          env: {
-            ULTRASHAPE_TEST_SKIP_OUTPUT_WRITE: '1',
-          },
-        },
-      );
-
-      expect(outcome).toEqual({
-        ok: false,
-        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('refined.glb'),
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('derives closure metrics from executed inputs instead of placeholder formulas', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const firstOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-      const firstPositions = getGlbPositions(join(fixture.outputDir, 'refined.glb'));
-
-      writeFileSync(fixture.referenceImage, createReferenceImageBytes('b'));
-      const secondOutputDir = join(fixture.root, 'output-variant-both');
-      mkdirSync(secondOutputDir);
-
-      const secondOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.binaryCoarseMesh,
-        output_dir: secondOutputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      const firstMetrics = getRunnerMetrics(firstOutcome);
-      const secondMetrics = getRunnerMetrics(secondOutcome);
-      const secondPositions = getGlbPositions(join(secondOutputDir, 'refined.glb'));
-
-      expect(firstMetrics.preprocess).toEqual(
-        expect.objectContaining({
-          image_tensor_shape: [1, 2, 2, 4],
-          image_feature_count: expect.any(Number),
-        }),
-      );
-      expect(firstMetrics.conditioning).toEqual(
-        expect.objectContaining({
-          surface_vertex_count: 8,
-          surface_face_count: 12,
-          voxel_resolution: 12,
-        }),
-      );
-      expect(firstMetrics.preprocess).not.toEqual(secondMetrics.preprocess);
-      expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
-      expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
-      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
-      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
-      expect(firstPositions).not.toEqual(secondPositions);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('mesh-only variation changes geometry and causality fingerprints', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const firstOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-      const firstPositions = getGlbPositions(join(fixture.outputDir, 'refined.glb'));
-      const secondOutputDir = join(fixture.root, 'output-mesh-b');
-      mkdirSync(secondOutputDir);
-
-      const secondOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.binaryCoarseMesh,
-        output_dir: secondOutputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      const firstMetrics = getRunnerMetrics(firstOutcome);
-      const secondMetrics = getRunnerMetrics(secondOutcome);
-      const firstCausality = getCausalityMetrics(firstMetrics);
-      const secondCausality = getCausalityMetrics(secondMetrics);
-      const secondPositions = getGlbPositions(join(secondOutputDir, 'refined.glb'));
-
-      expect(firstMetrics.preprocess).toEqual(secondMetrics.preprocess);
-      expect(firstMetrics.conditioning).toEqual(
-        expect.objectContaining({
-          surface_vertex_count: 8,
-          surface_face_count: 12,
-          surface_point_count: expect.any(Number),
-        }),
-      );
-      expect(secondMetrics.conditioning).toEqual(
-        expect.objectContaining({
-          surface_vertex_count: 8,
-          surface_face_count: 12,
-          surface_point_count: expect.any(Number),
-        }),
-      );
-      expect(firstMetrics.gate).toEqual(
-        expect.objectContaining({
-          reference_image_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-          attribution_signature: expect.any(Number),
-        }),
-      );
-      expect(secondMetrics.gate).toEqual(
-        expect.objectContaining({
-          reference_image_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-          attribution_signature: expect.any(Number),
-        }),
-      );
-      expect(firstCausality.image_fingerprint).toBe(secondCausality.image_fingerprint);
-      expect(firstCausality.checkpoint_fingerprint).toBe(secondCausality.checkpoint_fingerprint);
-      expect(firstCausality.mesh_fingerprint).not.toBe(secondCausality.mesh_fingerprint);
-      expect(firstCausality.context_fingerprint).not.toBe(secondCausality.context_fingerprint);
-      expect(firstCausality.latent_fingerprint).not.toBe(secondCausality.latent_fingerprint);
-      expect(firstCausality.field_fingerprint).not.toBe(secondCausality.field_fingerprint);
-      expect(firstCausality.geometry_fingerprint).not.toBe(secondCausality.geometry_fingerprint);
-      expect(firstPositions).not.toEqual(secondPositions);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('image-only variation changes geometry and causality fingerprints', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const firstOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-      const firstPositions = getGlbPositions(join(fixture.outputDir, 'refined.glb'));
-
-      writeFileSync(fixture.referenceImage, createReferenceImageBytes('b'));
-      const secondOutputDir = join(fixture.root, 'output-image-b');
-      mkdirSync(secondOutputDir);
-
-      const secondOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: secondOutputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      const firstMetrics = getRunnerMetrics(firstOutcome);
-      const secondMetrics = getRunnerMetrics(secondOutcome);
-      const firstCausality = getCausalityMetrics(firstMetrics);
-      const secondCausality = getCausalityMetrics(secondMetrics);
-      const secondPositions = getGlbPositions(join(secondOutputDir, 'refined.glb'));
-
-      expect(firstMetrics.preprocess).toEqual(
-        expect.objectContaining({
-          image_tensor_shape: [1, 2, 2, 4],
-          image_feature_count: expect.any(Number),
-          mask_feature_count: expect.any(Number),
-        }),
-      );
-      expect(firstMetrics.gate).toEqual(
-        expect.objectContaining({
-          coarse_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-          attribution_signature: expect.any(Number),
-        }),
-      );
-      expect(secondMetrics.gate).toEqual(
-        expect.objectContaining({
-          coarse_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-          attribution_signature: expect.any(Number),
-        }),
-      );
-      expect(firstCausality.mesh_fingerprint).toBe(secondCausality.mesh_fingerprint);
-      expect(firstCausality.checkpoint_fingerprint).toBe(secondCausality.checkpoint_fingerprint);
-      expect(firstCausality.image_fingerprint).not.toBe(secondCausality.image_fingerprint);
-      expect(firstCausality.context_fingerprint).not.toBe(secondCausality.context_fingerprint);
-      expect(firstCausality.latent_fingerprint).not.toBe(secondCausality.latent_fingerprint);
-      expect(firstCausality.field_fingerprint).not.toBe(secondCausality.field_fingerprint);
-      expect(firstCausality.geometry_fingerprint).not.toBe(secondCausality.geometry_fingerprint);
-      expect(firstPositions).not.toEqual(secondPositions);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('publishes checkpoint-backed image conditioning metadata from SingleImageEncoder', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      expect(getRunnerMetrics(outcome).conditioning).toEqual(
-        expect.objectContaining({
-          encoder: 'SingleImageEncoder',
-          surface_vertex_count: 8,
-          surface_face_count: 12,
-          context_token_count: expect.any(Number),
-          context_mask_token_count: expect.any(Number),
-          cfg_pairing: expect.objectContaining({
-            mode: 'classifier-free-guidance',
-            positive_context_tokens: expect.any(Number),
-            negative_context_tokens: expect.any(Number),
-          }),
-          conditioner_metadata: expect.objectContaining({
-            image_signature: expect.any(Number),
-            mesh_signature: expect.any(Number),
-            voxel_signature: expect.any(Number),
-            checkpoint_signature: expect.any(Number),
-            checkpoint_tensor_count: expect.any(Number),
-            checkpoint_value_count: expect.any(Number),
-          }),
-          state_hydrated: true,
-          hydration: expect.objectContaining({
-            module: 'SingleImageEncoder',
-            load_style: 'load_state_dict',
-            strict: false,
-          }),
-        }),
-      );
-      expect(getRunnerMetrics(outcome).conditioning).not.toHaveProperty('mask_tokens');
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('uses FlowMatchEulerDiscreteScheduler-guided RefineDiT denoising instead of step-agnostic placeholders', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const firstOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 12,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-      const secondOutputDir = join(fixture.root, 'output-steps-30');
-      mkdirSync(secondOutputDir);
-      const secondOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: secondOutputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-      const firstMetrics = getRunnerMetrics(firstOutcome);
-      const secondMetrics = getRunnerMetrics(secondOutcome);
-
-      expect(firstMetrics.scheduler).toEqual(
-        expect.objectContaining({
-          family: 'flow-matching-euler-discrete',
-          target: 'diffusers.FlowMatchEulerDiscreteScheduler',
-          step_count: 12,
-          object_type: 'FlowMatchEulerDiscreteScheduler',
-          consumed_timesteps: expect.any(Array),
-          consumed_sigmas: expect.any(Array),
-          sigma_start: expect.any(Number),
-          sigma_end: expect.any(Number),
-          timestep_signature: expect.any(Number),
-        }),
-      );
-      expect((firstMetrics.scheduler as Record<string, unknown>).consumed_timesteps).toHaveLength(12);
-      expect((firstMetrics.scheduler as Record<string, unknown>).consumed_sigmas).toHaveLength(12);
-      expect(firstMetrics.denoise).toEqual(
-        expect.objectContaining({
-          model: 'RefineDiT',
-          inputs: expect.objectContaining({
-            latents: expect.objectContaining({
-              count: expect.any(Number),
-              signature: expect.any(Number),
-            }),
-            timestep: expect.objectContaining({
-              count: 12,
-              signature: expect.any(Number),
-            }),
-            context: expect.objectContaining({
-              count: expect.any(Number),
-              signature: expect.any(Number),
-            }),
-            context_mask: expect.objectContaining({
-              count: expect.any(Number),
-              signature: expect.any(Number),
-            }),
-            voxel_cond: expect.objectContaining({
-              voxel_count: expect.any(Number),
-              signature: expect.any(Number),
-            }),
-          }),
-          timestep_count: 12,
-          state_hydrated: true,
-          hydration: expect.objectContaining({
-            module: 'RefineDiT',
-            load_style: 'load_state_dict',
-            strict: false,
-          }),
-        }),
-      );
-      expect(firstMetrics.denoise).not.toEqual(
-        expect.objectContaining({
-          scheduler_signature: expect.any(Number),
-          conditioning_signature: expect.any(Number),
-        }),
-      );
-      expect(firstMetrics.scheduler).not.toEqual(secondMetrics.scheduler);
-      expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
-      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
-      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('hydrates checkpoint-backed modules and invokes real diffusers/cubvh seams in the supported path', () => {
-    const fixture = createFixtureWorkspace();
-    const diffusersTracePath = join(fixture.root, 'diffusers-trace.json');
-    const cubvhTracePath = join(fixture.root, 'cubvh-trace.json');
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner(
-        {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: 7,
-          preserve_scale: true,
-        },
-        {
-          env: {
-            ULTRASHAPE_TEST_DIFFUSERS_TRACE_PATH: diffusersTracePath,
-            ULTRASHAPE_TEST_CUBVH_TRACE_PATH: cubvhTracePath,
-            ULTRASHAPE_TEST_CUBVH_RETURNS_TENSORS: '1',
-          },
-        },
-      );
-
-      expect(outcome?.ok).toBe(true);
-      const metrics = getRunnerMetrics(outcome);
-      expect(metrics.checkpoint).toEqual(
-        expect.objectContaining({
-          load_style: 'load_state_dict',
-          hydrated_modules: ['conditioner', 'dit', 'vae'],
-        }),
-      );
-      expect(JSON.parse(readFileSync(diffusersTracePath, 'utf8'))).toEqual(
-        expect.objectContaining({
-          event: 'set_timesteps',
-          step_count: 30,
-          timesteps: expect.any(Array),
-        }),
-      );
-      const diffusersTrace = JSON.parse(readFileSync(diffusersTracePath, 'utf8')) as {
-        timesteps: number[];
-      };
-      expect(metrics.scheduler).toEqual(
-        expect.objectContaining({
-          object_type: 'FlowMatchEulerDiscreteScheduler',
-          consumed_timesteps: diffusersTrace.timesteps,
-          consumed_sigmas: expect.any(Array),
-        }),
-      );
-      expect(((metrics.scheduler as Record<string, unknown>).consumed_sigmas as unknown[])).toHaveLength(diffusersTrace.timesteps.length);
-      expect(JSON.parse(readFileSync(cubvhTracePath, 'utf8'))).toEqual(
-        expect.objectContaining({
-          coords_type: 'Tensor',
-          corners_type: 'Tensor',
-          coords_dtype: 'int32',
-          corners_dtype: 'float32',
-          coords: expect.any(Number),
-          corners: expect.any(Number),
-          iso: 0,
-          ensure_consistency: false,
-        }),
-      );
-      const cubvhTrace = JSON.parse(readFileSync(cubvhTracePath, 'utf8')) as { coords: number; corners: number };
-      expect(cubvhTrace.coords).toBeGreaterThanOrEqual(64);
-      expect(cubvhTrace.corners).toBe(cubvhTrace.coords);
-      expect((metrics.decode as Record<string, unknown>).cell_count).toBeGreaterThanOrEqual(64);
-      expect(metrics.decode).toEqual(
-        expect.objectContaining({
-          authority: 'occupancy_field_grid',
-          field_value_count: expect.any(Number),
-          field_grid_shape: [expect.any(Number), expect.any(Number), expect.any(Number)],
-          field_grid_signature: expect.any(Number),
-          corner_signature: expect.any(Number),
-        }),
-      );
-      expect(metrics.extract).toEqual(
-        expect.objectContaining({
-          authority: 'decoded_field',
-          source_field_signature: (metrics.decode as Record<string, unknown>).field_signature,
-          source_corner_signature: (metrics.decode as Record<string, unknown>).corner_signature,
-        }),
-      );
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('propagates a checkpoint-backed occupancy field grid through decode metrics', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner(
-        {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: 7,
-          preserve_scale: true,
-        },
-      );
-
-      expect(outcome?.ok).toBe(true);
-      const metrics = getRunnerMetrics(outcome);
-      expect(metrics.decode).toEqual(
-        expect.objectContaining({
-          authority: 'occupancy_field_grid',
-          field_grid_shape: [expect.any(Number), expect.any(Number), expect.any(Number)],
-          occupied_grid_cells: expect.any(Number),
-          field_grid_signature: expect.any(Number),
-        }),
-      );
-      expect(Number((metrics.decode as Record<string, unknown>).occupied_grid_cells)).toBeGreaterThan(0);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('forces CUDA_LAUNCH_BLOCKING=1 for the local runner path without overwriting an explicit value', () => {
-    const fixture = createFixtureWorkspace();
-    const defaultTracePath = join(fixture.root, 'cubvh-default-trace.json');
-    const preservedTracePath = join(fixture.root, 'cubvh-preserved-trace.json');
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const defaultOutcome = runLocalRunner(
-        {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: 7,
-          preserve_scale: true,
-        },
-        {
-          env: {
-            ULTRASHAPE_TEST_CUBVH_TRACE_PATH: defaultTracePath,
-          },
-        },
-      );
-      expect(defaultOutcome?.ok).toBe(true);
-      expect(JSON.parse(readFileSync(defaultTracePath, 'utf8'))).toEqual(
-        expect.objectContaining({
-          cuda_launch_blocking: '1',
-        }),
-      );
-
-      const preservedOutcome = runLocalRunner(
-        {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: 7,
-          preserve_scale: true,
-        },
-        {
-          env: {
-            CUDA_LAUNCH_BLOCKING: '0',
-            ULTRASHAPE_TEST_CUBVH_TRACE_PATH: preservedTracePath,
-          },
-        },
-      );
-      expect(preservedOutcome?.ok).toBe(true);
-      expect(JSON.parse(readFileSync(preservedTracePath, 'utf8'))).toEqual(
-        expect.objectContaining({
-          cuda_launch_blocking: '0',
-        }),
-      );
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('surfaces cubvh input diagnostics while preserving LOCAL_RUNTIME_UNAVAILABLE at the runner seam', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner(
-        {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: 7,
-          preserve_scale: true,
-        },
-        {
-          env: {
-            ULTRASHAPE_TEST_CUBVH_ERROR_MESSAGE: 'CUDA error: out of memory',
-          },
-        },
-      );
-
-      expect(outcome).toEqual(
-        expect.objectContaining({
-          ok: false,
-          error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-          error_message: expect.stringContaining('cubvh.sparse_marching_cubes failed: CUDA error: out of memory'),
-        }),
-      );
-      expect(outcome.error_message).toEqual(expect.stringContaining('coords_shape='));
-      expect(outcome.error_message).toEqual(expect.stringContaining('corners_shape='));
-      expect(outcome.error_message).toEqual(expect.stringContaining('coords_dtype=int32'));
-      expect(outcome.error_message).toEqual(expect.stringContaining('corners_dtype=float32'));
-      expect(outcome.error_message).toEqual(expect.stringContaining('cell_count='));
-      expect(outcome.error_message).toEqual(expect.stringContaining('iso=0.0'));
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('exports refined.glb from the extracted mesh geometry instead of synthetic payload bytes', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      expect(outcome?.ok).toBe(true);
-      const metrics = getRunnerMetrics(outcome);
-      const extractMetrics = metrics.extract as Record<string, unknown>;
-      const refinedPath = join(fixture.outputDir, 'refined.glb');
-      const refinedBytes = readFileSync(refinedPath);
-      const refinedDocument = readGlbJson(refinedPath);
-      const primitive = refinedDocument.meshes?.[0]?.primitives?.[0];
-      const indexAccessorIndex = primitive?.indices;
-      expect(indexAccessorIndex).toEqual(expect.any(Number));
-      const indexAccessor = refinedDocument.accessors?.[indexAccessorIndex as number] as { count?: unknown } | undefined;
-
-      expect(extractMetrics).toEqual(
-        expect.objectContaining({
-          vertex_count: getGlbPositionAccessorCount(refinedPath),
-          face_count: Math.floor(Number(indexAccessor?.count ?? 0) / 3),
-          payload_bytes: refinedBytes.length,
-        }),
-      );
-      expect(Number(extractMetrics.vertex_count)).toBeGreaterThanOrEqual(24);
-      expect(Number(extractMetrics.face_count)).toBeGreaterThanOrEqual(16);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('rejects byte-derived refined mesh payloads instead of fabricating fallback geometry', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      const outcome = runPythonSnippet(
-        [
-          'import json',
-          'from ultrashape_runtime.models.autoencoders.surface_extractors import build_renderable_mesh_payload',
-          'try:',
-          '    build_renderable_mesh_payload({',
-          '        "kind": "refined-mesh",',
-          '        "mesh_name": "synthetic-refined",',
-          '        "bytes": b"synthetic-refined-payload",',
-          '    })',
-          'except Exception as error:',
-          '    print(json.dumps({"ok": False, "error": str(error)}))',
-          'else:',
-          '    print(json.dumps({"ok": True}))',
-        ].join('\n'),
-        [],
-        [fixture.stubDir],
-      );
-
-      expect(outcome.status).toBe(0);
-      expect(JSON.parse(outcome.stdout)).toEqual({
-        ok: false,
-        error: expect.stringContaining('renderable vertices and faces'),
-      });
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('derives staged closure metrics from checkpoint tensor values, not subtree key presence alone', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-      writeCheckpointBundle(fixture.checkpoint, 'a');
-
-      const firstOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      writeCheckpointBundle(fixture.checkpoint, 'b');
-
-      const secondOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      const firstResult = firstOutcome?.result as { metrics?: Record<string, unknown> } | undefined;
-      const secondResult = secondOutcome?.result as { metrics?: Record<string, unknown> } | undefined;
-      const firstMetrics = firstResult?.metrics ?? {};
-      const secondMetrics = secondResult?.metrics ?? {};
-
-      expect(firstMetrics.conditioning).not.toEqual(secondMetrics.conditioning);
-      expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
-      expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
-      expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('derives initial latents from conditioning and coarse geometry instead of seed-driven offsets', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const firstOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-
-      const secondOutputDir = join(fixture.root, 'output-seed-13');
-      mkdirSync(secondOutputDir);
-      const secondOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: secondOutputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 13,
-        preserve_scale: true,
-      });
-
-      const firstMetrics = getRunnerMetrics(firstOutcome);
-      const secondMetrics = getRunnerMetrics(secondOutcome);
-      const firstCausality = getCausalityMetrics(firstMetrics);
-      const secondCausality = getCausalityMetrics(secondMetrics);
-
-      expect(firstMetrics.denoise).toEqual(
-        expect.objectContaining({
-          inputs: expect.objectContaining({
-            latents: expect.objectContaining({
-              count: expect.any(Number),
-              signature: expect.any(Number),
-            }),
-          }),
-        }),
-      );
-      expect((firstMetrics.denoise as Record<string, unknown>).inputs).toEqual(
-        (secondMetrics.denoise as Record<string, unknown>).inputs,
-      );
-      expect(firstMetrics.denoise).toEqual(secondMetrics.denoise);
-      expect(firstMetrics.decode).toEqual(secondMetrics.decode);
-      expect(firstMetrics.extract).toEqual(secondMetrics.extract);
-      expect(firstCausality).toEqual(secondCausality);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('checkpoint-only variation changes geometry and causality fingerprints', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-      writeCheckpointBundle(fixture.checkpoint, 'a');
-
-      const firstOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: fixture.outputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-      writeCheckpointBundle(fixture.checkpoint, 'b');
-
-      const secondOutputDir = join(fixture.root, 'output-checkpoint-b');
-      mkdirSync(secondOutputDir);
-      const secondOutcome = runLocalRunner({
-        reference_image: fixture.referenceImage,
-        coarse_mesh: fixture.coarseMesh,
-        output_dir: secondOutputDir,
-        output_format: 'glb',
-        checkpoint: null,
-        config_path: fixture.configPath,
-        ext_dir: fixture.root,
-        backend: 'local',
-        steps: 30,
-        guidance_scale: 5.5,
-        seed: 7,
-        preserve_scale: true,
-      });
-      const firstMetrics = getRunnerMetrics(firstOutcome);
-      const secondMetrics = getRunnerMetrics(secondOutcome);
-      const firstCausality = getCausalityMetrics(firstMetrics);
-      const secondCausality = getCausalityMetrics(secondMetrics);
-      const firstPositions = getGlbPositions(join(fixture.outputDir, 'refined.glb'));
-      const secondPositions = getGlbPositions(join(secondOutputDir, 'refined.glb'));
-
-      expect(firstMetrics.conditioning).toEqual(
-        expect.objectContaining({
-          conditioner_metadata: expect.objectContaining({
-            checkpoint_signature: expect.any(Number),
-          }),
-        }),
-      );
-      expect(firstMetrics.denoise).toEqual(
-        expect.objectContaining({
-          checkpoint_signature: expect.any(Number),
-        }),
-      );
-      expect(firstMetrics.gate).toEqual(
-        expect.objectContaining({
-          coarse_signature: expect.any(Number),
-          reference_image_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-          attribution_signature: expect.any(Number),
-        }),
-      );
-      expect(secondMetrics.gate).toEqual(
-        expect.objectContaining({
-          coarse_signature: expect.any(Number),
-          reference_image_signature: expect.any(Number),
-          checkpoint_signature: expect.any(Number),
-          attribution_signature: expect.any(Number),
-        }),
-      );
-      expect(firstCausality.image_fingerprint).toBe(secondCausality.image_fingerprint);
-      expect(firstCausality.mesh_fingerprint).toBe(secondCausality.mesh_fingerprint);
-      expect(firstCausality.checkpoint_fingerprint).not.toBe(secondCausality.checkpoint_fingerprint);
-      expect(firstCausality.context_fingerprint).not.toBe(secondCausality.context_fingerprint);
-      expect(firstCausality.latent_fingerprint).not.toBe(secondCausality.latent_fingerprint);
-      expect(firstCausality.field_fingerprint).not.toBe(secondCausality.field_fingerprint);
-      expect(firstCausality.geometry_fingerprint).not.toBe(secondCausality.geometry_fingerprint);
-      expect(firstPositions).not.toEqual(secondPositions);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('rejects aligned passthrough geometry at the vendored runner seam and does not publish refined.glb', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const outcome = runLocalRunner(
-        {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: 7,
-          preserve_scale: true,
-        },
-        {
-          env: {
-            ULTRASHAPE_TEST_FORCE_PASSTHROUGH: '1',
-          },
-        },
-      );
-
-      expect(outcome).toEqual({
-        ok: false,
-        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('passthrough-like'),
-      });
-      const errorMessage = outcome.error_message;
-      expect(errorMessage).not.toBeNull();
-      expect(String(errorMessage)).not.toContain('GEOMETRIC_GATE_REJECTED');
-      expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it('enforces preserve-scale bbox tolerance while allowing isotropic scale fit only when preserve_scale=false', () => {
-    const fixture = createFixtureWorkspace();
-
-    try {
-      writeRuntimeConfig(fixture.configPath);
-
-      const rejected = runLocalRunner(
-        {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: 7,
-          preserve_scale: true,
-        },
-        {
-          env: {
-            ULTRASHAPE_TEST_FORCE_SCALE_DRIFT: '1',
-          },
-        },
-      );
-
-      expect(rejected).toEqual({
-        ok: false,
-        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message: expect.stringContaining('preserve-scale bbox tolerance failed'),
-      });
-      expect(existsSync(join(fixture.outputDir, 'refined.glb'))).toBe(false);
-
-      const accepted = runLocalRunner(
-        {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
-          output_dir: fixture.outputDir,
-          output_format: 'glb',
-          checkpoint: null,
-          config_path: fixture.configPath,
-          ext_dir: fixture.root,
-          backend: 'local',
-          steps: 30,
-          guidance_scale: 5.5,
-          seed: 7,
-          preserve_scale: false,
-        },
-        {
-          env: {
-            ULTRASHAPE_TEST_FORCE_SCALE_DRIFT: '1',
-          },
-        },
-      );
-
-      expect(accepted).toEqual({
-        ok: true,
-        result: {
-          file_path: join(fixture.outputDir, 'refined.glb'),
-          format: 'glb',
-          backend: 'local',
-          metrics: expect.objectContaining({
-            extent_ratio: expect.any(Array),
-            gate: expect.objectContaining({
-              preserve_scale: false,
-              scale_fit_applied: true,
-              attribution_signature: expect.any(Number),
-            }),
-          }),
-          fallbacks: ['flash_attn->sdpa'],
-          subtrees_loaded: ['vae', 'dit', 'conditioner'],
-          warnings: [],
-        },
-      });
-      const acceptedResult = accepted.result;
-      expect(acceptedResult).not.toBeNull();
-      expect((acceptedResult as Record<string, unknown>)).not.toHaveProperty('runtime_contract');
-      expectRenderableGlbMesh(join(fixture.outputDir, 'refined.glb'));
-    } finally {
-      fixture.cleanup();
+      rmSync(fixture.sandbox, { recursive: true, force: true });
     }
   });
 });

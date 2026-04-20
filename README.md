@@ -1,183 +1,30 @@
-# modly-UltraShape-1.0-extension
+# UltraShape clean-room local-only rewrite
 
-Pure process extension for UltraShape mesh refinement.
+This repository is in clean-room, local-only rewrite mode.
 
-## Installable Modly contract
-
-The active install surface is the repo-root Python boundary only:
-
+Shell authority in this rewrite is limited to:
 - `manifest.json`
 - `setup.py`
 - `processor.py`
-- `README.md`
-- `runtime/configs/infer_dit_refine.yaml`
-- `runtime/vendor/ultrashape_runtime/**`
+- `.runtime-readiness.json`
+- `.setup-summary.json`
+- public stdout events
+- `output_dir/refined.glb`
 
-Do NOT curate a separate CommonJS payload. GitHub install validation must target the extracted repo root exactly as Modly receives it.
+`setup.py` stages the vendored runtime closure into the install root and writes truthful readiness artifacts. `ready` means the staged config, vendored runtime, required imports, and required checkpoint are all actually present. The shell does NOT claim synthetic success.
 
-This repo stays on the root `manifest.json` + `setup.py` + `processor.py` contract.
+## Temporary processor seam
 
-## Linux ARM64 local-first runtime
+`processor.py` still carries the only temporary fallback seam for Modly compatibility:
+- preferred truth: `reference_image` + `coarse_mesh`
+- temporary fallback: `input.filePath` + `params.coarse_mesh`
 
-This MVP is LOCAL-FIRST and LOCAL-ONLY for execution.
+Fallback names are a temporary compatibility seam inside `processor.py` and are not shell authority anywhere else.
 
-- Host target: Linux ARM64
-- GPU target: CUDA 12.8-class / SM 90+
-- Torch profile: `torch==2.7.0+cu128` + `torchvision==0.22.0`
-- Runtime scope: `mc-only`
-- Active runtime backend: `local`
+That seam stays confined to `processor.py` until Modly ships native two-input routing.
 
-`setup.py` parses Modly JSON args (`python_exe`, `ext_dir`, `gpu_sm`, optional `cuda_version`), creates `ext_dir/venv`, installs the real-refinement MVP dependency surface into that venv, copies the vendored runtime into `ext_dir/runtime/ultrashape_runtime/**`, stages `ext_dir/runtime/configs/infer_dit_refine.yaml`, acquires `ext_dir/models/ultrashape/ultrashape_v1.pt` from a provided local source or configured Hugging Face source, runs import smoke across required, conditional, and degradable tiers, and writes:
+## Batch 1 non-goals
 
-- `ext_dir/.setup-summary.json`
-- `ext_dir/.runtime-readiness.json`
-
-`processor.py` must trust `.runtime-readiness.json` as the authoritative install/runtime signal. It does NOT reintroduce remote-first fallback behavior.
-
-## Readiness states
-
-`.runtime-readiness.json` is the source of truth for smoke verification and runtime behavior. It documents whether the installed runtime can execute the checkpoint-backed real-refinement closure truthfully.
-
-For this clean-room rewrite, readiness truth comes from the copied stable shell plus the vendored `runtime/vendor/ultrashape_runtime/**` closure exactly as shipped. There is no synthetic allowance layer between "install-ready" and "runtime-ready" anymore.
-
-- `ready` — required weights and the supported real-refinement dependency tier passed import smoke; the staged contract is eligible for the local-only / mc-only / glb-only path
-- `degraded` — install succeeded, but only CONDITIONAL or DEGRADABLE gaps remain; readiness must record those gaps explicitly instead of pretending the runtime closure is fully available
-- `blocked` — runtime cannot operate locally; processor must emit `LOCAL_RUNTIME_UNAVAILABLE`
-
-Required readiness fields:
-
-- `status`
-- `backend`
-- `mvp_scope`
-- `weights_ready`
-- `required_imports_ok`
-- `missing_required[]`
-- `missing_optional[]`
-- `missing_conditional[]`
-- `missing_degradable[]`
-- `expected_weights[]`
-
-## Public runtime outcomes
-
-Allowed stdout events:
-
-- `{"type":"progress","percent":number,"label":string}`
-- `{"type":"log","message":string}`
-- `{"type":"done","result":{"filePath":"/abs/path/refined.glb"}}`
-- `{"type":"error","message":string,"code":"..."}`
-
-Public runtime error codes are limited to:
-
-- `INVALID_PARAMS`
-- `MISSING_INPUT`
-- `UNREADABLE_ASSET`
-- `UNSUPPORTED_ASSET_TYPE`
-- `DEPENDENCY_MISSING`
-- `WEIGHTS_MISSING`
-- `LOCAL_RUNTIME_UNAVAILABLE`
-
-Smoke validation should accept ONLY:
-
-1. `done` when readiness is truly `ready`, or
-2. an explicit readiness-driven public error (`WEIGHTS_MISSING`, `DEPENDENCY_MISSING`, or `LOCAL_RUNTIME_UNAVAILABLE`).
-
-`BACKEND_UNAVAILABLE` is obsolete for this MVP and must not be treated as the normal install/runtime outcome.
-
-## Dependency policy
-
-Native install contract metadata is now staged explicitly in `.setup-summary.json` as `core -> cubvh -> flash_attn`.
-
-- `core` installs the bootstrap/runtime dependency tier before native builds.
-- `cubvh` is the REQUIRED native stage and is pinned to `git+https://github.com/ashawkey/cubvh@7855c000f95e43742081060d869702b2b2b33d1f` with `--no-build-isolation`.
-- `flash_attn` is the OPTIONAL / degradable native stage and may fall back to PyTorch SDPA.
-- `.runtime-readiness.json` remains the authoritative runtime truth: missing `cubvh` blocks the local path, while missing `flash_attn` must surface as `status="degraded"` with `missing_degradable=["flash_attn"]`.
-
-Linux ARM64 prerequisites for the required `cubvh` stage stay local-first and explicit: `git`, a usable C/C++ compiler toolchain, CUDA build tooling, and Eigen headers must already exist on the host. `setup.py` fails fast instead of pretending install success when those prerequisites or the required `cubvh` import smoke are missing.
-
-Required dependency tier for the supported real-refinement path:
-
-- `torch==2.7.0+cu128`
-- `torchvision==0.22.0`
-- `numpy`
-- `trimesh`
-- `Pillow`
-- `opencv-python-headless`
-- `scikit-image`
-- `PyYAML`
-- `omegaconf`
-- `einops`
-- `transformers`
-- `huggingface_hub`
-- `accelerate`
-- `cubvh`
-- `safetensors`
-- `tqdm`
-
-Conditional dependencies (only skippable when the reference image is already cut out / alpha-ready):
-
-- `rembg`
-- `onnxruntime`
-
-Degradable dependencies:
-
-- `flash_attn`
-
-Missing conditional or degradable dependencies must be recorded explicitly in readiness; they do not justify remote fallback, and missing `cubvh` is NOT degradable for the supported path.
-
-## Weights policy
-
-Required MVP weights are expected at:
-
-- `ext_dir/models/ultrashape/ultrashape_v1.pt`
-
-Missing required weights are a FATAL install failure. `setup.py` must copy or download `ultrashape_v1.pt` during install, write truthful failure metadata, and exit non-zero instead of reporting a successful `degraded` state.
-
-## Input contract
-
-`processor.py` reads exactly one JSON object line from stdin.
-
-Input resolution order:
-
-1. Preferred named inputs:
-   - `payload.input.inputs.reference_image.filePath`
-   - `payload.input.inputs.coarse_mesh.filePath`
-2. Temporary compatibility seam:
-    - `payload.input.filePath` becomes `reference_image`
-    - `payload.params.coarse_mesh` provides `coarse_mesh`
-
-The temporary `params.coarse_mesh` seam exists only until Modly exposes native multi-input routing for both semantic ids.
-
-## Extension identity
-
-- Repository/project: `modly-UltraShape-1.0-extension`
-- Extension id: `modly.ultrashape-refiner-process`
-- Node id: `ultrashape-refiner`
-- Semantic contract: `reference_image + coarse_mesh -> refined.glb`
-
-This extension is a refiner, NOT a coarse-mesh generator or single-image generation wrapper.
-
-## Coarse-mesh policy
-
-Hunyuan is the recommended and currently validated upstream source, but it is NOT required. Any coarse mesh that satisfies the accepted mesh-format validation may be used.
-
-## Future Modly seam
-
-The following items belong to Modly core, not this extension repo:
-
-- native named multi-input routing for `reference_image` and `coarse_mesh`
-- workflow plumbing that supplies both inputs without the temporary seam
-- Generate panel `Type mismatch` follow-up
-
-When Modly supports the native seam, this extension should drop the temporary compatibility seam without renaming the semantic contract.
-
-## Smoke-test expectation
-
-The faithful smoke from this repo is:
-
-1. validate the extracted repo-root install surface,
-2. run `setup.py` with Modly-style JSON args,
-3. verify `.setup-summary.json` recorded the staged native metadata (`core -> cubvh -> flash_attn`) truthfully for the copied payload,
-4. read `.runtime-readiness.json` as authoritative evidence,
-5. accept `degraded` only when the remaining gap is degradable (for example `flash_attn` falling back to SDPA),
-6. invoke `processor.py` with valid fixture assets,
-7. accept either `done` for local-ready installs or the explicit readiness-driven public error.
+- Do not recreate `src/`.
+- Do not restore fallback fixture bundles.
+- Do not restore patch-authority directories.

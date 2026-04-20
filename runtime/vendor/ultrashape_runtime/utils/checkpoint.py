@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
-import torch
+try:  # pragma: no cover - optional dependency seam
+    import torch  # type: ignore
+except ImportError:  # pragma: no cover - expected on degraded installs
+    torch = None
 
 from . import clamp_unit, stable_signature
 
@@ -45,6 +48,8 @@ def load_checkpoint_subtrees(
     required_subtrees: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     resolved_path = resolve_checkpoint(checkpoint, primary_weight, ext_dir)
+    if torch is None:
+        raise CheckpointResolutionError('Required runtime import is unavailable: torch.')
     try:
         parsed = torch.load(resolved_path, map_location='cpu')
     except Exception as error:  # pragma: no cover - exercised via runtime seam tests
