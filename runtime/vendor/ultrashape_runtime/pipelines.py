@@ -207,27 +207,71 @@ def _voxel_seed(voxel_cond: dict[str, object], *, limit: int = 8) -> list[float]
     return signal[:limit]
 
 
+def _flatten_numeric(candidate: object) -> list[float]:
+    values: list[float] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, (int, float)):
+            values.append(float(node))
+            return
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(candidate)
+    return values
+
+
+def _surface_seed(coarse_surface: dict[str, object], *, limit: int = 8) -> list[float]:
+    mesh = coarse_surface.get('mesh') if isinstance(coarse_surface.get('mesh'), dict) else {}
+    bounds = mesh.get('bounds') if isinstance(mesh.get('bounds'), dict) else {}
+    minimum = bounds.get('min') if isinstance(bounds.get('min'), tuple) else (0.0, 0.0, 0.0)
+    extents = bounds.get('extents') if isinstance(bounds.get('extents'), tuple) else (0.0, 0.0, 0.0)
+    mesh_scale = max(*(float(axis) for axis in extents), 1.0)
+    sampled_surface_points = coarse_surface.get('sampled_surface_points') if isinstance(coarse_surface.get('sampled_surface_points'), list) else []
+
+    signal = [
+        clamp_unit(float(axis) / mesh_scale)
+        for axis in extents[:3]
+        if isinstance(axis, (int, float))
+    ]
+
+    for point in sampled_surface_points:
+        if not isinstance(point, (list, tuple)) or len(point) < 3:
+            continue
+        for axis_index, axis in enumerate(point[:3]):
+            if not isinstance(axis, (int, float)):
+                continue
+            minimum_axis = float(minimum[axis_index]) if axis_index < len(minimum) else 0.0
+            extent_axis = float(extents[axis_index]) if axis_index < len(extents) and float(extents[axis_index]) > 0.0 else 1.0
+            signal.append(clamp_unit((float(axis) - minimum_axis) / extent_axis))
+            if len(signal) >= limit:
+                return signal[:limit]
+
+    return signal[:limit]
+
+
 def _initialize_latents(
     *,
     conditioning: dict[str, object],
     coarse_surface: dict[str, object],
-    schedule: dict[str, object],
-    seed: int | None,
 ) -> list[float]:
     context = _numeric_list(conditioning.get('context'))
-    context_mask = _numeric_list(conditioning.get('context_mask'))
+    unconditional_context = _numeric_list(conditioning.get('unconditional_context'))
+    context_vectors = _flatten_numeric(conditioning.get('context_vectors'))
     voxel_cond = coarse_surface.get('voxel_cond') if isinstance(coarse_surface.get('voxel_cond'), dict) else {}
-    timestep_seed = _numeric_list(schedule.get('consumed_timesteps'))[:8]
-    latent_basis = blend_sequences(context, context_mask, _voxel_seed(voxel_cond), timestep_seed)[:8]
+    latent_basis = blend_sequences(
+        context_vectors,
+        context,
+        unconditional_context,
+        _voxel_seed(voxel_cond),
+        _surface_seed(coarse_surface),
+    )[:8]
 
     if not latent_basis:
         latent_basis = [0.0]
 
-    seed_value = 0 if seed is None else int(seed)
-    return [
-        clamp_unit(value + (((seed_value + index) % 17) / 250.0))
-        for index, value in enumerate(latent_basis)
-    ]
+    return [clamp_unit(value) for value in latent_basis]
 
 
 def _signature_parts(*candidates: object) -> list[float]:
@@ -422,8 +466,6 @@ def run_refine_pipeline(
     initial_latents = _initialize_latents(
         conditioning=conditioning,
         coarse_surface=coarse_surface,
-        schedule=schedule,
-        seed=seed,
     )
     denoised = denoiser.denoise(
         latents=initial_latents,
@@ -574,11 +616,14 @@ def run_refine_pipeline(
                 'mesh_signature': decoded_volume['mesh_signature'],
                 'field_density': decoded_volume['field_density'],
                 'field_signature': decoded_volume['field_signature'],
+                'field_grid_signature': decoded_volume['field_grid_signature'],
+                'field_grid_shape': decoded_volume['field_grid_shape'],
                 'field_value_count': decoded_volume['field_value_count'],
                 'cell_count': decoded_volume['cell_count'],
                 'corner_count': decoded_volume['corner_count'],
                 'corner_signature': decoded_volume['corner_signature'],
                 'occupied_cell_count': decoded_volume['occupied_cell_count'],
+                'occupied_grid_cells': decoded_volume['occupied_grid_cells'],
                 'grid_resolution': decoded_volume['grid_resolution'],
                 'state_hydrated': decoded_latents['state_hydrated'],
             },

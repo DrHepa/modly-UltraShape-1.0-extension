@@ -767,6 +767,57 @@ describe('UltraShape processor.py protocol', () => {
     }
   });
 
+  it('projects tensor-backed image and voxel regions into checkpoint-driven context vectors', () => {
+    const fixture = createFixtureWorkspace();
+    const checkpointPath = join(fixture.root, 'ultrashape_v1.pt');
+    writeBinaryCheckpointBundle(checkpointPath, checkpointBundlePayload());
+
+    try {
+      const outcome = runPythonSnippet(
+        [
+          'import json, sys',
+          'from ultrashape_runtime.preprocessors import ImageProcessorV2',
+          'from ultrashape_runtime.surface_loaders import SharpEdgeSurfaceLoader',
+          'from ultrashape_runtime.models.conditioner_mask import SingleImageEncoder',
+          'from ultrashape_runtime.utils.checkpoint import load_checkpoint_subtrees',
+          'reference_asset = ImageProcessorV2().process(sys.argv[1])',
+          'surface_state = SharpEdgeSurfaceLoader().load(sys.argv[2])',
+          'checkpoint_bundle = load_checkpoint_subtrees(sys.argv[3], None, sys.argv[4])',
+          'conditioning = SingleImageEncoder(checkpoint_state=checkpoint_bundle["bundle"]["conditioner"]).build(',
+          '  reference_asset=reference_asset,',
+          '  coarse_surface=surface_state,',
+          ')',
+          'payload = {',
+          '  "context_vector_count": len(conditioning["context_vectors"]),',
+          '  "context_vector_width": len(conditioning["context_vectors"][0]) if conditioning["context_vectors"] else 0,',
+          '  "metadata": conditioning["metadata"],',
+          '  "first_vector": conditioning["context_vectors"][0] if conditioning["context_vectors"] else [],',
+          '}',
+          'print(json.dumps(payload))',
+        ].join('\n'),
+        [fixture.referenceImage, fixture.namedCoarseMesh, checkpointPath, fixture.root],
+        [join(fixture.root, 'py-stubs')],
+      );
+
+      expect(outcome.status).toBe(0);
+      const payload = JSON.parse(outcome.stdout) as Record<string, unknown>;
+      expect(payload.context_vector_count).toEqual(expect.any(Number));
+      expect(Number(payload.context_vector_count)).toBeGreaterThan(0);
+      expect(payload.context_vector_width).toBe(4);
+      expect(payload.metadata).toEqual(
+        expect.objectContaining({
+          image_region_count: expect.any(Number),
+          voxel_region_count: expect.any(Number),
+          checkpoint_channel_count: expect.any(Number),
+          context_vector_signature: expect.any(Number),
+        }),
+      );
+      expect(payload.first_vector).toEqual([expect.any(Number), expect.any(Number), expect.any(Number), expect.any(Number)]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it('rejects deferred backend requests as invalid processor params under the local-only shell', () => {
     const fixture = createFixtureWorkspace();
 

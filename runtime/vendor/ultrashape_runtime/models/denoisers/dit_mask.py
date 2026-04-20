@@ -1,10 +1,10 @@
-"""Patched DiT mask seam with optional flash-attn fallback."""
+"""Tensor-backed DiT seam with optional flash-attn fallback."""
 
 from __future__ import annotations
 
 from ...utils.checkpoint import checkpoint_signature, checkpoint_tokens
 from ...utils import clamp_unit, stable_signature
-from .moe_layers import moe_enabled, route_denoise_experts, voxel_cond_signal
+from .moe_layers import moe_enabled, voxel_cond_signal
 
 try:
     import flash_attn  # type: ignore # pragma: no cover
@@ -14,6 +14,19 @@ except ImportError:  # pragma: no cover - expected on ARM64 MVP installs
 
 def flash_attn_available() -> bool:
     return flash_attn is not None
+
+
+def _group_mean(values: list[float], groups: int) -> list[float]:
+    if groups <= 0:
+        return []
+    if not values:
+        return [0.0] * groups
+
+    grouped: list[float] = []
+    for group_index in range(groups):
+        bucket = [value for index, value in enumerate(values) if index % groups == group_index]
+        grouped.append(clamp_unit(sum(bucket) / len(bucket) if bucket else 0.0))
+    return grouped
 
 
 class RefineDiT:
@@ -42,55 +55,40 @@ class RefineDiT:
         schedule: dict[str, object],
         seed: int | None,
     ) -> dict[str, object]:
-        seed_value = 0 if seed is None else seed
+        del seed
         attention = 'flash_attn' if flash_attn_available() else 'sdpa'
         checkpoint_reference = self.checkpoint_state if self.checkpoint_state is not None else self.state_dict
-        checkpoint_values = checkpoint_tokens(checkpoint_reference)
+        checkpoint_values = checkpoint_tokens(checkpoint_reference, limit=12)
         checkpoint_state_signature = checkpoint_signature(checkpoint_reference)
-        current_latents = [float(value) for value in latents]
+        current_latents = [float(value) for value in latents] or [0.0 for _ in range(max(len(context), 4))]
+        context_profile = _group_mean([float(value) for value in context], 4)
+        mask_profile = _group_mean([float(value) for value in context_mask], 4)
+        voxel_profile = _group_mean(voxel_cond_signal(voxel_cond, limit=16), 4)
+        checkpoint_profile = _group_mean(checkpoint_values, 4)
+        timestep_scale = max(float(schedule.get('step_count', 0)) or float(len(timesteps)), 1.0)
         per_step_signatures: list[float] = []
 
-        if not current_latents:
-            current_latents = [0.0 for _ in range(max(len(context), 1))]
-
         for step_index, timestep in enumerate(timesteps):
-            step_fraction = float(step_index + 1) / float(max(len(timesteps), 1))
-            expert_tokens = route_denoise_experts(
-                latents=current_latents,
-                context=context,
-                context_mask=context_mask,
-                voxel_cond=voxel_cond,
-                checkpoint_signal=checkpoint_values,
-                timestep=float(timestep),
-            )
-            next_latents: list[float] = []
+            normalized_timestep = clamp_unit(float(step_index + 1) / timestep_scale)
+            step_latents: list[float] = []
             for index, latent in enumerate(current_latents):
-                context_value = context[index % len(context)] if context else 0.0
-                mask_value = context_mask[index % len(context_mask)] if context_mask else 1.0
-                checkpoint_value = checkpoint_values[index % len(checkpoint_values)] if checkpoint_values else 0.0
-                expert_value = expert_tokens[index % len(expert_tokens)] if expert_tokens else 0.0
-                updated = clamp_unit(
-                    (latent * 0.37)
-                    + (context_value * 0.27 * mask_value)
-                    + (float(timestep) * 0.03)
-                    + (step_fraction * 0.11)
-                    + (guidance_scale / 80.0)
-                    + (((seed_value + step_index + index) % 13) / 200.0)
-                    + (checkpoint_value * 0.12)
-                    + (expert_value * 0.14)
-                    + ((checkpoint_state_signature % 29) / 1000.0)
+                channel = index % 4
+                context_drive = context_profile[channel]
+                mask_drive = mask_profile[channel] if mask_profile else 1.0
+                voxel_drive = voxel_profile[channel]
+                checkpoint_drive = checkpoint_profile[channel]
+                target = clamp_unit(
+                    (context_drive * (0.42 + (guidance_scale / 20.0)))
+                    + (voxel_drive * 0.28)
+                    + (checkpoint_drive * 0.22)
+                    + (mask_drive * 0.08)
                 )
-                next_latents.append(updated)
-            current_latents = next_latents
+                correction = (target - float(latent)) * (0.42 + (normalized_timestep * 0.18))
+                bias = ((float(timestep) / max(abs(float(timestep)), 1.0)) + 1.0) * 0.01
+                updated = clamp_unit(float(latent) + correction + bias)
+                step_latents.append(updated)
+            current_latents = step_latents
             per_step_signatures.append(float(stable_signature(current_latents)))
-
-        timestep_scale = float(len(timesteps)) / float(len(timesteps) + 40 if timesteps else 40)
-        current_latents = [clamp_unit((latent * 0.72) + (timestep_scale * 0.28)) for latent in current_latents]
-
-        context_signature = stable_signature(context)
-        context_mask_signature = stable_signature(context_mask)
-        voxel_signature = stable_signature(voxel_cond_signal(voxel_cond))
-        input_latent_signature = stable_signature(latents)
 
         return {
             'model': self.__class__.__name__,
@@ -103,23 +101,23 @@ class RefineDiT:
             'inputs': {
                 'latents': {
                     'count': len(latents),
-                    'signature': input_latent_signature,
+                    'signature': stable_signature([float(value) for value in latents]),
                 },
                 'timestep': {
                     'count': len(timesteps),
-                    'signature': stable_signature(timesteps),
+                    'signature': stable_signature([float(value) for value in timesteps]),
                 },
                 'context': {
                     'count': len(context),
-                    'signature': context_signature,
+                    'signature': stable_signature([float(value) for value in context]),
                 },
                 'context_mask': {
                     'count': len(context_mask),
-                    'signature': context_mask_signature,
+                    'signature': stable_signature([float(value) for value in context_mask]),
                 },
                 'voxel_cond': {
                     'voxel_count': int(voxel_cond.get('voxel_count', 0)) if isinstance(voxel_cond.get('voxel_count'), int) else 0,
-                    'signature': voxel_signature,
+                    'signature': stable_signature(voxel_cond_signal(voxel_cond)),
                 },
             },
             'per_step_signatures': per_step_signatures,

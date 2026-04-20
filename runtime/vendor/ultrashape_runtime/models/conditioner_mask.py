@@ -1,9 +1,9 @@
-"""Checkpoint-backed image conditioner subset for the vendored runtime."""
+"""Checkpoint-backed image/voxel conditioner for the vendored runtime."""
 
 from __future__ import annotations
 
 from ..utils.checkpoint import checkpoint_signature, checkpoint_tensor_count, checkpoint_tokens, checkpoint_value_count
-from ..utils import blend_sequences, clamp_unit, stable_signature
+from ..utils import clamp_unit, stable_signature
 
 
 class _CompatState(dict):
@@ -33,40 +33,154 @@ class _CompatState(dict):
         return dict.__contains__(self, key) or key in self._compat
 
 
-def _numeric_list(candidate: object) -> list[float]:
-    if not isinstance(candidate, list):
+def _flatten_numeric(candidate: object) -> list[float]:
+    values: list[float] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, (int, float)):
+            values.append(float(node))
+            return
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(candidate)
+    return values
+
+
+def _group_mean(values: list[float], groups: int) -> list[float]:
+    if groups <= 0:
         return []
-    return [float(value) for value in candidate if isinstance(value, (int, float))]
+    if not values:
+        return [0.0] * groups
+
+    grouped: list[float] = []
+    for group_index in range(groups):
+        bucket = [value for index, value in enumerate(values) if index % groups == group_index]
+        grouped.append(clamp_unit(sum(bucket) / len(bucket) if bucket else 0.0))
+    return grouped
 
 
-def _surface_signal(points: object, *, limit: int = 8) -> list[float]:
-    if not isinstance(points, list):
+def _image_region_vectors(reference_asset: dict[str, object]) -> list[list[float]]:
+    image_tensor = reference_asset.get('image_tensor')
+    mask_tensor = reference_asset.get('mask_tensor')
+    if not isinstance(image_tensor, list) or not image_tensor or not isinstance(image_tensor[0], list):
         return []
 
-    signal: list[float] = []
-    for point in points[:limit]:
-        if not isinstance(point, (list, tuple)) or len(point) < 3:
+    rows = image_tensor[0]
+    mask_rows = mask_tensor[0] if isinstance(mask_tensor, list) and mask_tensor and isinstance(mask_tensor[0], list) else []
+    height = len(rows)
+    width = len(rows[0]) if rows and isinstance(rows[0], list) else 0
+    if height <= 0 or width <= 0:
+        return []
+
+    quadrants: list[list[list[float]]] = [[], [], [], []]
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, list):
             continue
-        signal.extend(clamp_unit((float(axis) + 1.5) / 3.0) for axis in point[:3])
-    return signal[:limit]
+        for column_index, pixel in enumerate(row):
+            if not isinstance(pixel, list) or len(pixel) < 4:
+                continue
+            quadrant = (0 if row_index < max(height / 2, 1) else 2) + (0 if column_index < max(width / 2, 1) else 1)
+            alpha = 1.0
+            if row_index < len(mask_rows) and isinstance(mask_rows[row_index], list) and column_index < len(mask_rows[row_index]):
+                mask_pixel = mask_rows[row_index][column_index]
+                if isinstance(mask_pixel, list) and mask_pixel and isinstance(mask_pixel[0], (int, float)):
+                    alpha = float(mask_pixel[0])
+            quadrants[quadrant].append([float(pixel[0]), float(pixel[1]), float(pixel[2]), alpha])
+
+    vectors: list[list[float]] = []
+    for pixels in quadrants:
+        if not pixels:
+            vectors.append([0.0, 0.0, 0.0, 0.0])
+            continue
+        red = clamp_unit(sum(pixel[0] for pixel in pixels) / len(pixels))
+        green = clamp_unit(sum(pixel[1] for pixel in pixels) / len(pixels))
+        blue = clamp_unit(sum(pixel[2] for pixel in pixels) / len(pixels))
+        alpha = clamp_unit(sum(pixel[3] for pixel in pixels) / len(pixels))
+        luminance = clamp_unit((red * 0.299) + (green * 0.587) + (blue * 0.114))
+        chroma = clamp_unit(abs(red - blue))
+        vectors.append([luminance, chroma, alpha, green])
+    return vectors
 
 
-def _voxel_signal(voxel_cond: dict[str, object], *, limit: int = 8) -> list[float]:
+def _voxel_region_vectors(voxel_cond: dict[str, object], *, groups: int = 4) -> list[list[float]]:
     coords = voxel_cond.get('coords') if isinstance(voxel_cond.get('coords'), list) else []
-    occupancies = _numeric_list(voxel_cond.get('occupancies'))
+    occupancies = _flatten_numeric(voxel_cond.get('occupancies'))
     resolution = int(voxel_cond.get('resolution', 0)) if isinstance(voxel_cond.get('resolution'), int) else 0
-    signal: list[float] = []
+    scale = float(max(resolution, 1))
+    buckets: list[list[list[float]]] = [[] for _ in range(groups)]
 
-    for index, coords_triplet in enumerate(coords[:limit]):
-        if isinstance(coords_triplet, (list, tuple)):
-            signal.extend(
-                clamp_unit(float(axis) / max(float(resolution), 1.0))
-                for axis in coords_triplet[:3]
-                if isinstance(axis, (int, float))
-            )
-        if index < len(occupancies):
-            signal.append(clamp_unit(float(occupancies[index]) / max(len(coords), 1)))
-    return signal[:limit]
+    for index, coord in enumerate(coords):
+        if not isinstance(coord, (list, tuple)) or len(coord) < 3:
+            continue
+        occupancy = occupancies[index] if index < len(occupancies) else 0.0
+        bucket_index = index % groups
+        buckets[bucket_index].append(
+            [
+                clamp_unit(float(coord[0]) / scale),
+                clamp_unit(float(coord[1]) / scale),
+                clamp_unit(float(coord[2]) / scale),
+                clamp_unit(float(occupancy)),
+            ]
+        )
+
+    vectors: list[list[float]] = []
+    for bucket in buckets:
+        if not bucket:
+            vectors.append([0.0, 0.0, 0.0, 0.0])
+            continue
+        vectors.append(
+            [
+                clamp_unit(sum(item[0] for item in bucket) / len(bucket)),
+                clamp_unit(sum(item[1] for item in bucket) / len(bucket)),
+                clamp_unit(sum(item[2] for item in bucket) / len(bucket)),
+                clamp_unit(sum(item[3] for item in bucket) / len(bucket)),
+            ]
+        )
+    return vectors
+
+
+def _checkpoint_channels(checkpoint_state: object, *, width: int = 4) -> list[float]:
+    return _group_mean(checkpoint_tokens(checkpoint_state, limit=max(width * 2, width)), width)
+
+
+def _flatten_vectors(vectors: list[list[float]]) -> list[float]:
+    return [value for vector in vectors for value in vector]
+
+
+def _project_context_vectors(
+    *,
+    image_vectors: list[list[float]],
+    voxel_vectors: list[list[float]],
+    checkpoint_channels: list[float],
+) -> tuple[list[list[float]], list[list[float]]]:
+    vector_count = max(len(image_vectors), len(voxel_vectors), 1)
+    checkpoint = checkpoint_channels or [0.0, 0.0, 0.0, 0.0]
+    context_vectors: list[list[float]] = []
+    unconditional_vectors: list[list[float]] = []
+
+    for index in range(vector_count):
+        image_vector = image_vectors[index % len(image_vectors)] if image_vectors else [0.0, 0.0, 0.0, 0.0]
+        voxel_vector = voxel_vectors[index % len(voxel_vectors)] if voxel_vectors else [0.0, 0.0, 0.0, 0.0]
+        context_vectors.append(
+            [
+                clamp_unit((image_vector[0] * (0.55 + checkpoint[0] * 0.25)) + (voxel_vector[3] * 0.25)),
+                clamp_unit((image_vector[1] * 0.45) + (voxel_vector[0] * (0.35 + checkpoint[1] * 0.2))),
+                clamp_unit((image_vector[2] * 0.5) + (voxel_vector[1] * 0.3) + (checkpoint[2] * 0.2)),
+                clamp_unit((image_vector[3] * 0.35) + (voxel_vector[2] * 0.35) + (checkpoint[3] * 0.3)),
+            ]
+        )
+        unconditional_vectors.append(
+            [
+                clamp_unit((voxel_vector[3] * 0.45) + (checkpoint[0] * 0.2)),
+                clamp_unit((voxel_vector[0] * 0.4) + (checkpoint[1] * 0.2)),
+                clamp_unit((voxel_vector[1] * 0.4) + (checkpoint[2] * 0.2)),
+                clamp_unit((voxel_vector[2] * 0.4) + (checkpoint[3] * 0.2)),
+            ]
+        )
+
+    return context_vectors, unconditional_vectors
 
 
 class SingleImageEncoder:
@@ -84,39 +198,30 @@ class SingleImageEncoder:
         return {'missing_keys': [], 'unexpected_keys': [], 'strict': strict}
 
     def build(self, *, reference_asset: dict[str, object], coarse_surface: dict[str, object]) -> dict[str, object]:
-        image_features = _numeric_list(reference_asset.get('image_features'))
-        mask_features = _numeric_list(reference_asset.get('mask_features'))
         mesh = coarse_surface.get('mesh') if isinstance(coarse_surface.get('mesh'), dict) else {}
         voxel_cond = coarse_surface.get('voxel_cond') if isinstance(coarse_surface.get('voxel_cond'), dict) else {}
-        surface_points = coarse_surface.get('sampled_surface_points')
-        if not isinstance(surface_points, list):
-            surface_points = mesh.get('sampled_surface_points') if isinstance(mesh.get('sampled_surface_points'), list) else []
-
         checkpoint_reference = self.checkpoint_state if self.checkpoint_state is not None else self.state_dict
-        checkpoint_signal = checkpoint_tokens(checkpoint_reference)
-        surface_signal = _surface_signal(surface_points)
-        voxel_signal = _voxel_signal(voxel_cond)
-        context = blend_sequences(image_features, mask_features, surface_signal, voxel_signal, checkpoint_signal)[:8]
-        context_mask = [1.0 for _ in context]
-        unconditional_context = blend_sequences(mask_features, voxel_signal, checkpoint_signal)[: len(context)]
-        if len(unconditional_context) < len(context):
-            unconditional_context.extend([0.0] * (len(context) - len(unconditional_context)))
 
-        image_signature = int(reference_asset.get('image_signature', stable_signature(image_features)))
-        mask_signature = int(reference_asset.get('mask_signature', stable_signature(mask_features)))
-        mesh_signature = int(mesh.get('signature', 0)) if isinstance(mesh.get('signature'), int) else stable_signature(surface_signal)
-        voxel_signature = (
-            int(voxel_cond.get('voxel_signature', 0))
-            if isinstance(voxel_cond.get('voxel_signature'), int)
-            else stable_signature(voxel_signal)
+        image_vectors = _image_region_vectors(reference_asset)
+        voxel_vectors = _voxel_region_vectors(voxel_cond)
+        checkpoint_channels = _checkpoint_channels(checkpoint_reference)
+        context_vectors, unconditional_vectors = _project_context_vectors(
+            image_vectors=image_vectors,
+            voxel_vectors=voxel_vectors,
+            checkpoint_channels=checkpoint_channels,
         )
+
+        context = _flatten_vectors(context_vectors)
+        unconditional_context = _flatten_vectors(unconditional_vectors)
+        context_mask = [1.0 for _ in context]
+
+        image_signature = int(reference_asset.get('image_signature', stable_signature(_flatten_vectors(image_vectors))))
+        mask_signature = int(reference_asset.get('mask_signature', 0)) if isinstance(reference_asset.get('mask_signature'), int) else 0
+        mesh_signature = int(mesh.get('signature', 0)) if isinstance(mesh.get('signature'), int) else 0
+        voxel_signature = int(voxel_cond.get('voxel_signature', 0)) if isinstance(voxel_cond.get('voxel_signature'), int) else 0
         checkpoint_state_signature = checkpoint_signature(checkpoint_reference)
         context_signature = stable_signature(context)
-        context_mask_signature = stable_signature(context_mask)
-        conditioning_mean = clamp_unit(sum(context) / len(context) if context else 0.0)
-        bounds = mesh.get('bounds') if isinstance(mesh.get('bounds'), dict) else {}
-        extents = bounds.get('extents') if isinstance(bounds.get('extents'), tuple) else (0.0, 0.0, 0.0)
-        occupied_ratio = clamp_unit(float(voxel_cond.get('occupied_ratio', 0.0)))
+        context_vector_signature = stable_signature(_flatten_vectors(context_vectors))
 
         metadata = {
             'image_signature': image_signature,
@@ -126,12 +231,16 @@ class SingleImageEncoder:
             'checkpoint_signature': checkpoint_state_signature,
             'checkpoint_tensor_count': checkpoint_tensor_count(checkpoint_reference),
             'checkpoint_value_count': checkpoint_value_count(checkpoint_reference),
+            'checkpoint_channel_count': len(checkpoint_channels),
             'image_tensor_shape': reference_asset.get('image_tensor_shape'),
             'mask_tensor_shape': reference_asset.get('mask_tensor_shape'),
-            'surface_point_count': len(surface_points),
-            'voxel_count': int(voxel_cond.get('voxel_count', 0)),
+            'surface_point_count': len(coarse_surface.get('sampled_surface_points', [])) if isinstance(coarse_surface.get('sampled_surface_points'), list) else 0,
+            'voxel_count': int(voxel_cond.get('voxel_count', 0)) if isinstance(voxel_cond.get('voxel_count'), int) else 0,
             'context_signature': context_signature,
-            'context_mask_signature': context_mask_signature,
+            'context_mask_signature': stable_signature(context_mask),
+            'image_region_count': len(image_vectors),
+            'voxel_region_count': len(voxel_vectors),
+            'context_vector_signature': context_vector_signature,
         }
 
         cfg_pairing = {
@@ -142,11 +251,19 @@ class SingleImageEncoder:
             'negative_context_signature': stable_signature(unconditional_context),
         }
 
+        conditioning_mean = clamp_unit(sum(context) / len(context) if context else 0.0)
+        image_features = _flatten_numeric(reference_asset.get('image_features'))
+        bounds = mesh.get('bounds') if isinstance(mesh.get('bounds'), dict) else {}
+        extents = bounds.get('extents') if isinstance(bounds.get('extents'), tuple) else (0.0, 0.0, 0.0)
+        occupied_ratio = clamp_unit(float(voxel_cond.get('occupied_ratio', 0.0)))
+
         return _CompatState(
             {
                 'encoder': self.__class__.__name__,
                 'context': context,
                 'context_mask': context_mask,
+                'context_vectors': context_vectors,
+                'unconditional_context': unconditional_context,
                 'cfg_pairing': cfg_pairing,
                 'metadata': metadata,
                 'state_hydrated': self.hydrated,

@@ -789,14 +789,17 @@ function expectRealClosureMetrics(metrics: Record<string, unknown>) {
       decode: expect.objectContaining({
         vae: 'ShapeVAE',
         decoder: expect.stringMatching(/VDMVolumeDecoding|VolumeDecoder/u),
-        authority: 'field_logits',
+        authority: 'occupancy_field_grid',
         field_density: expect.any(Number),
         field_value_count: expect.any(Number),
+        field_grid_shape: [expect.any(Number), expect.any(Number), expect.any(Number)],
+        field_grid_signature: expect.any(Number),
         corner_signature: expect.any(Number),
         cell_count: expect.any(Number),
         grid_resolution: expect.any(Number),
         corner_count: expect.any(Number),
         occupied_cell_count: expect.any(Number),
+        occupied_grid_cells: expect.any(Number),
       }),
       extract: expect.objectContaining({
         extractor: 'cubvh.sparse_marching_cubes',
@@ -2211,8 +2214,10 @@ describe('UltraShape runtime flow', () => {
       expect((metrics.decode as Record<string, unknown>).cell_count).toBeGreaterThanOrEqual(64);
       expect(metrics.decode).toEqual(
         expect.objectContaining({
-          authority: 'field_logits',
+          authority: 'occupancy_field_grid',
           field_value_count: expect.any(Number),
+          field_grid_shape: [expect.any(Number), expect.any(Number), expect.any(Number)],
+          field_grid_signature: expect.any(Number),
           corner_signature: expect.any(Number),
         }),
       );
@@ -2223,6 +2228,45 @@ describe('UltraShape runtime flow', () => {
           source_corner_signature: (metrics.decode as Record<string, unknown>).corner_signature,
         }),
       );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('propagates a checkpoint-backed occupancy field grid through decode metrics', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const outcome = runLocalRunner(
+        {
+          reference_image: fixture.referenceImage,
+          coarse_mesh: fixture.coarseMesh,
+          output_dir: fixture.outputDir,
+          output_format: 'glb',
+          checkpoint: null,
+          config_path: fixture.configPath,
+          ext_dir: fixture.root,
+          backend: 'local',
+          steps: 30,
+          guidance_scale: 5.5,
+          seed: 7,
+          preserve_scale: true,
+        },
+      );
+
+      expect(outcome?.ok).toBe(true);
+      const metrics = getRunnerMetrics(outcome);
+      expect(metrics.decode).toEqual(
+        expect.objectContaining({
+          authority: 'occupancy_field_grid',
+          field_grid_shape: [expect.any(Number), expect.any(Number), expect.any(Number)],
+          occupied_grid_cells: expect.any(Number),
+          field_grid_signature: expect.any(Number),
+        }),
+      );
+      expect(Number((metrics.decode as Record<string, unknown>).occupied_grid_cells)).toBeGreaterThan(0);
     } finally {
       fixture.cleanup();
     }
@@ -2470,6 +2514,71 @@ describe('UltraShape runtime flow', () => {
       expect(firstMetrics.denoise).not.toEqual(secondMetrics.denoise);
       expect(firstMetrics.decode).not.toEqual(secondMetrics.decode);
       expect(firstMetrics.extract).not.toEqual(secondMetrics.extract);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('derives initial latents from conditioning and coarse geometry instead of seed-driven offsets', () => {
+    const fixture = createFixtureWorkspace();
+
+    try {
+      writeRuntimeConfig(fixture.configPath);
+
+      const firstOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: fixture.outputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 7,
+        preserve_scale: true,
+      });
+
+      const secondOutputDir = join(fixture.root, 'output-seed-13');
+      mkdirSync(secondOutputDir);
+      const secondOutcome = runLocalRunner({
+        reference_image: fixture.referenceImage,
+        coarse_mesh: fixture.coarseMesh,
+        output_dir: secondOutputDir,
+        output_format: 'glb',
+        checkpoint: null,
+        config_path: fixture.configPath,
+        ext_dir: fixture.root,
+        backend: 'local',
+        steps: 30,
+        guidance_scale: 5.5,
+        seed: 13,
+        preserve_scale: true,
+      });
+
+      const firstMetrics = getRunnerMetrics(firstOutcome);
+      const secondMetrics = getRunnerMetrics(secondOutcome);
+      const firstCausality = getCausalityMetrics(firstMetrics);
+      const secondCausality = getCausalityMetrics(secondMetrics);
+
+      expect(firstMetrics.denoise).toEqual(
+        expect.objectContaining({
+          inputs: expect.objectContaining({
+            latents: expect.objectContaining({
+              count: expect.any(Number),
+              signature: expect.any(Number),
+            }),
+          }),
+        }),
+      );
+      expect((firstMetrics.denoise as Record<string, unknown>).inputs).toEqual(
+        (secondMetrics.denoise as Record<string, unknown>).inputs,
+      );
+      expect(firstMetrics.denoise).toEqual(secondMetrics.denoise);
+      expect(firstMetrics.decode).toEqual(secondMetrics.decode);
+      expect(firstMetrics.extract).toEqual(secondMetrics.extract);
+      expect(firstCausality).toEqual(secondCausality);
     } finally {
       fixture.cleanup();
     }
