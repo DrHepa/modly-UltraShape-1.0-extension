@@ -11,31 +11,33 @@ function repoPath(...segments: string[]) {
 }
 
 describe('stable shell manifest', () => {
-  it('declares the honest local-only process-refiner shell', () => {
+  it('declares the honest local-only model shell', () => {
     const manifestPath = repoPath('manifest.json');
 
     expect(existsSync(manifestPath)).toBe(true);
+    expect(existsSync(repoPath('processor.py'))).toBe(false);
 
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 
-    expect(manifest.shell).toEqual({
-      local_only: true,
-      processor: 'processor.py',
-      setup: 'setup.py',
+    expect(manifest.type).toBe('model');
+    expect(manifest.local_only).toBe(true);
+    expect(manifest.generator_class).toBe('UltraShapeGenerator');
+    expect(manifest.nodes).toHaveLength(1);
+    expect(manifest.nodes[0]).toMatchObject({
+      id: 'refine',
+      name: 'Refine Mesh',
+      input: 'image',
+      inputs: ['image', 'mesh'],
+      output: 'mesh',
     });
-    expect(manifest.contract).toEqual({
-      kind: 'process-refiner',
-      required_inputs: ['reference_image', 'coarse_mesh'],
-      output_artifact: 'output_dir/refined.glb',
-    });
-    expect(manifest.forbidden_execution_modes).toEqual([
-      'remote',
-      'hybrid',
-      'model-wrapper',
-    ]);
-    expect(JSON.stringify(manifest)).not.toContain('filePath');
-    expect(JSON.stringify(manifest)).not.toContain('params.coarse_mesh');
-    expect(JSON.stringify(manifest)).not.toContain('input.filePath');
-    expect(JSON.stringify(manifest)).not.toContain('fallback');
+
+    expect(manifest).not.toHaveProperty('shell');
+    expect(manifest).not.toHaveProperty('contract');
+    expect(manifest).not.toHaveProperty('forbidden_execution_modes');
+    expect(JSON.stringify(manifest)).not.toContain('processor.py');
+    expect(JSON.stringify(manifest)).not.toContain('setup.py');
+    expect(JSON.stringify(manifest)).not.toContain('process-refiner');
+    expect(JSON.stringify(manifest)).not.toContain('reference_image');
+    expect(JSON.stringify(manifest)).not.toContain('coarse_mesh');
   });
 });

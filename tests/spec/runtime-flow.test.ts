@@ -121,11 +121,11 @@ function createRuntimeFixture() {
   mkdirSync(modelsDir, { recursive: true });
   writeRuntimeStubModules(stubRoot);
 
-  const referenceImage = path.join(sandbox, 'reference.png');
-  const coarseMesh = path.join(sandbox, 'coarse.glb');
+  const imageInputPath = path.join(sandbox, 'reference.png');
+  const meshInputPath = path.join(sandbox, 'coarse.glb');
   const checkpoint = path.join(modelsDir, 'ultrashape_v1.pt');
-  writeFileSync(referenceImage, Buffer.from(PNG_1X1_BASE64, 'base64'));
-  writeFileSync(coarseMesh, createBinaryGlb());
+  writeFileSync(imageInputPath, Buffer.from(PNG_1X1_BASE64, 'base64'));
+  writeFileSync(meshInputPath, createBinaryGlb());
   writeFileSync(
     checkpoint,
     JSON.stringify({
@@ -136,7 +136,7 @@ function createRuntimeFixture() {
     'utf8',
   );
 
-  return { sandbox, stubRoot, extDir, referenceImage, coarseMesh, checkpoint };
+  return { sandbox, stubRoot, extDir, imageInputPath, meshInputPath, checkpoint };
 }
 
 function runPythonSnippet(source: string, args: string[] = []) {
@@ -162,7 +162,42 @@ function runLocalRunner(job: Record<string, unknown>, stubRoot: string) {
   });
 }
 
-describe('runtime closure authority', () => {
+describe('private runtime flow behind the model shell', () => {
+  it('adapts generator state into the private local runner payload through production code', () => {
+    const result = runPythonSnippet(
+      [
+        'import json, pathlib, tempfile',
+        'from generator import UltraShapeGenerator',
+        'generator = UltraShapeGenerator()',
+        'output_dir = pathlib.Path(tempfile.mkdtemp(prefix="ultrashape-private-runner-output-"))',
+        'job = generator._build_runner_job(',
+        '    readiness={"checkpoint": "/tmp/ultrashape_v1.pt", "config_path": "", "ext_dir": "/tmp/ext"},',
+        '    reference_image=pathlib.Path("/tmp/reference.png"),',
+        '    coarse_mesh=pathlib.Path("/tmp/coarse.glb"),',
+        '    output_dir=output_dir,',
+        '    params={"steps": 4, "guidance_scale": 6, "seed": 7, "preserve_scale": True},',
+        ')',
+        'print(json.dumps(job))',
+      ].join('\n'),
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      reference_image: '/tmp/reference.png',
+      coarse_mesh: '/tmp/coarse.glb',
+      output_dir: expect.stringContaining('ultrashape-private-runner-output-'),
+      output_format: 'glb',
+      checkpoint: '/tmp/ultrashape_v1.pt',
+      config_path: configPath,
+      ext_dir: '/tmp/ext',
+      backend: 'local',
+      steps: 4,
+      guidance_scale: 6,
+      seed: 7,
+      preserve_scale: true,
+    });
+  });
+
   it('publishes upstream-style stage evidence from the vendored closure', () => {
     const result = runPythonSnippet(
       [
@@ -279,13 +314,13 @@ describe('runtime closure authority', () => {
     try {
       const result = runLocalRunner(
         {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
           output_dir: outputDir,
-          output_format: 'glb',
           checkpoint: fixture.checkpoint,
           config_path: configPath,
           ext_dir: fixture.extDir,
+          output_format: 'glb',
           backend: 'local',
           steps: 4,
           guidance_scale: 6,
@@ -317,13 +352,13 @@ describe('runtime closure authority', () => {
     try {
       const result = runLocalRunner(
         {
-          reference_image: fixture.referenceImage,
-          coarse_mesh: fixture.coarseMesh,
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
           output_dir: path.join(fixture.sandbox, 'output'),
-          output_format: 'glb',
           checkpoint: path.join(fixture.sandbox, 'missing.pt'),
           config_path: configPath,
           ext_dir: fixture.extDir,
+          output_format: 'glb',
           backend: 'local',
           steps: 4,
           guidance_scale: 6,

@@ -5,7 +5,7 @@ import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { copyInstallSurface, repoRoot, stageCheckpoint, writeRuntimeStubModules } from './install-test-helpers.js';
+import { copyInstallSurface, repoRoot, runGeneratorProbe, stageCheckpoint, writeRuntimeStubModules } from './install-test-helpers.js';
 
 type Readiness = {
   backend: string;
@@ -58,6 +58,21 @@ describe('setup.py install truth', () => {
         weights_ready: false,
         status: 'blocked',
       });
+      const generator = runGeneratorProbe(checkout, [{ method: 'is_downloaded' }, { method: 'load' }]);
+      expect(generator.status).toBe(0);
+      expect(JSON.parse(generator.stdout)).toEqual([
+        { method: 'is_downloaded', ok: true, result: false, loaded: false },
+        {
+          method: 'load',
+          ok: false,
+          error: {
+            type: 'PublicRuntimeError',
+            code: 'DEPENDENCY_MISSING',
+            message: expect.stringContaining('Required runtime imports are unavailable'),
+          },
+          loaded: false,
+        },
+      ]);
       expect(readiness.missing_required).toContain('import:torch');
       expect(readiness.missing_required).toContain('weight:models/ultrashape/ultrashape_v1.pt');
       expect(result.stdout).not.toContain('filePath');
@@ -98,7 +113,13 @@ describe('setup.py install truth', () => {
         status: 'ready',
         missing_required: [],
       });
+      const generator = runGeneratorProbe(checkout, [{ method: 'is_downloaded' }], { PYTHONPATH: stubRoot });
+      expect(generator.status).toBe(0);
+      expect(JSON.parse(generator.stdout)).toEqual([
+        { method: 'is_downloaded', ok: true, result: true, loaded: false },
+      ]);
       expect(existsSync(path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime', 'local_runner.py'))).toBe(true);
+      expect(existsSync(path.join(checkout, 'generator.py'))).toBe(true);
       expect(result.stdout).not.toContain('filePath');
       expect(result.stdout).not.toContain('params.coarse_mesh');
       expect(result.stdout).not.toContain('fallback');

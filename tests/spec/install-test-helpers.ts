@@ -1,4 +1,5 @@
 import { cpSync, mkdirSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -7,7 +8,7 @@ export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 const INSTALL_SURFACE_PATHS = [
   'README.md',
   'manifest.json',
-  'processor.py',
+  'generator.py',
   'setup.py',
   'runtime/configs/infer_dit_refine.yaml',
   'runtime/vendor/ultrashape_runtime',
@@ -97,6 +98,70 @@ export function writeRuntimeStubModules(root: string) {
     `import json\nimport struct\n\nclass Trimesh:\n    def __init__(self, vertices, faces, process=False):\n        del process\n        self.vertices = vertices\n        self.faces = faces\n\nclass Scene:\n    def __init__(self):\n        self.mesh = None\n\n    def add_geometry(self, mesh, node_name=None):\n        del node_name\n        self.mesh = mesh\n\n    def export(self, file_type='glb'):\n        if file_type != 'glb':\n            raise ValueError('Only glb export is supported in tests.')\n        if self.mesh is None:\n            raise ValueError('Scene has no mesh.')\n        return _build_glb(self.mesh.vertices, self.mesh.faces)\n\ndef _build_glb(vertices, faces):\n    document = {\n        'asset': {'version': '2.0'},\n        'scenes': [{'nodes': [0]}],\n        'scene': 0,\n        'nodes': [{'mesh': 0}],\n        'meshes': [{'primitives': [{'attributes': {'POSITION': 0}, 'indices': 1}]}],\n        'accessors': [\n            {'bufferView': 0, 'componentType': 5126, 'count': len(vertices), 'type': 'VEC3'},\n            {'bufferView': 1, 'componentType': 5125, 'count': len(faces) * 3, 'type': 'SCALAR'},\n        ],\n        'bufferViews': [\n            {'buffer': 0, 'byteOffset': 0, 'byteLength': len(vertices) * 12},\n            {'buffer': 0, 'byteOffset': len(vertices) * 12, 'byteLength': len(faces) * 12},\n        ],\n        'buffers': [{'byteLength': (len(vertices) * 12) + (len(faces) * 12)}],\n    }\n    json_chunk = json.dumps(document).encode('utf8')\n    json_chunk += b' ' * ((4 - (len(json_chunk) % 4)) % 4)\n    binary = bytearray()\n    for vertex in vertices:\n        binary.extend(struct.pack('<3f', float(vertex[0]), float(vertex[1]), float(vertex[2])))\n    for face in faces:\n        binary.extend(struct.pack('<3I', int(face[0]), int(face[1]), int(face[2])))\n    header = struct.pack('<4sII', b'glTF', 2, 12 + 8 + len(json_chunk) + 8 + len(binary))\n    json_header = struct.pack('<II', len(json_chunk), 0x4E4F534A)\n    bin_header = struct.pack('<II', len(binary), 0x004E4942)\n    return header + json_header + json_chunk + bin_header + bytes(binary)\n`,
     'utf8',
   );
+}
+
+type GeneratorProbeAction =
+  | { method: 'is_downloaded' }
+  | { method: 'load' }
+  | { method: 'unload' }
+  | {
+      method: 'generate';
+      imageBase64?: string;
+      params?: Record<string, unknown>;
+    };
+
+export function runGeneratorProbe(
+  checkout: string,
+  actions: GeneratorProbeAction[],
+  env: NodeJS.ProcessEnv = {},
+) {
+  const script = [
+    'import base64, json, sys',
+    'from generator import UltraShapeGenerator',
+    'generator = UltraShapeGenerator()',
+    'actions = json.loads(sys.argv[1])',
+    'results = []',
+    'for action in actions:',
+    '    method = action["method"]',
+    '    try:',
+    '        if method == "is_downloaded":',
+    '            value = generator.is_downloaded()',
+    '        elif method == "load":',
+    '            value = generator.load()',
+    '        elif method == "unload":',
+    '            value = generator.unload()',
+    '        elif method == "generate":',
+    '            image_base64 = action.get("imageBase64")',
+    '            image_bytes = base64.b64decode(image_base64) if isinstance(image_base64, str) else None',
+    '            value = generator.generate(image_bytes, action.get("params") or {})',
+    '        else:',
+    '            raise ValueError(f"Unsupported probe method: {method}")',
+    '        item = {"method": method, "ok": True, "result": value, "loaded": getattr(generator, "_loaded", None)}',
+    '        if method == "generate":',
+    '            item["debug"] = {"last_job": getattr(generator, "_last_job", None), "last_pythonpath": getattr(generator, "_last_pythonpath", None), "last_result": getattr(generator, "_last_result", None)}',
+    '        results.append(item)',
+    '    except Exception as error:',
+    '        results.append({',
+    '            "method": method,',
+    '            "ok": False,',
+    '            "error": {',
+    '                "type": error.__class__.__name__,',
+    '                "code": getattr(error, "code", None),',
+    '                "message": str(error),',
+    '            },',
+    '            "loaded": getattr(generator, "_loaded", None),',
+    '        })',
+    'print(json.dumps(results))',
+  ].join('\n');
+
+  return spawnSync('python3', ['-S', '-c', script, JSON.stringify(actions)], {
+    cwd: checkout,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...env,
+    },
+  });
 }
 
 function createBinaryGlb() {

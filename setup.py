@@ -100,6 +100,7 @@ def detect_missing_imports(module_names: list[str]) -> list[str]:
 
 def build_readiness(ext_dir: Path, *, config_ready: bool, vendor_ready: bool) -> dict[str, object]:
     checkpoint_path = ext_dir / CHECKPOINT_RELATIVE
+    vendor_path = ext_dir / VENDOR_RELATIVE.parent
     missing_required: list[str] = []
     if not config_ready:
         missing_required.append(f'config:{CONFIG_RELATIVE.as_posix()}')
@@ -138,6 +139,7 @@ def build_readiness(ext_dir: Path, *, config_ready: bool, vendor_ready: bool) ->
         'required_imports_ok': required_imports_ok,
         'runtime_ready': runtime_ready,
         'status': status,
+        'vendor_path': str(vendor_path),
         'vendor_ready': vendor_ready,
         'weights_ready': weights_ready,
         'required_checkpoint_subtrees': ['vae', 'dit', 'conditioner'],
@@ -174,6 +176,7 @@ def main() -> int:
         'install_success': readiness['install_success'],
         'install_ready': readiness['install_ready'],
         'status': readiness['status'],
+        'vendor_path': readiness['vendor_path'],
         'missing_required': readiness['missing_required'],
         'missing_optional': readiness['missing_optional'],
         'missing_conditional': readiness['missing_conditional'],

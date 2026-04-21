@@ -12,6 +12,7 @@ type Summary = {
   missing_required: string[];
   runtime_ready: boolean;
   status: string;
+  vendor_path: string;
 };
 
 function runSetup(cwd: string, extDir: string, env: NodeJS.ProcessEnv = {}) {
@@ -42,6 +43,7 @@ describe('GitHub install smoke', () => {
       expect(existsSync(path.join(checkout, '.runtime-readiness.json'))).toBe(true);
       expect(existsSync(path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'))).toBe(true);
       expect(existsSync(path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime', 'local_runner.py'))).toBe(true);
+      expect(existsSync(path.join(checkout, 'processor.py'))).toBe(false);
       expect(existsSync(path.join(checkout, 'processor.js'))).toBe(false);
       expect(existsSync(path.join(checkout, 'src'))).toBe(false);
       expect(existsSync(path.join(checkout, 'runtime', 'modly'))).toBe(false);
@@ -52,6 +54,7 @@ describe('GitHub install smoke', () => {
         runtime_ready: true,
         status: 'ready',
         missing_required: [],
+        vendor_path: path.join(checkout, 'runtime', 'vendor'),
       });
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
@@ -75,6 +78,7 @@ describe('GitHub install smoke', () => {
         config_ready: true,
         runtime_ready: false,
         status: 'blocked',
+        vendor_path: path.join(checkout, 'runtime', 'vendor'),
       });
       expect(summary.missing_required).toContain('weight:models/ultrashape/ultrashape_v1.pt');
     } finally {
