@@ -28,6 +28,35 @@ function runSetup(cwd: string, extDir: string, env: NodeJS.ProcessEnv = {}) {
 }
 
 describe('generator lifecycle shell', () => {
+  it('exposes the exact public generate signature required by the model shell contract', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-signature-'));
+    const checkout = path.join(sandbox, 'repo');
+    copyInstallSurface(checkout);
+
+    try {
+      const signatureProbe = spawnSync(
+        'python3',
+        [
+          '-S',
+          '-c',
+          [
+            'import inspect, json',
+            'from generator import UltraShapeGenerator',
+            'print(json.dumps(str(inspect.signature(UltraShapeGenerator.generate))))',
+          ].join('\n'),
+        ],
+        { cwd: checkout, encoding: 'utf8' },
+      );
+
+      expect(signatureProbe.status).toBe(0);
+      expect(JSON.parse(signatureProbe.stdout.trim())).toBe(
+        '(self, image_bytes: \'bytes | None\', params: \'dict[str, Any] | None\' = None, progress_cb: \'Any | None\' = None, cancel_event: \'Any | None\' = None) -> \'str\'',
+      );
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
   it('reports download truthfully before and after staged setup assets exist', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-download-'));
     const checkout = path.join(sandbox, 'repo');
@@ -62,10 +91,15 @@ describe('generator lifecycle shell', () => {
     copyInstallSurface(checkout);
 
     try {
+      const readme = readFileSync(path.join(checkout, 'README.md'), 'utf8');
+
       expect(existsSync(path.join(checkout, 'generator.py'))).toBe(true);
       expect(existsSync(path.join(checkout, 'setup.py'))).toBe(true);
       expect(existsSync(path.join(checkout, 'processor.py'))).toBe(false);
-      expect(readFileSync(path.join(checkout, 'README.md'), 'utf8')).not.toContain('processor.py');
+      expect(existsSync(path.join(checkout, 'processor.js'))).toBe(false);
+      expect(readme).toContain('The model shell is the sole public authority: `manifest.json`, `setup.py`, and `generator.py`.');
+      expect(readme).not.toContain('process-shell authority');
+      expect(readme).not.toContain('processor.py');
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }
@@ -101,16 +135,12 @@ describe('generator lifecycle shell', () => {
       expect(typeof payload[0].result).toBe('string');
       expect(payload[0].result).toMatch(/\.glb$/);
       expect(existsSync(payload[0].result)).toBe(true);
-      expect(payload[0].debug.last_job).toMatchObject({
-        coarse_mesh: coarseMesh,
-        config_path: path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'),
-        ext_dir: checkout,
-      });
-      expect(payload[0].debug.last_pythonpath).toContain(path.join(checkout, 'runtime', 'vendor'));
       expect(payload[0].debug.last_result).toMatchObject({
         backend: 'local',
         subtrees_loaded: ['vae', 'dit', 'conditioner'],
       });
+      expect(JSON.stringify(payload[0].debug.last_job ?? {})).not.toContain('coarse_mesh');
+      expect(JSON.stringify(payload[0].debug.last_job ?? {})).not.toContain('reference_image');
       expect(payload[1]).toEqual({ method: 'unload', ok: true, result: false, loaded: false });
     } finally {
       rmSync(sandbox, { recursive: true, force: true });

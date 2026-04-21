@@ -1,19 +1,16 @@
-# UltraShape clean-room local-only rewrite
+# UltraShape Hunyuan-aligned shell
 
-This repository is in clean-room, local-only rewrite mode.
+This repository exposes a Hunyuan-aligned public shell over the existing UltraShape model extension.
 
-The ONLY public shell authority in this rewrite is:
-- `manifest.json`
-- `generator.py`
-- `setup.py`
+The model shell is the sole public authority: `manifest.json`, `setup.py`, and `generator.py`.
 
-`manifest.json` now declares a truthful local model extension for `image + mesh -> mesh` refinement. The shell does not publish fallback aliases, mixed partial payloads, or process-entry authority.
+`manifest.json` publishes the shell contract, `setup.py` is the install/bootstrap authority, and `generator.py` is the only public lifecycle authority.
 
-Private runtime implementation details remain staged behind the shell. They support the local model lifecycle, but they are not the public contract.
+`runtime/**` and `models/ultrashape/**` remain private implementation details.
 
 `setup.py` stages the vendored runtime closure into the install root and writes truthful readiness artifacts for the generator lifecycle. `ready` means the staged config, vendored runtime, required imports, and required checkpoint are all actually present. The shell does NOT claim synthetic success.
 
-Legacy process-shell authority has been removed. No public artifact re-authorizes any process-era entrypoint or fallback alias.
+No legacy process entrypoint or fallback alias remains public.
 
 ## Batch 1 non-goals
 

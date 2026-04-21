@@ -8,22 +8,39 @@ import { describe, expect, it } from 'vitest';
 import { copyInstallSurface, stageCheckpoint, writeRuntimeStubModules } from './install-test-helpers.js';
 
 type Summary = {
+  cuda_version?: string | null;
   config_ready: boolean;
+  gpu_sm?: string | null;
+  install_ready: boolean;
+  install_success: boolean;
   missing_required: string[];
   runtime_ready: boolean;
+  runtime_closure_ready: boolean;
   status: string;
   vendor_path: string;
 };
 
 function runSetup(cwd: string, extDir: string, env: NodeJS.ProcessEnv = {}) {
-  return spawnSync('python3', ['-S', 'setup.py', '--ext-dir', extDir], {
+  return spawnSync(
+    'python3',
+    [
+      '-S',
+      'setup.py',
+      '--ext-dir',
+      extDir,
+      '--python-exe',
+      '/opt/modly/python/bin/python3',
+      JSON.stringify({ gpu_sm: '89', cuda_version: '12.4' }),
+    ],
+    {
     cwd,
     encoding: 'utf8',
     env: {
       ...process.env,
       ...env,
     },
-  });
+  },
+  );
 }
 
 describe('GitHub install smoke', () => {
@@ -50,12 +67,19 @@ describe('GitHub install smoke', () => {
 
       const summary = JSON.parse(readFileSync(path.join(checkout, '.setup-summary.json'), 'utf8')) as Summary;
       expect(summary).toMatchObject({
+        gpu_sm: '89',
+        cuda_version: '12.4',
         config_ready: true,
         runtime_ready: true,
+        install_success: true,
+        install_ready: true,
+        runtime_closure_ready: true,
         status: 'ready',
         missing_required: [],
-        vendor_path: path.join(checkout, 'runtime', 'vendor'),
+        vendor_path: path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime'),
       });
+      expect(JSON.stringify(summary).toLowerCase()).not.toContain('hunyuan');
+      expect(JSON.stringify(summary).toLowerCase()).not.toContain('wheel');
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }
@@ -75,12 +99,19 @@ describe('GitHub install smoke', () => {
 
       const summary = JSON.parse(readFileSync(path.join(checkout, '.setup-summary.json'), 'utf8')) as Summary;
       expect(summary).toMatchObject({
+        gpu_sm: '89',
+        cuda_version: '12.4',
         config_ready: true,
         runtime_ready: false,
+        install_success: false,
+        install_ready: false,
+        runtime_closure_ready: true,
         status: 'blocked',
-        vendor_path: path.join(checkout, 'runtime', 'vendor'),
+        vendor_path: path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime'),
       });
       expect(summary.missing_required).toContain('weight:models/ultrashape/ultrashape_v1.pt');
+      expect(JSON.stringify(summary).toLowerCase()).not.toContain('hunyuan');
+      expect(JSON.stringify(summary).toLowerCase()).not.toContain('wheel');
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }

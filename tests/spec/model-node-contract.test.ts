@@ -11,7 +11,7 @@ function repoPath(...segments: string[]) {
 }
 
 describe('model node contract', () => {
-  it('declares an honest image + mesh -> mesh node for the model shell', () => {
+  it('publishes truthful Hunyuan-style download metadata for the refinement node', () => {
     const manifest = JSON.parse(readFileSync(repoPath('manifest.json'), 'utf8'));
     const [node] = manifest.nodes;
 
@@ -20,10 +20,15 @@ describe('model node contract', () => {
       input: 'image',
       inputs: ['image', 'mesh'],
       output: 'mesh',
+      hf_repo: 'infinith/UltraShape',
+      download_check: 'ultrashape_v1.pt',
+      hf_skip_prefixes: ['vae/**'],
     });
+    expect(Array.isArray(node.hf_skip_prefixes)).toBe(true);
+    expect(node.hf_skip_prefixes).not.toContain('models/**');
   });
 
-  it('keeps mesh routing as node contract truth instead of legacy aliases', () => {
+  it('keeps mesh routing and parameter schema free of legacy shell aliases', () => {
     const manifest = JSON.parse(readFileSync(repoPath('manifest.json'), 'utf8'));
     const [node] = manifest.nodes;
     const paramIds = Array.isArray(node.params_schema)
@@ -33,6 +38,7 @@ describe('model node contract', () => {
     expect(paramIds).not.toContain('reference_image');
     expect(paramIds).not.toContain('coarse_mesh');
     expect(paramIds).not.toContain('mesh_path');
+    expect(paramIds).toEqual(['steps', 'guidance_scale', 'seed', 'preserve_scale']);
     expect(JSON.stringify(manifest)).not.toContain('input.filePath');
     expect(JSON.stringify(manifest)).not.toContain('params.coarse_mesh');
     expect(JSON.stringify(manifest)).not.toContain('reference_image');

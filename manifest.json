@@ -1,10 +1,10 @@
 {
   "id": "modly.ultrashape-refiner-model",
   "name": "UltraShape Refiner",
-  "type": "model",
-  "local_only": true,
+  "source": "https://github.com/DrHepa/modly-UltraShape-1.0-extension",
+  "description": "Refines an input mesh from an input image into a higher-fidelity mesh through the UltraShape generator shell.",
   "version": "1.0.0",
-  "description": "Refines an input mesh from an input image into a refined mesh through the local UltraShape runtime.",
+  "author": "DrHepa",
   "generator_class": "UltraShapeGenerator",
   "tags": ["mesh-refinement", "image-plus-mesh", "local"],
   "nodes": [
@@ -14,6 +14,10 @@
       "input": "image",
       "inputs": ["image", "mesh"],
       "output": "mesh",
+      "hf_repo": "infinith/UltraShape",
+      "download_check": "ultrashape_v1.pt",
+      "hf_skip_prefixes": ["vae/**"],
+      "description": "High-fidelity mesh refinement for an existing coarse mesh guided by a reference image.",
       "params_schema": [
         {
           "id": "steps",

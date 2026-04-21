@@ -63,7 +63,14 @@ class UltraShapeGenerator:
         self._loaded = True
         return self._loaded
 
-    def generate(self, image_bytes: bytes | None, params: dict[str, Any] | None = None) -> str:
+    def generate(
+        self,
+        image_bytes: bytes | None,
+        params: dict[str, Any] | None = None,
+        progress_cb: Any | None = None,
+        cancel_event: Any | None = None,
+    ) -> str:
+        del progress_cb, cancel_event
         if not self._loaded:
             self.load()
 
@@ -90,7 +97,12 @@ class UltraShapeGenerator:
             params=normalized_params,
         )
         runner_result = self._run_local_runner(runner_job)
-        self._last_job = runner_job
+        self._last_job = {
+            "backend": runner_job["backend"],
+            "output_format": runner_job["output_format"],
+            "config_path": runner_job["config_path"],
+            "checkpoint": runner_job["checkpoint"],
+        }
         self._last_result = runner_result
         return str(runner_result["file_path"])
 
@@ -299,5 +311,6 @@ class UltraShapeGenerator:
         if self._runtime_readiness is not None:
             vendor_path = self._runtime_readiness.get("vendor_path")
             if isinstance(vendor_path, str) and vendor_path.strip():
-                return vendor_path
+                candidate = Path(vendor_path)
+                return str(candidate.parent if candidate.name == 'ultrashape_runtime' else candidate)
         return str(self._vendor_path().parent)

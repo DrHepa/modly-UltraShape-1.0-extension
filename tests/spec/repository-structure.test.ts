@@ -31,13 +31,21 @@ describe('clean-room repository structure', () => {
     expect(existsSync(repoPath('tests', 'spec', 'fallback-fixtures.test.ts'))).toBe(false);
   });
 
+  it('keeps shell-level manifest authority free of processor-era leakage', () => {
+    const manifestText = readFileSync(repoPath('manifest.json'), 'utf8');
+
+    expect(manifestText).not.toContain('processor');
+    expect(manifestText).not.toContain('process-refiner');
+    expect(manifestText).not.toContain('reference_image');
+    expect(manifestText).not.toContain('coarse_mesh');
+  });
+
   it('documents shell authority and current non-goals in the README', () => {
     const readme = readFileSync(repoPath('README.md'), 'utf8');
 
-    expect(readme).toContain('The ONLY public shell authority in this rewrite is');
-    expect(readme).toContain('- `manifest.json`');
-    expect(readme).toContain('- `generator.py`');
-    expect(readme).toContain('- `setup.py`');
+    expect(readme).toContain('The model shell is the sole public authority: `manifest.json`, `setup.py`, and `generator.py`.');
+    expect(readme).toContain('`runtime/**` and `models/ultrashape/**` remain private implementation details.');
+    expect(readme).not.toContain('process-shell authority');
     expect(readme).not.toContain('temporary migration seam');
     expect(readme).not.toContain('temporary compatibility seam');
     expect(readme).not.toContain('later removal batch');

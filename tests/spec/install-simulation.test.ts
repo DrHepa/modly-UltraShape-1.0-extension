@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -54,24 +54,88 @@ describe('install simulation', () => {
       );
 
       expect(result.status).toBe(0);
-      expect(JSON.parse(result.stdout)).toEqual([
+      const payload = JSON.parse(result.stdout);
+      expect(payload).toEqual([
         {
           method: 'generate',
           ok: true,
           result: expect.stringMatching(/\.glb$/),
           loaded: true,
-          debug: {
-            last_job: expect.objectContaining({
-              coarse_mesh: inputs.coarseMesh,
-              config_path: path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'),
-              ext_dir: checkout,
-            }),
-            last_pythonpath: expect.stringContaining(path.join(checkout, 'runtime', 'vendor')),
-            last_result: expect.objectContaining({
-              backend: 'local',
-              subtrees_loaded: ['vae', 'dit', 'conditioner'],
-            }),
+          debug: expect.any(Object),
+        },
+      ]);
+      expect(payload[0].result).toContain('ultrashape-generator-');
+      expect(payload[0].debug.last_result).toMatchObject({
+        backend: 'local',
+        subtrees_loaded: ['vae', 'dit', 'conditioner'],
+      });
+      expect(JSON.stringify(payload[0].debug.last_job ?? {})).not.toContain('coarse_mesh');
+      expect(JSON.stringify(payload[0].debug.last_job ?? {})).not.toContain('reference_image');
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('treats setup-produced readiness as the install authority for generator load and generate', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-install-readiness-authority-'));
+    const checkout = path.join(sandbox, 'repo');
+    const stubRoot = path.join(sandbox, 'stubs');
+    copyInstallSurface(checkout);
+    writeRuntimeStubModules(stubRoot);
+    stageCheckpoint(checkout);
+    const inputs = createRuntimeInputs(sandbox);
+
+    try {
+      const setup = runSetup(checkout, checkout, { PYTHONPATH: stubRoot });
+      expect(setup.status).toBe(0);
+
+      writeFileSync(
+        path.join(checkout, '.runtime-readiness.json'),
+        JSON.stringify(
+          {
+            backend: 'local',
+            checkpoint: path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'),
+            config_path: path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'),
+            ext_dir: checkout,
+            install_ready: false,
+            install_success: false,
+            missing_required: ['weight:models/ultrashape/ultrashape_v1.pt'],
+            required_imports_ok: true,
+            runtime_ready: false,
+            status: 'blocked',
+            vendor_path: path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime'),
+            weights_ready: false,
           },
+          null,
+          2,
+        ),
+      );
+
+      const result = runGeneratorProbe(
+        checkout,
+        [
+          { method: 'is_downloaded' },
+          {
+            method: 'generate',
+            imageBase64: PNG_1X1_BASE64,
+            params: { mesh_path: inputs.coarseMesh },
+          },
+        ],
+        { PYTHONPATH: stubRoot },
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual([
+        { method: 'is_downloaded', ok: true, result: false, loaded: false },
+        {
+          method: 'generate',
+          ok: false,
+          error: {
+            type: 'PublicRuntimeError',
+            code: 'WEIGHTS_MISSING',
+            message: 'Required runtime weights are unavailable: weight:models/ultrashape/ultrashape_v1.pt.',
+          },
+          loaded: false,
         },
       ]);
     } finally {

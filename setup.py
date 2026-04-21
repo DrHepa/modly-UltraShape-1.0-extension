@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('payload_json', nargs='?')
     parser.add_argument('--ext-dir', default=str(repo_root()))
     parser.add_argument('--python-exe', default=sys.executable)
+    parser.add_argument('--gpu-sm', dest='gpu_sm')
+    parser.add_argument('--cuda-version', dest='cuda_version')
     args = parser.parse_args()
 
     if args.payload_json:
@@ -51,10 +53,16 @@ def parse_args() -> argparse.Namespace:
             raise SystemExit('setup payload must be a JSON object')
         ext_dir = payload.get('ext_dir')
         python_exe = payload.get('python_exe')
+        gpu_sm = payload.get('gpu_sm')
+        cuda_version = payload.get('cuda_version')
         if isinstance(ext_dir, str) and ext_dir.strip() != '':
             args.ext_dir = ext_dir
         if isinstance(python_exe, str) and python_exe.strip() != '':
             args.python_exe = python_exe
+        if isinstance(gpu_sm, str) and gpu_sm.strip() != '':
+            args.gpu_sm = gpu_sm.strip()
+        if isinstance(cuda_version, str) and cuda_version.strip() != '':
+            args.cuda_version = cuda_version.strip()
 
     return args
 
@@ -98,9 +106,17 @@ def detect_missing_imports(module_names: list[str]) -> list[str]:
     return missing
 
 
-def build_readiness(ext_dir: Path, *, config_ready: bool, vendor_ready: bool) -> dict[str, object]:
+def build_readiness(
+    ext_dir: Path,
+    *,
+    python_exe: str,
+    gpu_sm: str | None,
+    cuda_version: str | None,
+    config_ready: bool,
+    vendor_ready: bool,
+) -> dict[str, object]:
     checkpoint_path = ext_dir / CHECKPOINT_RELATIVE
-    vendor_path = ext_dir / VENDOR_RELATIVE.parent
+    vendor_path = ext_dir / VENDOR_RELATIVE
     missing_required: list[str] = []
     if not config_ready:
         missing_required.append(f'config:{CONFIG_RELATIVE.as_posix()}')
@@ -131,12 +147,15 @@ def build_readiness(ext_dir: Path, *, config_ready: bool, vendor_ready: bool) ->
         'checkpoint': str(checkpoint_path),
         'config_path': str(ext_dir / CONFIG_RELATIVE),
         'config_ready': config_ready,
+        'cuda_version': cuda_version,
         'ext_dir': str(ext_dir),
+        'gpu_sm': gpu_sm,
         'missing_required': missing_required,
         'missing_conditional': [f'import:{name}' for name in missing_conditional],
         'missing_degradable': [f'import:{name}' for name in missing_degradable],
         'missing_optional': [f'import:{name}' for name in [*missing_conditional, *missing_degradable]],
         'required_imports_ok': required_imports_ok,
+        'python_exe': python_exe,
         'runtime_ready': runtime_ready,
         'status': status,
         'vendor_path': str(vendor_path),
@@ -162,10 +181,19 @@ def main() -> int:
     ext_dir.mkdir(parents=True, exist_ok=True)
 
     config_ready, vendor_ready = stage_runtime_assets(ext_dir)
-    readiness = build_readiness(ext_dir, config_ready=config_ready, vendor_ready=vendor_ready)
+    readiness = build_readiness(
+        ext_dir,
+        python_exe=args.python_exe,
+        gpu_sm=args.gpu_sm,
+        cuda_version=args.cuda_version,
+        config_ready=config_ready,
+        vendor_ready=vendor_ready,
+    )
     summary = {
         'python_exe': args.python_exe,
         'ext_dir': str(ext_dir),
+        'gpu_sm': args.gpu_sm,
+        'cuda_version': args.cuda_version,
         'config_ready': readiness['config_ready'],
         'vendor_ready': readiness['vendor_ready'],
         'required_imports_ok': readiness['required_imports_ok'],
