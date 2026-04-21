@@ -5,18 +5,22 @@ import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { copyInstallSurface, stageCheckpoint, writeRuntimeStubModules } from './install-test-helpers.js';
+import { copyInstallSurface } from './install-test-helpers.js';
 
 type Summary = {
   cuda_version?: string | null;
   config_ready: boolean;
+  dependency_install?: Record<string, unknown>;
   gpu_sm?: string | null;
+  host_facts?: Record<string, unknown>;
   install_ready: boolean;
   install_success: boolean;
   missing_required: string[];
+  native_install?: Record<string, unknown>;
   runtime_ready: boolean;
   runtime_closure_ready: boolean;
   status: string;
+  venv_dir?: string;
   vendor_path: string;
 };
 
@@ -44,22 +48,26 @@ function runSetup(cwd: string, extDir: string, env: NodeJS.ProcessEnv = {}) {
 }
 
 describe('GitHub install smoke', () => {
-  it('stages readiness artifacts from a copied clean-room checkout', () => {
+  it('creates a real install footprint from a copied clean-room checkout', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-github-install-'));
     const checkout = path.join(sandbox, 'modly-UltraShape-1.0-extension');
-    const stubRoot = path.join(sandbox, 'stubs');
     copyInstallSurface(checkout);
-    writeRuntimeStubModules(stubRoot);
-    stageCheckpoint(checkout);
 
     try {
-      const result = runSetup(checkout, checkout, { PYTHONPATH: stubRoot });
+      const result = runSetup(checkout, checkout, {
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+        ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+        ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'stub-weight',
+      });
 
       expect(result.status).toBe(0);
       expect(existsSync(path.join(checkout, '.setup-summary.json'))).toBe(true);
       expect(existsSync(path.join(checkout, '.runtime-readiness.json'))).toBe(true);
       expect(existsSync(path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'))).toBe(true);
       expect(existsSync(path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime', 'local_runner.py'))).toBe(true);
+      expect(existsSync(path.join(checkout, 'venv', 'bin', 'python'))).toBe(true);
+      expect(existsSync(path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'))).toBe(true);
       expect(existsSync(path.join(checkout, 'processor.py'))).toBe(false);
       expect(existsSync(path.join(checkout, 'processor.js'))).toBe(false);
       expect(existsSync(path.join(checkout, 'src'))).toBe(false);
@@ -76,24 +84,30 @@ describe('GitHub install smoke', () => {
         runtime_closure_ready: true,
         status: 'ready',
         missing_required: [],
+        venv_dir: path.join(checkout, 'venv'),
         vendor_path: path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime'),
       });
+      expect(summary.host_facts).toMatchObject({ platform: 'linux', machine: 'aarch64' });
+      expect(summary.dependency_install).toBeTruthy();
+      expect(summary.native_install).toMatchObject({ cubvh: expect.objectContaining({ status: 'ready' }) });
       expect(JSON.stringify(summary).toLowerCase()).not.toContain('hunyuan');
-      expect(JSON.stringify(summary).toLowerCase()).not.toContain('wheel');
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }
   });
 
-  it('keeps copied checkout installs blocked when the required checkpoint is absent', () => {
+  it('keeps copied checkout installs blocked when the required native cubvh prerequisites are absent', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-github-blocked-'));
     const checkout = path.join(sandbox, 'modly-UltraShape-1.0-extension');
-    const stubRoot = path.join(sandbox, 'stubs');
     copyInstallSurface(checkout);
-    writeRuntimeStubModules(stubRoot);
 
     try {
-      const result = runSetup(checkout, checkout, { PYTHONPATH: stubRoot });
+      const result = runSetup(checkout, checkout, {
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+        ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+        ULTRASHAPE_SETUP_TEST_CUBVH_PREREQ_MISSING: 'compiler',
+      });
 
       expect(result.status).toBe(1);
 
@@ -107,11 +121,14 @@ describe('GitHub install smoke', () => {
         install_ready: false,
         runtime_closure_ready: true,
         status: 'blocked',
+        venv_dir: path.join(checkout, 'venv'),
         vendor_path: path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime'),
       });
-      expect(summary.missing_required).toContain('weight:models/ultrashape/ultrashape_v1.pt');
+      expect(summary.missing_required).toContain('native-stage:cubvh');
+      expect(summary.native_install).toMatchObject({
+        cubvh: expect.objectContaining({ status: 'blocked' }),
+      });
       expect(JSON.stringify(summary).toLowerCase()).not.toContain('hunyuan');
-      expect(JSON.stringify(summary).toLowerCase()).not.toContain('wheel');
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }

@@ -32,13 +32,20 @@ describe('install simulation', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-install-generator-'));
     const checkout = path.join(sandbox, 'repo');
     const stubRoot = path.join(sandbox, 'stubs');
+    const weightSourceRoot = path.join(sandbox, 'weight-source');
     copyInstallSurface(checkout);
     writeRuntimeStubModules(stubRoot);
-    stageCheckpoint(checkout);
+    const weightSourcePath = stageCheckpoint(weightSourceRoot);
     const inputs = createRuntimeInputs(sandbox);
 
     try {
-      const setup = runSetup(checkout, checkout, { PYTHONPATH: stubRoot });
+      const setup = runSetup(checkout, checkout, {
+        PYTHONPATH: stubRoot,
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+        ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+        ULTRASHAPE_WEIGHT_SOURCE_PATH: weightSourcePath,
+      });
       expect(setup.status).toBe(0);
 
       const result = runGeneratorProbe(
@@ -80,13 +87,20 @@ describe('install simulation', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-install-readiness-authority-'));
     const checkout = path.join(sandbox, 'repo');
     const stubRoot = path.join(sandbox, 'stubs');
+    const weightSourceRoot = path.join(sandbox, 'weight-source');
     copyInstallSurface(checkout);
     writeRuntimeStubModules(stubRoot);
-    stageCheckpoint(checkout);
+    const weightSourcePath = stageCheckpoint(weightSourceRoot);
     const inputs = createRuntimeInputs(sandbox);
 
     try {
-      const setup = runSetup(checkout, checkout, { PYTHONPATH: stubRoot });
+      const setup = runSetup(checkout, checkout, {
+        PYTHONPATH: stubRoot,
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+        ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+        ULTRASHAPE_WEIGHT_SOURCE_PATH: weightSourcePath,
+      });
       expect(setup.status).toBe(0);
 
       writeFileSync(
@@ -167,7 +181,13 @@ describe('install simulation', () => {
     const inputs = createRuntimeInputs(sandbox);
 
     try {
-      const setup = runSetup(checkout, checkout, { PYTHONPATH: stubRoot });
+      const setup = runSetup(checkout, checkout, {
+        PYTHONPATH: stubRoot,
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+        ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+        ULTRASHAPE_SETUP_TEST_CUBVH_PREREQ_MISSING: 'compiler',
+      });
       expect(setup.status).toBe(1);
 
       const result = runGeneratorProbe(
@@ -189,8 +209,8 @@ describe('install simulation', () => {
           ok: false,
           error: {
             type: 'PublicRuntimeError',
-            code: 'WEIGHTS_MISSING',
-            message: 'Required runtime weights are unavailable: weight:models/ultrashape/ultrashape_v1.pt.',
+            code: 'DEPENDENCY_MISSING',
+            message: 'Required runtime imports are unavailable: import:cubvh, weight:models/ultrashape/ultrashape_v1.pt, native-stage:cubvh.',
           },
           loaded: false,
         },
