@@ -40,9 +40,23 @@ SUMMARY_FILE = '.setup-summary.json'
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Stage the truthful local UltraShape shell')
+    parser.add_argument('payload_json', nargs='?')
     parser.add_argument('--ext-dir', default=str(repo_root()))
     parser.add_argument('--python-exe', default=sys.executable)
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.payload_json:
+        payload = json.loads(args.payload_json)
+        if not isinstance(payload, dict):
+            raise SystemExit('setup payload must be a JSON object')
+        ext_dir = payload.get('ext_dir')
+        python_exe = payload.get('python_exe')
+        if isinstance(ext_dir, str) and ext_dir.strip() != '':
+            args.ext_dir = ext_dir
+        if isinstance(python_exe, str) and python_exe.strip() != '':
+            args.python_exe = python_exe
+
+    return args
 
 
 def repo_root() -> Path:

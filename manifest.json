@@ -1,4 +1,7 @@
 {
+  "id": "modly.ultrashape-refiner-process",
+  "name": "UltraShape Refiner Process",
+  "version": "1.0.0",
   "shell": {
     "local_only": true,
     "processor": "processor.py",
