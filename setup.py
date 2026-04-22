@@ -57,6 +57,9 @@ CORE_PIP_DEPENDENCIES = [
     'onnxruntime',
 ]
 TORCH_EXTRA_INDEX_URL = 'https://download.pytorch.org/whl/cu128'
+CUBVH_TORCH_CUDA_TOOLKITS = {
+    'cu128': Path('/usr/local/cuda-12.8'),
+}
 CUBVH_PINNED_REF = '7855c000f95e43742081060d869702b2b2b33d1f'
 CUBVH_SOURCE = f'git+https://github.com/ashawkey/cubvh@{CUBVH_PINNED_REF}'
 FLASH_ATTN_PACKAGE = 'flash-attn'
@@ -277,6 +280,62 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def detect_torch_cuda_profile() -> str | None:
+    for dependency in CORE_PIP_DEPENDENCIES:
+        if not dependency.startswith('torch=='):
+            continue
+        match = re.search(r'\+(cu\d+)$', dependency)
+        if match:
+            return match.group(1)
+
+    match = re.search(r'/(cu\d+)$', TORCH_EXTRA_INDEX_URL)
+    return match.group(1) if match else None
+
+
+def prepend_env_path(current: str | None, value: str) -> str:
+    entries = [value]
+    if current:
+        entries.extend(item for item in current.split(os.pathsep) if item and item != value)
+    return os.pathsep.join(entries)
+
+
+def resolve_cubvh_cuda_toolkit() -> dict[str, Any]:
+    torch_cuda_profile = detect_torch_cuda_profile()
+    expected_cuda_home = CUBVH_TORCH_CUDA_TOOLKITS.get(torch_cuda_profile)
+    stub_mode = os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS') == '1'
+
+    selected_cuda_home: Path | None = None
+    if expected_cuda_home and (stub_mode or expected_cuda_home.is_dir()):
+        selected_cuda_home = expected_cuda_home
+    else:
+        env_cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+        if env_cuda_home:
+            selected_cuda_home = Path(env_cuda_home)
+        else:
+            nvcc = which('nvcc')
+            if nvcc:
+                selected_cuda_home = Path(nvcc).resolve().parent.parent
+
+    env_overrides: dict[str, str] = {}
+    if selected_cuda_home:
+        selected_str = str(selected_cuda_home)
+        env_overrides = {
+            'CUDA_HOME': selected_str,
+            'CUDA_PATH': selected_str,
+            'PATH': prepend_env_path(os.environ.get('PATH'), str(selected_cuda_home / 'bin')),
+            'LD_LIBRARY_PATH': prepend_env_path(os.environ.get('LD_LIBRARY_PATH'), str(selected_cuda_home / 'lib64')),
+            'LIBRARY_PATH': prepend_env_path(os.environ.get('LIBRARY_PATH'), str(selected_cuda_home / 'lib64')),
+        }
+
+    return {
+        'torch_cuda_profile': torch_cuda_profile,
+        'expected_cuda_home': str(expected_cuda_home) if expected_cuda_home else None,
+        'selected_cuda_home': str(selected_cuda_home) if selected_cuda_home else None,
+        'toolkit_pinned': bool(expected_cuda_home and selected_cuda_home and expected_cuda_home == selected_cuda_home),
+        'env_overrides': env_overrides,
+    }
+
+
 def bootstrap_packaging_tools(venv_dir: Path) -> dict[str, Any]:
     python_path = str(venv_python(venv_dir))
     commands = [run_command([python_path, '-m', 'ensurepip', '--upgrade'])]
@@ -331,26 +390,24 @@ def detect_cubvh_prerequisites(host_facts: dict[str, Any]) -> dict[str, Any]:
     machine = str(host_facts.get('machine') or '')
     platform_name = str(host_facts.get('platform') or '')
     is_linux_arm64 = platform_name.startswith('linux') and machine in {'arm64', 'aarch64'}
+    cuda_toolkit = resolve_cubvh_cuda_toolkit()
     if os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS') == '1':
         detected = {
             'host': f'{platform_name}-{machine}',
             'git': 'git' not in missing_tokens,
             'compiler': None if 'compiler' in missing_tokens else 'g++',
-            'cuda': None if 'cuda' in missing_tokens else '/usr/local/cuda',
+            'cuda': None if 'cuda' in missing_tokens else cuda_toolkit['selected_cuda_home'],
             'eigen': None if 'eigen' in missing_tokens else '/usr/include/eigen3',
         }
     else:
         compiler = next((candidate for candidate in ('c++', 'g++', 'clang++') if which(candidate)), None)
-        cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
-        nvcc = which('nvcc')
-        cuda_path = cuda_home or (str(Path(nvcc).resolve().parent.parent) if nvcc else None)
         eigen_candidates = [Path('/usr/include/eigen3'), Path('/usr/local/include/eigen3')]
         eigen_path = next((str(candidate) for candidate in eigen_candidates if (candidate / 'Eigen' / 'Core').is_file()), None)
         detected = {
             'host': f'{platform_name}-{machine}',
             'git': which('git') is not None,
             'compiler': compiler,
-            'cuda': cuda_path,
+            'cuda': cuda_toolkit['selected_cuda_home'],
             'eigen': eigen_path,
         }
 
@@ -381,10 +438,11 @@ def detect_cubvh_prerequisites(host_facts: dict[str, Any]) -> dict[str, Any]:
 def install_cubvh_stage(venv_dir: Path, ext_dir: Path) -> tuple[dict[str, Any], list[str]]:
     command = [str(venv_python(venv_dir)), '-m', 'pip', 'install', '--no-build-isolation', CUBVH_SOURCE]
     rendered_command = ' '.join(command)
+    cuda_toolkit = resolve_cubvh_cuda_toolkit()
     if os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS') == '1':
         create_stub_package(venv_site_packages(venv_dir), 'cubvh')
     else:
-        subprocess.run(command, check=True, env=child_env())
+        subprocess.run(command, check=True, env=child_env(cuda_toolkit['env_overrides']))
 
     missing = run_import_smoke(venv_dir, ext_dir, ['cubvh'])
     return (
@@ -395,6 +453,11 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: Path) -> tuple[dict[str, Any], 
             'commands': [rendered_command],
             'source': CUBVH_SOURCE,
             'pinned_ref': CUBVH_PINNED_REF,
+            'torch_cuda_profile': cuda_toolkit['torch_cuda_profile'],
+            'expected_cuda_home': cuda_toolkit['expected_cuda_home'],
+            'selected_cuda_home': cuda_toolkit['selected_cuda_home'],
+            'toolkit_pinned': cuda_toolkit['toolkit_pinned'],
+            'env_overrides': cuda_toolkit['env_overrides'],
             'import_smoke_missing': missing,
             'failure_message': None if not missing else 'cubvh build completed but import smoke failed.',
         },

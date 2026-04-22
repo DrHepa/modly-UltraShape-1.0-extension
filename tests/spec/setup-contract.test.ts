@@ -76,6 +76,11 @@ describe('setup.py install truth', () => {
           ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
           ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
           ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'stub-weight',
+          CUDA_HOME: '/usr/local/cuda-13.0',
+          CUDA_PATH: '/usr/local/cuda-13.0',
+          PATH: `/usr/local/cuda-13.0/bin:${process.env.PATH ?? ''}`,
+          LD_LIBRARY_PATH: `/usr/local/cuda-13.0/lib64:${process.env.LD_LIBRARY_PATH ?? ''}`,
+          LIBRARY_PATH: `/usr/local/cuda-13.0/lib64:${process.env.LIBRARY_PATH ?? ''}`,
         },
       });
 
@@ -103,7 +108,20 @@ describe('setup.py install truth', () => {
       expect(existsSync(path.join(checkout, 'venv', 'bin', 'python'))).toBe(true);
       expect(existsSync(path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'))).toBe(true);
       expect(readiness.native_install).toMatchObject({
-        cubvh: expect.objectContaining({ status: 'ready' }),
+        cubvh: expect.objectContaining({
+          status: 'ready',
+          torch_cuda_profile: 'cu128',
+          expected_cuda_home: '/usr/local/cuda-12.8',
+          selected_cuda_home: '/usr/local/cuda-12.8',
+          toolkit_pinned: true,
+          env_overrides: expect.objectContaining({
+            CUDA_HOME: '/usr/local/cuda-12.8',
+            CUDA_PATH: '/usr/local/cuda-12.8',
+            PATH: expect.stringMatching(/^\/usr\/local\/cuda-12\.8\/bin:/),
+            LD_LIBRARY_PATH: expect.stringMatching(/^\/usr\/local\/cuda-12\.8\/lib64:/),
+            LIBRARY_PATH: expect.stringMatching(/^\/usr\/local\/cuda-12\.8\/lib64:/),
+          }),
+        }),
       });
       expect(result.stdout).not.toContain('filePath');
       expect(result.stdout).not.toContain('params.coarse_mesh');
