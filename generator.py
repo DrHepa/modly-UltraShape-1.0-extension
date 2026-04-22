@@ -82,9 +82,9 @@ class UltraShapeGenerator(BaseGenerator):
         if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) == 0:
             raise PublicRuntimeError("INVALID_INPUT", "image_bytes must be a non-empty bytes payload.")
 
-        source_mesh = Path(mesh_path)
+        source_mesh = self._resolve_mesh_path(mesh_path)
         if not source_mesh.is_file():
-            raise PublicRuntimeError("INVALID_INPUT", f"Mesh input does not exist: {mesh_path}")
+            raise PublicRuntimeError("INVALID_INPUT", f"Mesh input does not exist: {source_mesh}")
 
         runtime_readiness = self._runtime_readiness or self._require_runtime_ready()
         output_dir = Path(tempfile.mkdtemp(prefix="ultrashape-generator-"))
@@ -166,6 +166,12 @@ class UltraShapeGenerator(BaseGenerator):
             "seed": seed,
             "preserve_scale": preserve_scale,
         }
+
+    def _resolve_mesh_path(self, mesh_path: str) -> Path:
+        candidate = Path(mesh_path)
+        if candidate.is_absolute():
+            return candidate
+        return Path(self.outputs_dir) / candidate
 
     def unload(self) -> bool:
         self._last_job = None

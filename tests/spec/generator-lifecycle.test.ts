@@ -155,6 +155,53 @@ describe('generator lifecycle shell', () => {
     }
   });
 
+  it('resolves relative params.mesh_path values from the generator outputs directory', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-relative-mesh-'));
+    const checkout = path.join(sandbox, 'repo');
+    const stubRoot = path.join(sandbox, 'stubs');
+    copyInstallSurface(checkout);
+    writeRuntimeStubModules(stubRoot);
+
+    try {
+      const absoluteMeshPath = path.join(sandbox, 'absolute.glb');
+      const relativeMeshPath = path.join('Workflows', '1776878041_a6dadde2.glb');
+      const resolutionProbe = spawnSync(
+        'python3',
+        [
+          '-S',
+          '-c',
+          [
+            'import json, sys',
+            'from pathlib import Path',
+            'from generator import UltraShapeGenerator',
+            'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "outputs")',
+            'absolute = str(generator._resolve_mesh_path(sys.argv[1]))',
+            'relative = str(generator._resolve_mesh_path(sys.argv[2]))',
+            'print(json.dumps({"absolute": absolute, "relative": relative}))',
+          ].join('\n'),
+          absoluteMeshPath,
+          relativeMeshPath,
+        ],
+        {
+          cwd: checkout,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PYTHONPATH: stubRoot,
+          },
+        },
+      );
+
+      expect(resolutionProbe.status).toBe(0);
+      expect(JSON.parse(resolutionProbe.stdout)).toEqual({
+        absolute: absoluteMeshPath,
+        relative: path.join(checkout, 'outputs', relativeMeshPath),
+      });
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
   it('passes raw image_bytes through to the vendored runtime instead of ignoring them', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-bad-image-'));
     const checkout = path.join(sandbox, 'repo');
