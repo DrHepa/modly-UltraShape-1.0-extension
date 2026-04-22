@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -155,7 +155,7 @@ describe('generator lifecycle shell', () => {
     }
   });
 
-  it('resolves relative params.mesh_path values from the generator outputs directory', () => {
+  it('resolves the reported Workflows-prefixed relative mesh_path against the real existing file', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-relative-mesh-'));
     const checkout = path.join(sandbox, 'repo');
     const stubRoot = path.join(sandbox, 'stubs');
@@ -163,8 +163,10 @@ describe('generator lifecycle shell', () => {
     writeRuntimeStubModules(stubRoot);
 
     try {
-      const absoluteMeshPath = path.join(sandbox, 'absolute.glb');
-      const relativeMeshPath = path.join('Workflows', '1776878041_a6dadde2.glb');
+      const relativeMeshPath = path.join('Workflows', 'foo.glb');
+      const existingMeshPath = path.join(checkout, 'Workflows', 'foo.glb');
+      mkdirSync(path.dirname(existingMeshPath), { recursive: true });
+      writeFileSync(existingMeshPath, 'mesh', 'utf8');
       const resolutionProbe = spawnSync(
         'python3',
         [
@@ -174,12 +176,10 @@ describe('generator lifecycle shell', () => {
             'import json, sys',
             'from pathlib import Path',
             'from generator import UltraShapeGenerator',
-            'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "outputs")',
-            'absolute = str(generator._resolve_mesh_path(sys.argv[1]))',
-            'relative = str(generator._resolve_mesh_path(sys.argv[2]))',
-            'print(json.dumps({"absolute": absolute, "relative": relative}))',
+            'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "Workflows")',
+            'relative = str(generator._resolve_mesh_path(sys.argv[1]))',
+            'print(json.dumps({"relative": relative}))',
           ].join('\n'),
-          absoluteMeshPath,
           relativeMeshPath,
         ],
         {
@@ -193,10 +193,7 @@ describe('generator lifecycle shell', () => {
       );
 
       expect(resolutionProbe.status).toBe(0);
-      expect(JSON.parse(resolutionProbe.stdout)).toEqual({
-        absolute: absoluteMeshPath,
-        relative: path.join(checkout, 'outputs', relativeMeshPath),
-      });
+      expect(JSON.parse(resolutionProbe.stdout)).toEqual({ relative: existingMeshPath });
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }

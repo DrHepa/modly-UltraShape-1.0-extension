@@ -169,9 +169,28 @@ class UltraShapeGenerator(BaseGenerator):
 
     def _resolve_mesh_path(self, mesh_path: str) -> Path:
         candidate = Path(mesh_path)
+        candidates: list[Path] = []
+
+        def append_candidate(path: Path) -> None:
+            if path not in candidates:
+                candidates.append(path)
+
         if candidate.is_absolute():
-            return candidate
-        return Path(self.outputs_dir) / candidate
+            append_candidate(candidate)
+        else:
+            outputs_dir = Path(self.outputs_dir)
+            append_candidate(outputs_dir / candidate)
+            append_candidate(outputs_dir.parent / candidate)
+
+            workspace_dir = os.environ.get("WORKSPACE_DIR")
+            if isinstance(workspace_dir, str) and workspace_dir.strip():
+                append_candidate(Path(workspace_dir.strip()) / candidate)
+
+        for resolved_candidate in candidates:
+            if resolved_candidate.exists():
+                return resolved_candidate
+
+        return candidates[-1]
 
     def unload(self) -> bool:
         self._last_job = None
