@@ -66,8 +66,16 @@ export function writeRuntimeStubModules(root: string) {
   mkdirSync(root, { recursive: true });
   mkdirSync(path.join(root, 'skimage'), { recursive: true });
   mkdirSync(path.join(root, 'PIL'), { recursive: true });
+  mkdirSync(path.join(root, 'services', 'generators'), { recursive: true });
   writeFileSync(path.join(root, 'skimage', '__init__.py'), '', 'utf8');
   writeFileSync(path.join(root, 'PIL', '__init__.py'), '', 'utf8');
+  writeFileSync(path.join(root, 'services', '__init__.py'), '', 'utf8');
+  writeFileSync(path.join(root, 'services', 'generators', '__init__.py'), '', 'utf8');
+  writeFileSync(
+    path.join(root, 'services', 'generators', 'base.py'),
+    'class BaseGenerator:\n    def __init__(self, model_dir, outputs_dir):\n        self.model_dir = model_dir\n        self.outputs_dir = outputs_dir\n        self._loaded = False\n',
+    'utf8',
+  );
 
   for (const modulePath of modules) {
     writeFileSync(path.join(root, modulePath), '\n', 'utf8');

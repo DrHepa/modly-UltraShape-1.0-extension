@@ -28,6 +28,7 @@ PUBLIC_GENERATE_PARAM_DEFAULTS: dict[str, Any] = {
     "preserve_scale": True,
 }
 
+NON_OPERATIVE_MODLY_GENERATE_PARAM_KEYS = {"remesh", "enable_texture", "texture_resolution"}
 PUBLIC_GENERATE_ALLOWED_PARAM_KEYS = {"mesh_path", *PUBLIC_GENERATE_PARAM_DEFAULTS.keys()}
 LEGACY_GENERATE_ALIAS_KEYS = {"reference_image", "coarse_mesh", "input", "input.filePath"}
 
@@ -115,6 +116,9 @@ class UltraShapeGenerator(BaseGenerator):
             normalized_params = dict(params)
         else:
             raise PublicRuntimeError("INVALID_INPUT", "params must be a JSON object when provided.")
+
+        for ignored_key in NON_OPERATIVE_MODLY_GENERATE_PARAM_KEYS:
+            normalized_params.pop(ignored_key, None)
 
         alias_fields = sorted(key for key in LEGACY_GENERATE_ALIAS_KEYS if key in normalized_params)
         if alias_fields:

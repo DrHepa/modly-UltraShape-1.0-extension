@@ -122,7 +122,12 @@ describe('generator lifecycle shell', () => {
           {
             method: 'generate',
             imageBase64: PNG_1X1_BASE64,
-            params: { mesh_path: coarseMesh },
+            params: {
+              mesh_path: coarseMesh,
+              remesh: true,
+              enable_texture: true,
+              texture_resolution: 1024,
+            },
           },
           { method: 'unload' },
         ],
@@ -141,6 +146,9 @@ describe('generator lifecycle shell', () => {
       });
       expect(JSON.stringify(payload[0].debug.last_job ?? {})).not.toContain('coarse_mesh');
       expect(JSON.stringify(payload[0].debug.last_job ?? {})).not.toContain('reference_image');
+      expect(JSON.stringify(payload[0].debug.last_job ?? {})).not.toContain('remesh');
+      expect(JSON.stringify(payload[0].debug.last_job ?? {})).not.toContain('enable_texture');
+      expect(JSON.stringify(payload[0].debug.last_job ?? {})).not.toContain('texture_resolution');
       expect(payload[1]).toEqual({ method: 'unload', ok: true, result: false, loaded: false });
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
@@ -312,6 +320,53 @@ describe('generator lifecycle shell', () => {
             type: 'PublicRuntimeError',
             code: 'INVALID_INPUT',
             message: expect.stringContaining('Mixed public contract fields'),
+          },
+          loaded: true,
+        },
+      ]);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores Modly global generation params but still rejects other unsupported params', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-global-params-'));
+    const checkout = path.join(sandbox, 'repo');
+    const stubRoot = path.join(sandbox, 'stubs');
+    copyInstallSurface(checkout);
+    writeRuntimeStubModules(stubRoot);
+    stageCheckpoint(checkout);
+    runSetup(checkout, checkout, { PYTHONPATH: stubRoot });
+    const { coarseMesh } = createRuntimeInputs(sandbox);
+
+    try {
+      const result = runGeneratorProbe(
+        checkout,
+        [
+          {
+            method: 'generate',
+            imageBase64: PNG_1X1_BASE64,
+            params: {
+              mesh_path: coarseMesh,
+              remesh: false,
+              enable_texture: false,
+              texture_resolution: 512,
+              unsupported_flag: true,
+            },
+          },
+        ],
+        { PYTHONPATH: stubRoot },
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual([
+        {
+          method: 'generate',
+          ok: false,
+          error: {
+            type: 'PublicRuntimeError',
+            code: 'INVALID_INPUT',
+            message: 'Unsupported params fields: unsupported_flag.',
           },
           loaded: true,
         },
