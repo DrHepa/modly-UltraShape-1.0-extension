@@ -168,7 +168,7 @@ describe('private runtime flow behind the model shell', () => {
       [
         'import json, pathlib, tempfile',
         'from generator import UltraShapeGenerator',
-        'generator = UltraShapeGenerator()',
+        'generator = UltraShapeGenerator(pathlib.Path.cwd() / "models", pathlib.Path.cwd() / "outputs")',
         'output_dir = pathlib.Path(tempfile.mkdtemp(prefix="ultrashape-private-runner-output-"))',
         'job = generator._build_runner_job(',
         '    readiness={"checkpoint": "/tmp/ultrashape_v1.pt", "config_path": "", "ext_dir": "/tmp/ext"},',

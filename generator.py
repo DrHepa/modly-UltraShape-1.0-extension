@@ -12,6 +12,8 @@ import subprocess
 import sys
 from typing import Any
 
+from services.generators.base import BaseGenerator
+
 PUBLIC_RUNTIME_ERROR_CODES = {
     "DEPENDENCY_MISSING",
     "WEIGHTS_MISSING",
@@ -37,9 +39,9 @@ class PublicRuntimeError(RuntimeError):
         self.code = normalized
 
 
-class UltraShapeGenerator:
-    def __init__(self) -> None:
-        self._loaded = False
+class UltraShapeGenerator(BaseGenerator):
+    def __init__(self, model_dir: Path, outputs_dir: Path) -> None:
+        super().__init__(model_dir, outputs_dir)
         self._last_job: dict[str, Any] | None = None
         self._last_pythonpath: str | None = None
         self._last_result: dict[str, Any] | None = None

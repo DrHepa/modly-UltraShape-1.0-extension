@@ -117,8 +117,9 @@ export function runGeneratorProbe(
 ) {
   const script = [
     'import base64, json, sys',
+    'from pathlib import Path',
     'from generator import UltraShapeGenerator',
-    'generator = UltraShapeGenerator()',
+    'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "outputs")',
     'actions = json.loads(sys.argv[1])',
     'results = []',
     'for action in actions:',
