@@ -199,6 +199,63 @@ describe('generator lifecycle shell', () => {
     }
   });
 
+  it('surfaces structured mesh resolution diagnostics when no candidate exists', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-mesh-diagnostics-'));
+    const checkout = path.join(sandbox, 'repo');
+    const stubRoot = path.join(sandbox, 'stubs');
+    const workspaceDir = path.join(sandbox, 'workspace');
+    copyInstallSurface(checkout);
+    writeRuntimeStubModules(stubRoot);
+    mkdirSync(workspaceDir, { recursive: true });
+
+    try {
+      const diagnosticProbe = spawnSync(
+        'python3',
+        [
+          '-S',
+          '-c',
+          [
+            'import json, sys',
+            'from pathlib import Path',
+            'from generator import PublicRuntimeError, UltraShapeGenerator',
+            'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "outputs")',
+            'try:',
+            '    generator._resolve_mesh_path(sys.argv[1])',
+            'except PublicRuntimeError as error:',
+            '    print(json.dumps({"code": error.code, "message": str(error)}))',
+          ].join('\n'),
+          path.join('Workflows', 'missing.glb'),
+        ],
+        {
+          cwd: checkout,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PYTHONPATH: stubRoot,
+            WORKSPACE_DIR: workspaceDir,
+          },
+        },
+      );
+
+      expect(diagnosticProbe.status).toBe(0);
+      expect(JSON.parse(diagnosticProbe.stdout)).toEqual({
+        code: 'INVALID_INPUT',
+        message: [
+          'Mesh input could not be resolved.',
+          'original mesh_path: Workflows/missing.glb',
+          `self.outputs_dir: ${path.join(checkout, 'outputs')}`,
+          `WORKSPACE_DIR: ${workspaceDir}`,
+          'candidates:',
+          `  1. path=${path.join(checkout, 'outputs', 'Workflows', 'missing.glb')} exists=False parent=${path.join(checkout, 'outputs', 'Workflows')} parent_exists=False`,
+          `  2. path=${path.join(checkout, 'Workflows', 'missing.glb')} exists=False parent=${path.join(checkout, 'Workflows')} parent_exists=False`,
+          `  3. path=${path.join(workspaceDir, 'Workflows', 'missing.glb')} exists=False parent=${path.join(workspaceDir, 'Workflows')} parent_exists=False`,
+        ].join('\n'),
+      });
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
   it('passes raw image_bytes through to the vendored runtime instead of ignoring them', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-bad-image-'));
     const checkout = path.join(sandbox, 'repo');

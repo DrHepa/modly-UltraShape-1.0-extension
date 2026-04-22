@@ -83,8 +83,6 @@ class UltraShapeGenerator(BaseGenerator):
             raise PublicRuntimeError("INVALID_INPUT", "image_bytes must be a non-empty bytes payload.")
 
         source_mesh = self._resolve_mesh_path(mesh_path)
-        if not source_mesh.is_file():
-            raise PublicRuntimeError("INVALID_INPUT", f"Mesh input does not exist: {source_mesh}")
 
         runtime_readiness = self._runtime_readiness or self._require_runtime_ready()
         output_dir = Path(tempfile.mkdtemp(prefix="ultrashape-generator-"))
@@ -190,7 +188,25 @@ class UltraShapeGenerator(BaseGenerator):
             if resolved_candidate.exists():
                 return resolved_candidate
 
-        return candidates[-1]
+        raise PublicRuntimeError("INVALID_INPUT", self._format_missing_mesh_diagnostics(mesh_path, candidates))
+
+    def _format_missing_mesh_diagnostics(self, mesh_path: str, candidates: list[Path]) -> str:
+        workspace_dir = os.environ.get("WORKSPACE_DIR")
+        diagnostics = [
+            "Mesh input could not be resolved.",
+            f"original mesh_path: {mesh_path}",
+            f"self.outputs_dir: {Path(self.outputs_dir)}",
+            f"WORKSPACE_DIR: {workspace_dir if isinstance(workspace_dir, str) and workspace_dir.strip() else '<unset>'}",
+            "candidates:",
+        ]
+
+        for index, candidate in enumerate(candidates, start=1):
+            parent = candidate.parent
+            diagnostics.append(
+                f"  {index}. path={candidate} exists={candidate.exists()} parent={parent} parent_exists={parent.exists()}"
+            )
+
+        return "\n".join(diagnostics)
 
     def unload(self) -> bool:
         self._last_job = None
