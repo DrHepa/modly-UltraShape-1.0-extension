@@ -85,7 +85,9 @@ class UltraShapeGenerator(BaseGenerator):
         source_mesh = self._resolve_mesh_path(mesh_path)
 
         runtime_readiness = self._runtime_readiness or self._require_runtime_ready()
-        output_dir = Path(tempfile.mkdtemp(prefix="ultrashape-generator-"))
+        workspace_output_root = Path(self.outputs_dir)
+        workspace_output_root.mkdir(parents=True, exist_ok=True)
+        output_dir = Path(tempfile.mkdtemp(prefix="ultrashape-generator-", dir=workspace_output_root))
         reference_dir = Path(tempfile.mkdtemp(prefix="ultrashape-reference-"))
         reference_path = reference_dir / "reference.png"
         reference_path.write_bytes(bytes(image_bytes))

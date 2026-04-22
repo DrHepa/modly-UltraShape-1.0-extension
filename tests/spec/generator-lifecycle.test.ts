@@ -140,6 +140,7 @@ describe('generator lifecycle shell', () => {
       expect(typeof payload[0].result).toBe('string');
       expect(payload[0].result).toMatch(/\.glb$/);
       expect(existsSync(payload[0].result)).toBe(true);
+      expect(payload[0].result).toContain(path.join(checkout, 'outputs'));
       expect(payload[0].debug.last_result).toMatchObject({
         backend: 'local',
         subtrees_loaded: ['vae', 'dit', 'conditioner'],
