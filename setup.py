@@ -435,6 +435,12 @@ def detect_cubvh_prerequisites(host_facts: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def is_linux_arm64_host(host_facts: dict[str, Any]) -> bool:
+    platform_name = str(host_facts.get('platform') or '')
+    machine = str(host_facts.get('machine') or '')
+    return platform_name.startswith('linux') and machine in {'arm64', 'aarch64'}
+
+
 def install_cubvh_stage(venv_dir: Path, ext_dir: Path) -> tuple[dict[str, Any], list[str]]:
     command = [str(venv_python(venv_dir)), '-m', 'pip', 'install', '--no-build-isolation', CUBVH_SOURCE]
     rendered_command = ' '.join(command)
@@ -465,7 +471,24 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: Path) -> tuple[dict[str, Any], 
     )
 
 
-def install_flash_attn_stage(venv_dir: Path, ext_dir: Path) -> tuple[dict[str, Any], list[str]]:
+def install_flash_attn_stage(venv_dir: Path, ext_dir: Path, host_facts: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    if is_linux_arm64_host(host_facts):
+        missing = ['flash_attn']
+        message = 'flash_attn stage skipped on Linux ARM64 host; continuing with degraded PyTorch SDPA fallback.'
+        return (
+            {
+                'attempted': False,
+                'required': False,
+                'degradable': True,
+                'status': 'degraded',
+                'commands': [],
+                'import_smoke_missing': missing,
+                'failure_message': message,
+                'skip_reason': message,
+            },
+            missing,
+        )
+
     command = [str(venv_python(venv_dir)), '-m', 'pip', 'install', '--no-build-isolation', FLASH_ATTN_PACKAGE]
     rendered_command = ' '.join(command)
     if os.environ.get('ULTRASHAPE_SETUP_TEST_STUB_DEPS') == '1':
@@ -841,7 +864,7 @@ def main() -> int:
         return 1
 
     cubvh_stage, cubvh_missing = install_cubvh_stage(venv_dir, ext_dir)
-    flash_attn_stage, flash_attn_missing = install_flash_attn_stage(venv_dir, ext_dir)
+    flash_attn_stage, flash_attn_missing = install_flash_attn_stage(venv_dir, ext_dir, host_facts)
     native_install = {
         'cubvh': cubvh_stage,
         'flash_attn': flash_attn_stage,

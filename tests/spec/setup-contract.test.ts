@@ -59,6 +59,9 @@ function readSetupSummary(extDir: string) {
   return readFileSync(path.join(extDir, '.setup-summary.json'), 'utf8');
 }
 
+const FLASH_ATTN_SKIP_MESSAGE =
+  'flash_attn stage skipped on Linux ARM64 host; continuing with degraded PyTorch SDPA fallback.';
+
 describe('setup.py install truth', () => {
   it('creates a venv, installs dependencies, acquires weights, and stays honest when payload host facts are absent', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-contract-'));
@@ -101,10 +104,11 @@ describe('setup.py install truth', () => {
         install_success: true,
         install_ready: true,
         runtime_closure_ready: true,
-        status: 'ready',
+        status: 'degraded',
         venv_dir: path.join(checkout, 'venv'),
       });
       expect(readiness.missing_required).toEqual([]);
+      expect(readiness.missing_optional).toEqual(['import:flash_attn']);
       expect(existsSync(path.join(checkout, 'venv', 'bin', 'python'))).toBe(true);
       expect(existsSync(path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'))).toBe(true);
       expect(readiness.native_install).toMatchObject({
@@ -122,18 +126,30 @@ describe('setup.py install truth', () => {
             LIBRARY_PATH: expect.stringMatching(/^\/usr\/local\/cuda-12\.8\/lib64:/),
           }),
         }),
+        flash_attn: {
+          attempted: false,
+          required: false,
+          degradable: true,
+          status: 'degraded',
+          commands: [],
+          import_smoke_missing: ['flash_attn'],
+          failure_message:
+            FLASH_ATTN_SKIP_MESSAGE,
+          skip_reason:
+            FLASH_ATTN_SKIP_MESSAGE,
+        },
       });
       expect(result.stdout).not.toContain('filePath');
       expect(result.stdout).not.toContain('params.coarse_mesh');
-      expect(result.stdout).not.toContain('fallback');
+      expect(result.stdout).toContain(FLASH_ATTN_SKIP_MESSAGE);
       expect(result.stdout.toLowerCase()).not.toContain('hunyuan');
       expect(JSON.stringify(readiness)).not.toContain('filePath');
       expect(JSON.stringify(readiness)).not.toContain('params.coarse_mesh');
-      expect(JSON.stringify(readiness)).not.toContain('fallback');
+      expect(JSON.stringify(readiness)).toContain(FLASH_ATTN_SKIP_MESSAGE);
       expect(JSON.stringify(readiness).toLowerCase()).not.toContain('hunyuan');
       expect(readSetupSummary(checkout)).not.toContain('filePath');
       expect(readSetupSummary(checkout)).not.toContain('params.coarse_mesh');
-      expect(readSetupSummary(checkout)).not.toContain('fallback');
+      expect(readSetupSummary(checkout)).toContain(FLASH_ATTN_SKIP_MESSAGE);
       expect(readSetupSummary(checkout).toLowerCase()).not.toContain('hunyuan');
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
