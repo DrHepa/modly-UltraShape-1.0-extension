@@ -219,4 +219,54 @@ describe('install simulation', () => {
       rmSync(sandbox, { recursive: true, force: true });
     }
   });
+
+  it('rejects invalid image bytes from copied checkout installs instead of reporting impossible runtime success', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-install-invalid-image-'));
+    const checkout = path.join(sandbox, 'repo');
+    const stubRoot = path.join(sandbox, 'stubs');
+    const weightSourceRoot = path.join(sandbox, 'weight-source');
+    copyInstallSurface(checkout);
+    writeRuntimeStubModules(stubRoot);
+    const weightSourcePath = stageCheckpoint(weightSourceRoot);
+    const inputs = createRuntimeInputs(sandbox);
+
+    try {
+      const setup = runSetup(checkout, checkout, {
+        PYTHONPATH: stubRoot,
+        ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+        ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+        ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+        ULTRASHAPE_WEIGHT_SOURCE_PATH: weightSourcePath,
+      });
+      expect(setup.status).toBe(0);
+
+      const result = runGeneratorProbe(
+        checkout,
+        [
+          {
+            method: 'generate',
+            imageBase64: Buffer.from('not-a-png', 'utf8').toString('base64'),
+            params: { mesh_path: inputs.coarseMesh },
+          },
+        ],
+        { PYTHONPATH: stubRoot },
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual([
+        {
+          method: 'generate',
+          ok: false,
+          error: {
+            type: 'PublicRuntimeError',
+            code: 'INVALID_INPUT',
+            message: expect.stringContaining('reference_image'),
+          },
+          loaded: true,
+        },
+      ]);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
 });

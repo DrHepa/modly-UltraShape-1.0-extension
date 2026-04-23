@@ -52,7 +52,6 @@ export function writeRuntimeStubModules(root: string) {
     'numpy.py',
     'cv2.py',
     'yaml.py',
-    'omegaconf.py',
     'einops.py',
     'transformers.py',
     'huggingface_hub.py',
@@ -80,6 +79,27 @@ export function writeRuntimeStubModules(root: string) {
   for (const modulePath of modules) {
     writeFileSync(path.join(root, modulePath), '\n', 'utf8');
   }
+
+  writeFileSync(
+    path.join(root, 'omegaconf.py'),
+    [
+      'import json',
+      'from pathlib import Path',
+      '',
+      'class OmegaConf:',
+      '    @staticmethod',
+      '    def load(path):',
+      '        candidate = Path(path)',
+      '        return {"loaded_from": str(candidate), "loader": "OmegaConf.load"}',
+      '',
+      '    @staticmethod',
+      '    def to_container(value, resolve=False):',
+      '        del resolve',
+      '        return json.loads(json.dumps(value))',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
 
   writeFileSync(path.join(root, 'rembg.py'), 'def remove(payload):\n    return payload\n', 'utf8');
 

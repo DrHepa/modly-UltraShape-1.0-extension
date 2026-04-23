@@ -14,6 +14,22 @@ from . import clamp_unit, stable_signature
 
 REQUIRED_SUBTREES = ('vae', 'dit', 'conditioner')
 MAX_TENSOR_SAMPLES = 8
+MODULE_FAMILY_SPECS = {
+    'conditioner': {
+        'module_family': 'SingleImageEncoder',
+        'required_roots': ('main_image_encoder',),
+    },
+    'dit': {
+        'module_family': 'RefineDiT',
+        'required_roots': ('x_embedder', 't_embedder', 'final_layer'),
+    },
+    'vae': {
+        'module_family': 'ShapeVAE',
+        'required_roots': ('post_kl', 'transformer', 'geo_decoder'),
+    },
+}
+MODULE_STATE_DICT_REPRESENTATION = 'module-state-dict-v2'
+LEGACY_SUBTREE_REPRESENTATION = 'checkpoint-subtree-v1'
 
 
 class CheckpointResolutionError(Exception):
@@ -76,9 +92,23 @@ def load_checkpoint_subtrees(
         if not isinstance(subtree, Mapping):
             raise CheckpointResolutionError(f'Checkpoint subtree {name} must be an object.')
 
-        tensors = _normalize_checkpoint_subtree(subtree)
+        state_dict_source = subtree.get('state_dict') if isinstance(subtree.get('state_dict'), Mapping) else None
+        state_dict = _collect_state_dict_entries(state_dict_source if isinstance(state_dict_source, Mapping) else subtree)
+        tensors = {tensor_name: _coerce_tensor_values(tensor_value) for tensor_name, tensor_value in state_dict.items()}
+        tensors = {tensor_name: tensor_summary for tensor_name, tensor_summary in tensors.items() if tensor_summary}
         if not tensors:
             raise CheckpointResolutionError(f'Checkpoint subtree {name} must include non-empty tensor data.')
+
+        family_spec = MODULE_FAMILY_SPECS.get(name, {})
+        module_family = str(family_spec.get('module_family', name))
+        module_roots = _module_roots(state_dict)
+        required_roots = tuple(root for root in family_spec.get('required_roots', ()) if isinstance(root, str) and root)
+        if state_dict_source is not None:
+            missing_roots = [root for root in required_roots if root not in module_roots]
+            if missing_roots:
+                raise CheckpointResolutionError(
+                    f'Checkpoint subtree {name} must include module-family roots: {", ".join(missing_roots)}.'
+                )
 
         subtree_tokens: list[float] = []
         subtree_value_count = 0
@@ -99,17 +129,25 @@ def load_checkpoint_subtrees(
         compact_tokens = subtree_tokens[:MAX_TENSOR_SAMPLES]
         summary_tokens.extend(compact_tokens)
         value_count += subtree_value_count
+        parameter_names = sorted(state_dict.keys())
         state_dict_metadata = {
             'tensor_count': len(tensors),
             'value_count': subtree_value_count,
             'tensor_names': sorted(tensors.keys()),
+            'parameter_count': len(parameter_names),
+            'parameter_names': parameter_names,
+            'module_roots': module_roots,
+            'module_family': module_family,
+            'required_roots': list(required_roots),
+            'representation': MODULE_STATE_DICT_REPRESENTATION if state_dict_source is not None else LEGACY_SUBTREE_REPRESENTATION,
         }
         bundle[name] = {
-            'state_dict': dict(subtree),
+            'state_dict': state_dict,
             'state_dict_metadata': state_dict_metadata,
             'tensors': tensors,
-            'representation': 'checkpoint-subtree-v1',
+            'representation': state_dict_metadata['representation'],
             'tensor_count': len(tensors),
+            'parameter_count': len(parameter_names),
             'value_count': subtree_value_count,
             'signature': stable_signature(compact_tokens),
             'evidence': {
@@ -124,10 +162,19 @@ def load_checkpoint_subtrees(
         'bundle': bundle,
         'summary': {
             'format': 'pytorch-binary-checkpoint',
-            'representation': 'tensor-summary-v1',
+            'representation': MODULE_STATE_DICT_REPRESENTATION if all(
+                isinstance(bundle.get(name), Mapping)
+                and bundle[name].get('representation') == MODULE_STATE_DICT_REPRESENTATION
+                for name in expected
+            ) else 'tensor-summary-v1',
             'tensor_count': tensor_count,
             'value_count': value_count,
             'signature': stable_signature(summary_tokens),
+            'subtree_representations': {
+                subtree_name: bundle[subtree_name].get('representation')
+                for subtree_name in expected
+                if isinstance(bundle.get(subtree_name), Mapping)
+            },
         },
     }
 
@@ -135,6 +182,20 @@ def load_checkpoint_subtrees(
 def checkpoint_tokens(checkpoint_state: object, *, limit: int = MAX_TENSOR_SAMPLES) -> list[float]:
     if not isinstance(checkpoint_state, Mapping):
         return []
+
+    state_dict = checkpoint_parameter_map(checkpoint_state)
+    if state_dict:
+        tokens: list[float] = []
+        for parameter_name in sorted(state_dict.keys()):
+            tensor_summary = _coerce_tensor_values(state_dict[parameter_name])
+            if not tensor_summary:
+                continue
+            sample = tensor_summary.get('sample')
+            if isinstance(sample, list):
+                tokens.extend(clamp_unit(float(value)) for value in sample if isinstance(value, (int, float)))
+            if len(tokens) >= limit:
+                return tokens[:limit]
+        return tokens[:limit]
 
     direct_tokens = checkpoint_state.get('tokens')
     if isinstance(direct_tokens, list):
@@ -168,6 +229,11 @@ def checkpoint_signature(checkpoint_state: object) -> int:
 
 
 def checkpoint_tensor_count(checkpoint_state: object) -> int:
+    if isinstance(checkpoint_state, Mapping) and isinstance(checkpoint_state.get('parameter_count'), int):
+        return int(checkpoint_state['parameter_count'])
+    metadata = checkpoint_state.get('state_dict_metadata') if isinstance(checkpoint_state, Mapping) and isinstance(checkpoint_state.get('state_dict_metadata'), Mapping) else {}
+    if isinstance(metadata.get('parameter_count'), int):
+        return int(metadata['parameter_count'])
     if isinstance(checkpoint_state, Mapping) and isinstance(checkpoint_state.get('tensor_count'), int):
         return int(checkpoint_state['tensor_count'])
 
@@ -178,6 +244,18 @@ def checkpoint_tensor_count(checkpoint_state: object) -> int:
 def checkpoint_value_count(checkpoint_state: object) -> int:
     if isinstance(checkpoint_state, Mapping) and isinstance(checkpoint_state.get('value_count'), int):
         return int(checkpoint_state['value_count'])
+    metadata = checkpoint_state.get('state_dict_metadata') if isinstance(checkpoint_state, Mapping) and isinstance(checkpoint_state.get('state_dict_metadata'), Mapping) else {}
+    if isinstance(metadata.get('value_count'), int):
+        return int(metadata['value_count'])
+
+    state_dict = checkpoint_parameter_map(checkpoint_state)
+    if state_dict:
+        total = 0
+        for parameter_value in state_dict.values():
+            tensor_summary = _coerce_tensor_values(parameter_value)
+            if isinstance(tensor_summary, Mapping) and isinstance(tensor_summary.get('value_count'), int):
+                total += int(tensor_summary['value_count'])
+        return total
 
     tensors = checkpoint_state.get('tensors') if isinstance(checkpoint_state, Mapping) else None
     if not isinstance(tensors, Mapping):
@@ -204,14 +282,28 @@ def apply_checkpoint_state(module: object, checkpoint_state: object, *, strict: 
     if not isinstance(state_dict, Mapping):
         raise CheckpointResolutionError('Checkpoint hydration requires a state_dict mapping.')
 
-    loader(dict(state_dict), strict=strict)
+    loader_result = loader(dict(state_dict), strict=strict)
+    incompatible = _normalize_loader_result(loader_result)
+    if strict and (incompatible['missing_keys'] or incompatible['unexpected_keys']):
+        raise CheckpointResolutionError(
+            f'{module.__class__.__name__} strict hydration mismatch: '
+            f'missing={incompatible["missing_keys"]}, unexpected={incompatible["unexpected_keys"]}.'
+        )
+
+    metadata = checkpoint_state.get('state_dict_metadata') if isinstance(checkpoint_state.get('state_dict_metadata'), Mapping) else {}
     return {
         'module': module.__class__.__name__,
+        'module_family': metadata.get('module_family', module.__class__.__name__),
         'load_style': 'load_state_dict',
         'strict': strict,
+        'representation': checkpoint_state.get('representation', metadata.get('representation', LEGACY_SUBTREE_REPRESENTATION)),
+        'parameter_count': metadata.get('parameter_count', checkpoint_tensor_count(checkpoint_state)),
+        'module_roots': metadata.get('module_roots', []),
         'signature': checkpoint_signature(checkpoint_state),
         'tensor_count': checkpoint_tensor_count(checkpoint_state),
         'value_count': checkpoint_value_count(checkpoint_state),
+        'missing_keys': incompatible['missing_keys'],
+        'unexpected_keys': incompatible['unexpected_keys'],
     }
 
 
@@ -219,6 +311,58 @@ def _normalize_checkpoint_subtree(subtree: Mapping[str, object]) -> dict[str, di
     tensor_source = subtree.get('tensors') if isinstance(subtree.get('tensors'), Mapping) else subtree
     normalized_tensors = _collect_tensor_values(tensor_source)
     return {name: values for name, values in normalized_tensors.items() if values.get('sample')}
+
+
+def checkpoint_parameter_map(checkpoint_state: object) -> dict[str, object]:
+    if not isinstance(checkpoint_state, Mapping):
+        return {}
+    state_dict = checkpoint_state.get('state_dict')
+    if not isinstance(state_dict, Mapping):
+        return {}
+    return {str(name): value for name, value in state_dict.items() if isinstance(name, str) and name.strip()}
+
+
+def _collect_state_dict_entries(node: object, prefix: str = '') -> dict[str, object]:
+    if not isinstance(node, Mapping):
+        return {prefix: node} if prefix else {}
+
+    tensors: dict[str, object] = {}
+    for key, value in node.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        tensor_name = key if not prefix else f'{prefix}.{key}'
+        tensor_values = _coerce_tensor_values(value)
+        if tensor_values:
+            tensors[tensor_name] = value
+            continue
+        tensors.update(_collect_state_dict_entries(value, tensor_name))
+    return tensors
+
+
+def _module_roots(state_dict: Mapping[str, object]) -> list[str]:
+    roots = {name.split('.', 1)[0] for name in state_dict if isinstance(name, str) and name.strip()}
+    return sorted(root for root in roots if root)
+
+
+def _normalize_loader_result(result: object) -> dict[str, list[str]]:
+    missing_keys: list[str] = []
+    unexpected_keys: list[str] = []
+    if isinstance(result, Mapping):
+        raw_missing = result.get('missing_keys')
+        raw_unexpected = result.get('unexpected_keys')
+        if isinstance(raw_missing, list):
+            missing_keys = [str(value) for value in raw_missing]
+        if isinstance(raw_unexpected, list):
+            unexpected_keys = [str(value) for value in raw_unexpected]
+        return {'missing_keys': missing_keys, 'unexpected_keys': unexpected_keys}
+
+    raw_missing = getattr(result, 'missing_keys', None)
+    raw_unexpected = getattr(result, 'unexpected_keys', None)
+    if isinstance(raw_missing, list):
+        missing_keys = [str(value) for value in raw_missing]
+    if isinstance(raw_unexpected, list):
+        unexpected_keys = [str(value) for value in raw_unexpected]
+    return {'missing_keys': missing_keys, 'unexpected_keys': unexpected_keys}
 
 
 def _collect_tensor_values(node: object, prefix: str = '') -> dict[str, dict[str, object]]:

@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - expected on degraded installs
     torch = None
 
 from ...utils import clamp_unit, stable_signature
+from .volume_decoders import get_sparse_valid_voxels
 
 
 class MeshExportError(Exception):
@@ -575,7 +576,14 @@ def _cubvh_input_diagnostics(
     )
 
 
-class MCSurfaceExtractor:
+class SurfaceExtractor:
+    extractor = 'cubvh.sparse_marching_cubes'
+
+    def __call__(self, **kwargs):
+        return self.extract(**kwargs)
+
+
+class MCSurfaceExtractor(SurfaceExtractor):
     extractor = 'cubvh.sparse_marching_cubes'
 
     def extract(
@@ -594,12 +602,16 @@ class MCSurfaceExtractor:
             raise SurfaceExtractionError('coarse_surface.mesh must be a structured binary-safe mesh payload.')
 
         coords = decoded_volume.get('coords') if isinstance(decoded_volume.get('coords'), list) else []
-        if not coords:
-            raise SurfaceExtractionError('decoded_volume.coords must contain marching-cubes cube coordinates.')
-
         corners = decoded_volume.get('corners') if isinstance(decoded_volume.get('corners'), list) else []
+        extraction_authority = 'decoded_field'
+        if not coords or not corners:
+            grid_logits = decoded_volume.get('grid_logits') if isinstance(decoded_volume.get('grid_logits'), list) else decoded_volume.get('field_grid')
+            coords, corners = get_sparse_valid_voxels(grid_logits)
+            extraction_authority = 'grid_logits'
+        if not coords:
+            raise SurfaceExtractionError('decoded_volume must contain sparse marching-cubes inputs or grid_logits.')
         if not corners:
-            raise SurfaceExtractionError('decoded_volume.corners must contain marching-cubes cube corner fields.')
+            raise SurfaceExtractionError('decoded_volume must contain sparse marching-cubes corner fields or grid_logits.')
         if len(coords) != len(corners):
             raise SurfaceExtractionError('decoded_volume.coords and decoded_volume.corners must have the same length.')
 
@@ -688,7 +700,7 @@ class MCSurfaceExtractor:
         return {
             'extractor': self.extractor,
             'marching_cubes': self.extractor,
-            'authority': 'decoded_field',
+            'authority': extraction_authority,
             'preserve_scale': preserve_scale,
             'payload': renderable_payload,
             'reference_bytes': reference_asset['byte_length'],
@@ -734,3 +746,13 @@ def extract_surface(
         decoded_volume=decoded_volume,
         preserve_scale=preserve_scale,
     )
+
+
+class DMCSurfaceExtractor(MCSurfaceExtractor):
+    extractor = 'cubvh.sparse_marching_cubes'
+
+
+SurfaceExtractors = {
+    'mc': MCSurfaceExtractor,
+    'dmc': DMCSurfaceExtractor,
+}

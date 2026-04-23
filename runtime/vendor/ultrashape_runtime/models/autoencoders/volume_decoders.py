@@ -1,4 +1,4 @@
-"""Volume decoder subset for the vendored runtime."""
+"""Portable upstream-shaped volume decoder subset for the vendored runtime."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ from ...utils import clamp_unit, stable_signature
 CORNER_DIRECTIONS = (
     (0, 0, 0),
     (1, 0, 0),
-    (0, 1, 0),
     (1, 1, 0),
+    (0, 1, 0),
     (0, 0, 1),
     (1, 0, 1),
-    (0, 1, 1),
     (1, 1, 1),
+    (0, 1, 1),
 )
 
 
@@ -22,92 +22,102 @@ def _numeric_values(candidate: object) -> list[float]:
     return [float(value) for value in candidate if isinstance(value, (int, float))]
 
 
-def _voxel_coords(candidate: object) -> list[tuple[int, int, int]]:
-    if not isinstance(candidate, list):
-        return []
-
-    coords: list[tuple[int, int, int]] = []
-    for item in candidate:
-        if not isinstance(item, (list, tuple)) or len(item) < 3:
-            continue
-        coords.append((int(item[0]), int(item[1]), int(item[2])))
-    return coords
-
-
 def _field_grid(decoded_latents: dict[str, object]) -> tuple[list[list[list[float]]], int]:
     raw_grid = decoded_latents.get('field_grid')
     if isinstance(raw_grid, list) and raw_grid and isinstance(raw_grid[0], list):
         resolution = len(raw_grid)
-        return raw_grid, resolution
+        normalized: list[list[list[float]]] = []
+        for plane in raw_grid:
+            plane_rows: list[list[float]] = []
+            if not isinstance(plane, list):
+                continue
+            for row in plane:
+                if not isinstance(row, list):
+                    continue
+                plane_rows.append([round(float(value), 6) for value in row if isinstance(value, (int, float))])
+            if plane_rows:
+                normalized.append(plane_rows)
+        if normalized:
+            return normalized, resolution
 
     values = _numeric_values(decoded_latents.get('field_logits')) or _numeric_values(decoded_latents.get('occupancy_field'))
     resolution = int(round(max(len(values), 1) ** (1 / 3)))
     resolution = max(resolution, 2)
     cursor = 0
     grid: list[list[list[float]]] = []
-    for z_axis in range(resolution):
+    for _z_axis in range(resolution):
         plane: list[list[float]] = []
-        for y_axis in range(resolution):
+        for _y_axis in range(resolution):
             row: list[float] = []
-            for x_axis in range(resolution):
-                if values:
-                    row.append(float(values[cursor % len(values)]))
-                else:
-                    row.append(0.0)
+            for _x_axis in range(resolution):
+                row.append(float(values[cursor % len(values)]) if values else 0.0)
                 cursor += 1
             plane.append(row)
         grid.append(plane)
     return grid, resolution
 
 
-def _candidate_cells(voxel_coords: list[tuple[int, int, int]], resolution: int) -> list[tuple[int, int, int]]:
-    max_index = max(resolution - 1, 1)
-    candidates: set[tuple[int, int, int]] = set()
-
-    for x_axis, y_axis, z_axis in voxel_coords:
-        for dx in (0, -1):
-            for dy in (0, -1):
-                for dz in (0, -1):
-                    candidate = (
-                        min(max(x_axis + dx, 0), max_index - 1),
-                        min(max(y_axis + dy, 0), max_index - 1),
-                        min(max(z_axis + dz, 0), max_index - 1),
-                    )
-                    candidates.add(candidate)
-
-    if candidates:
-        return sorted(candidates)
-
-    return [
-        (x_axis, y_axis, z_axis)
-        for z_axis in range(max_index)
-        for y_axis in range(max_index)
-        for x_axis in range(max_index)
-    ]
+def generate_dense_grid_points(*, bounds: float = 1.01, octree_resolution: int) -> tuple[list[list[list[tuple[float, float, float]]]], list[int], list[float]]:
+    if isinstance(bounds, (int, float)):
+        minimum = -float(bounds)
+        maximum = float(bounds)
+    else:
+        minimum = -1.01
+        maximum = 1.01
+    steps = max(int(octree_resolution), 1)
+    stride = (maximum - minimum) / steps
+    points: list[list[list[tuple[float, float, float]]]] = []
+    for z_axis in range(steps + 1):
+        plane: list[list[tuple[float, float, float]]] = []
+        for y_axis in range(steps + 1):
+            row: list[tuple[float, float, float]] = []
+            for x_axis in range(steps + 1):
+                row.append((minimum + (x_axis * stride), minimum + (y_axis * stride), minimum + (z_axis * stride)))
+            plane.append(row)
+        points.append(plane)
+    return points, [steps + 1, steps + 1, steps + 1], [maximum - minimum] * 3
 
 
-def _corner_values(field_grid: list[list[list[float]]], coord: tuple[int, int, int]) -> tuple[float, float, float, float, float, float, float, float]:
-    x_axis, y_axis, z_axis = coord
-    values: list[float] = []
-    for dx, dy, dz in CORNER_DIRECTIONS:
-        values.append(round(float(field_grid[z_axis + dz][y_axis + dy][x_axis + dx]), 6))
-    return tuple(values[:8])
+def get_sparse_valid_voxels(grid_logits: object) -> tuple[list[tuple[int, int, int]], list[tuple[float, float, float, float, float, float, float, float]]]:
+    if not isinstance(grid_logits, list) or not grid_logits or not isinstance(grid_logits[0], list):
+        return [], []
+
+    coords: list[tuple[int, int, int]] = []
+    corners: list[tuple[float, float, float, float, float, float, float, float]] = []
+    depth = len(grid_logits)
+    height = len(grid_logits[0]) if depth else 0
+    width = len(grid_logits[0][0]) if height and isinstance(grid_logits[0][0], list) else 0
+    for z_axis in range(max(depth - 1, 0)):
+        for y_axis in range(max(height - 1, 0)):
+            for x_axis in range(max(width - 1, 0)):
+                cube = []
+                for dx, dy, dz in CORNER_DIRECTIONS:
+                    cube.append(round(float(grid_logits[z_axis + dz][y_axis + dy][x_axis + dx]), 6))
+                if min(cube) <= 0.0 <= max(cube):
+                    coords.append((x_axis, y_axis, z_axis))
+                    corners.append(tuple(cube[:8]))
+    return coords, corners
 
 
-class VanillaVDMVolumeDecoding:
+def _occupancy_field(field_values: list[float]) -> list[float]:
+    return [clamp_unit((value + 1.0) / 2.0) for value in field_values]
+
+
+class VanillaVolumeDecoder:
+    hierarchy = 'dense-grid'
+
     def decode(self, decoded_latents: dict[str, object]) -> dict[str, object]:
         field_grid, resolution = _field_grid(decoded_latents)
-        spatial_context = decoded_latents.get('spatial_context') if isinstance(decoded_latents.get('spatial_context'), dict) else {}
-        voxel_coords = _voxel_coords(spatial_context.get('voxel_coords'))
-        coords = _candidate_cells(voxel_coords, resolution)
-        corners = [_corner_values(field_grid, coord) for coord in coords]
-        field_values = [value for plane in field_grid for row in plane for value in row]
-        occupancy_field = [clamp_unit((value + 1.0) / 2.0) for value in field_values]
-        flattened_coords = [float(axis) / max(resolution - 1, 1) for point in coords for axis in point]
-
+        field_values = [float(value) for plane in field_grid for row in plane for value in row]
+        coords, corners = get_sparse_valid_voxels(field_grid)
+        occupancy_field = _occupancy_field(field_values)
+        mesh_signature = stable_signature([float(axis) / max(resolution - 1, 1) for point in coords for axis in point])
         return {
             'decoder': self.__class__.__name__,
-            'authority': 'occupancy_field_grid',
+            'authority': 'geo_decoder(query_grid)',
+            'hierarchy': self.hierarchy,
+            'grid_logits': field_grid,
+            'field_grid': field_grid,
             'coords': coords,
             'corners': corners,
             'iso': 0.0,
@@ -117,18 +127,26 @@ class VanillaVDMVolumeDecoding:
             'field_grid_shape': [resolution, resolution, resolution],
             'field_value_count': len(field_values),
             'corner_signature': stable_signature([value for corner in corners for value in corner]),
-            'mesh_signature': stable_signature(flattened_coords[:128]),
+            'mesh_signature': mesh_signature,
             'cell_count': len(coords),
             'corner_count': len(corners),
-            'occupied_cell_count': len(voxel_coords),
+            'occupied_cell_count': len(coords),
             'occupied_grid_cells': sum(1 for value in occupancy_field if value >= 0.5),
             'grid_resolution': resolution,
         }
 
 
-class FlashVDMVolumeDecoding(VanillaVDMVolumeDecoding):
+class HierarchicalVolumeDecoding(VanillaVolumeDecoder):
+    hierarchy = 'octree-near-surface'
+
+
+class VanillaVDMVolumeDecoding(VanillaVolumeDecoder):
+    pass
+
+
+class FlashVDMVolumeDecoding(HierarchicalVolumeDecoding):
     pass
 
 
 def decode_volume(decoded_latents: dict[str, object]) -> dict[str, object]:
-    return VanillaVDMVolumeDecoding().decode(decoded_latents)
+    return VanillaVolumeDecoder().decode(decoded_latents)

@@ -43,6 +43,7 @@ def clamp_unit(value: float) -> float:
 
 
 from .checkpoint import expected_checkpoint_name, expected_checkpoint_subtrees
+from .misc import get_obj_from_str, instantiate_from_config, load_omega_config
 
 
 __all__ = [
@@ -51,5 +52,8 @@ __all__ = [
     'clamp_unit',
     'expected_checkpoint_name',
     'expected_checkpoint_subtrees',
+    'get_obj_from_str',
+    'instantiate_from_config',
+    'load_omega_config',
     'stable_signature',
 ]

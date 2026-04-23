@@ -22,6 +22,9 @@ function runSetup(cwd: string, extDir: string, env: NodeJS.ProcessEnv = {}) {
     encoding: 'utf8',
     env: {
       ...process.env,
+      ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+      ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+      ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
       ...env,
     },
   });
@@ -257,7 +260,7 @@ describe('generator lifecycle shell', () => {
     }
   });
 
-  it('passes raw image_bytes through to the vendored runtime instead of ignoring them', () => {
+  it('fails with INVALID_INPUT when image_bytes are not a decodable runtime image payload', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-bad-image-'));
     const checkout = path.join(sandbox, 'repo');
     const stubRoot = path.join(sandbox, 'stubs');
@@ -281,27 +284,18 @@ describe('generator lifecycle shell', () => {
       );
 
       expect(result.status).toBe(0);
-      const payload = JSON.parse(result.stdout);
-      expect(payload[0]).toMatchObject({
-        method: 'generate',
-        ok: true,
-        loaded: true,
-        debug: {
-          last_result: {
-            metrics: {
-              preprocess: {
-                byte_length: 'not-a-png'.length,
-                source_format: 'raw-bytes',
-              },
-              stage_evidence: {
-                preprocess: {
-                  source: 'reference_image',
-                },
-              },
-            },
+      expect(JSON.parse(result.stdout)).toEqual([
+        {
+          method: 'generate',
+          ok: false,
+          error: {
+            type: 'PublicRuntimeError',
+            code: 'INVALID_INPUT',
+            message: expect.stringContaining('reference_image'),
           },
+          loaded: true,
         },
-      });
+      ]);
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }
@@ -338,7 +332,7 @@ describe('generator lifecycle shell', () => {
           ok: false,
           error: {
             type: 'PublicRuntimeError',
-            code: 'LOCAL_RUNTIME_UNAVAILABLE',
+            code: 'INVALID_INPUT',
             message: expect.stringContaining('coarse_mesh'),
           },
           loaded: true,
@@ -478,7 +472,7 @@ describe('generator lifecycle shell', () => {
     }
   });
 
-  it('surfaces public dependency and weight failures without synthetic success', () => {
+  it('surfaces public dependency and weight failures without reporting impossible runtime success', () => {
     const dependencySandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-deps-'));
     const dependencyCheckout = path.join(dependencySandbox, 'repo');
     copyInstallSurface(dependencyCheckout);
@@ -490,7 +484,9 @@ describe('generator lifecycle shell', () => {
     writeRuntimeStubModules(stubRoot);
 
     try {
-      const dependencySetup = runSetup(dependencyCheckout, dependencyCheckout);
+      const dependencySetup = runSetup(dependencyCheckout, dependencyCheckout, {
+        ULTRASHAPE_SETUP_TEST_CUBVH_PREREQ_MISSING: 'compiler',
+      });
       expect(dependencySetup.status).toBe(1);
       const missingDependencies = runGeneratorProbe(dependencyCheckout, [{ method: 'load' }]);
       expect(missingDependencies.status).toBe(0);
@@ -507,7 +503,10 @@ describe('generator lifecycle shell', () => {
         },
       ]);
 
-      const setupResult = runSetup(weightsCheckout, weightsCheckout, { PYTHONPATH: stubRoot });
+      const setupResult = runSetup(weightsCheckout, weightsCheckout, {
+        PYTHONPATH: stubRoot,
+        ULTRASHAPE_SETUP_TEST_HF_SCENARIO: 'not-found',
+      });
       expect(setupResult.status).toBe(1);
       const missingWeights = runGeneratorProbe(weightsCheckout, [{ method: 'generate', imageBase64: PNG_1X1_BASE64, params: {} }], {
         PYTHONPATH: stubRoot,

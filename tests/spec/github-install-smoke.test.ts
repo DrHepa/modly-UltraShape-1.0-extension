@@ -15,10 +15,12 @@ type Summary = {
   host_facts?: Record<string, unknown>;
   install_ready: boolean;
   install_success: boolean;
+  missing_optional?: string[];
   missing_required: string[];
   native_install?: Record<string, unknown>;
   runtime_ready: boolean;
   runtime_closure_ready: boolean;
+  runtime_modes?: Record<string, unknown>;
   status: string;
   venv_dir?: string;
   vendor_path: string;
@@ -48,7 +50,7 @@ function runSetup(cwd: string, extDir: string, env: NodeJS.ProcessEnv = {}) {
 }
 
 describe('GitHub install smoke', () => {
-  it('creates a real install footprint from a copied clean-room checkout', () => {
+  it('creates a real install footprint from a copied repository checkout', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-github-install-'));
     const checkout = path.join(sandbox, 'modly-UltraShape-1.0-extension');
     copyInstallSurface(checkout);
@@ -82,11 +84,24 @@ describe('GitHub install smoke', () => {
         install_success: true,
         install_ready: true,
         runtime_closure_ready: true,
-        status: 'ready',
+        runtime_modes: {
+          selection: 'portable-only',
+          requested: 'auto',
+          active: 'portable',
+          real: {
+            available: false,
+            adapter: 'ultrashape_runtime.real_mode.run_real_refine_pipeline',
+          },
+          portable: {
+            available: true,
+          },
+        },
+        status: 'degraded',
         missing_required: [],
         venv_dir: path.join(checkout, 'venv'),
         vendor_path: path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime'),
       });
+      expect(summary.missing_optional).toEqual(['import:flash_attn']);
       expect(summary.host_facts).toMatchObject({ platform: 'linux', machine: 'aarch64' });
       expect(summary.dependency_install).toBeTruthy();
       expect(summary.native_install).toMatchObject({ cubvh: expect.objectContaining({ status: 'ready' }) });
@@ -120,6 +135,13 @@ describe('GitHub install smoke', () => {
         install_success: false,
         install_ready: false,
         runtime_closure_ready: true,
+        runtime_modes: {
+          selection: 'blocked',
+          active: null,
+          portable: {
+            available: false,
+          },
+        },
         status: 'blocked',
         venv_dir: path.join(checkout, 'venv'),
         vendor_path: path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime'),

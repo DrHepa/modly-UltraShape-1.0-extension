@@ -1,10 +1,24 @@
 model:
   name: ultrashape-refiner
   scope: mc-only
+  params:
+    vae_config:
+      target: ultrashape_runtime.models.autoencoders.model.ShapeVAE
+    dit_cfg:
+      target: ultrashape_runtime.models.denoisers.dit_mask.RefineDiT
+    conditioner_config:
+      target: ultrashape_runtime.models.conditioner_mask.SingleImageEncoder
+    scheduler_cfg:
+      target: diffusers.FlowMatchEulerDiscreteScheduler
+    image_processor_cfg:
+      target: ultrashape_runtime.preprocessors.ImageProcessorV2
+    surface_loader_cfg:
+      target: ultrashape_runtime.surface_loaders.SharpEdgeSurfaceLoader
 runtime:
   backend: local
   readiness_file: .runtime-readiness.json
   requires_exact_closure: true
+  config_loader: OmegaConf.load
 public_contract:
   backend_modes:
     - auto
@@ -13,6 +27,7 @@ public_contract:
     - glb
   public_error_codes:
     - DEPENDENCY_MISSING
+    - INVALID_INPUT
     - WEIGHTS_MISSING
     - LOCAL_RUNTIME_UNAVAILABLE
 dependencies:
@@ -78,6 +93,8 @@ preprocess:
     - cutout_applied
 image_processor_cfg:
   target: ultrashape_runtime.preprocessors.ImageProcessorV2
+surface_loader_cfg:
+  target: ultrashape_runtime.surface_loaders.SharpEdgeSurfaceLoader
 conditioning:
   coarse_mesh_encoder: SharpEdgeSurfaceLoader
   voxelizer: voxelize_from_point
@@ -123,6 +140,7 @@ decoder:
 surface:
   extraction: mc
   loader: SharpEdgeSurfaceLoader
+  target: ultrashape_runtime.surface_loaders.SharpEdgeSurfaceLoader
   surface_contract:
     sampled_surface_points: required
     mesh_state:
@@ -142,3 +160,5 @@ gate:
 export:
   format: glb
   filename: refined.glb
+preserve_scale:
+  restore: coarse-normalization-inverse

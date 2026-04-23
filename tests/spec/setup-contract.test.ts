@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -21,6 +21,7 @@ type Readiness = {
   native_install?: Record<string, unknown>;
   required_imports_ok: boolean;
   runtime_closure_ready: boolean;
+  runtime_modes?: Record<string, unknown>;
   status: string;
   venv_dir?: string;
   vendor_path: string;
@@ -105,10 +106,23 @@ describe('setup.py install truth', () => {
         install_ready: true,
         runtime_closure_ready: true,
         status: 'degraded',
+        runtime_modes: {
+          selection: 'portable-only',
+          requested: 'auto',
+          active: 'portable',
+          real: {
+            available: false,
+            adapter: 'ultrashape_runtime.real_mode.run_real_refine_pipeline',
+          },
+          portable: {
+            available: true,
+          },
+        },
         venv_dir: path.join(checkout, 'venv'),
       });
       expect(readiness.missing_required).toEqual([]);
       expect(readiness.missing_optional).toEqual(['import:flash_attn']);
+      expect(JSON.stringify(readiness.runtime_modes ?? {})).toContain('Portable fallback');
       expect(existsSync(path.join(checkout, 'venv', 'bin', 'python'))).toBe(true);
       expect(existsSync(path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'))).toBe(true);
       expect(readiness.native_install).toMatchObject({
@@ -193,6 +207,17 @@ describe('setup.py install truth', () => {
         install_ready: false,
         runtime_closure_ready: true,
         status: 'blocked',
+        runtime_modes: {
+          selection: 'blocked',
+          requested: 'auto',
+          active: null,
+          real: {
+            available: false,
+          },
+          portable: {
+            available: false,
+          },
+        },
         venv_dir: path.join(checkout, 'venv'),
       });
       expect(readiness.missing_required).toContain('native-stage:cubvh');
@@ -200,16 +225,166 @@ describe('setup.py install truth', () => {
       expect(existsSync(path.join(checkout, 'venv', 'bin', 'python'))).toBe(true);
       expect(result.stdout).not.toContain('filePath');
       expect(result.stdout).not.toContain('params.coarse_mesh');
-      expect(result.stdout).not.toContain('fallback');
+      expect(result.stdout).toContain('Portable fallback is blocked because required runtime prerequisites are missing.');
       expect(result.stdout.toLowerCase()).not.toContain('hunyuan');
       expect(JSON.stringify(readiness)).not.toContain('filePath');
       expect(JSON.stringify(readiness)).not.toContain('params.coarse_mesh');
-      expect(JSON.stringify(readiness)).not.toContain('fallback');
+      expect(JSON.stringify(readiness)).toContain('Portable fallback is blocked because required runtime prerequisites are missing.');
       expect(JSON.stringify(readiness).toLowerCase()).not.toContain('hunyuan');
       expect(readSetupSummary(checkout)).not.toContain('filePath');
       expect(readSetupSummary(checkout)).not.toContain('params.coarse_mesh');
-      expect(readSetupSummary(checkout)).not.toContain('fallback');
+      expect(readSetupSummary(checkout)).toContain('Portable fallback is blocked because required runtime prerequisites are missing.');
       expect(readSetupSummary(checkout).toLowerCase()).not.toContain('hunyuan');
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('short-circuits dependency bootstrap when cubvh prerequisites are already blocked', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-short-circuit-'));
+    const checkout = path.join(sandbox, 'repo');
+    copyInstallSurface(checkout);
+
+    try {
+      const result = spawnSync(
+        'python3',
+        [
+          '-S',
+          '-c',
+          [
+            'import setup',
+            '',
+            'def fail(name):',
+            '    def _raise(*args, **kwargs):',
+            '        del args, kwargs',
+            '        raise AssertionError(f"{name} should not run when cubvh prerequisites are already blocked")',
+            '    return _raise',
+            '',
+            'setup.bootstrap_packaging_tools = fail("bootstrap_packaging_tools")',
+            'setup.install_core_dependencies = fail("install_core_dependencies")',
+            'raise SystemExit(setup.main())',
+          ].join('\n'),
+          '--ext-dir',
+          checkout,
+          '--python-exe',
+          '/opt/modly/python/bin/python3',
+        ],
+        {
+          cwd: checkout,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+            ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+            ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+            ULTRASHAPE_SETUP_TEST_CUBVH_PREREQ_MISSING: 'compiler',
+          },
+        },
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).not.toContain('should not run when cubvh prerequisites are already blocked');
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks readiness when the staged vendored closure cannot import', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-runtime-import-'));
+    const checkout = path.join(sandbox, 'repo');
+    copyInstallSurface(checkout);
+
+    writeFileSync(
+      path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime', 'local_runner.py'),
+      'raise ModuleNotFoundError("broken vendored runtime closure")\n',
+      'utf8',
+    );
+
+    try {
+      const result = runSetup(checkout, {
+        extDir: checkout,
+        pythonExe: '/opt/modly/python/bin/python3',
+        payload: {},
+        env: {
+          ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+          ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+          ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'stub-weight',
+        },
+      });
+
+      expect(result.status).toBe(1);
+
+      const readiness = readReadiness(checkout);
+      expect(readiness).toMatchObject({
+        required_imports_ok: false,
+        weights_ready: true,
+        install_success: false,
+        install_ready: false,
+        runtime_closure_ready: false,
+        status: 'blocked',
+        runtime_modes: {
+          selection: 'blocked',
+          active: null,
+          portable: {
+            available: false,
+          },
+        },
+      });
+      expect(readiness.missing_required).toContain('runtime-import:ultrashape_runtime.local_runner');
+      expect(JSON.stringify(readiness)).toContain('broken vendored runtime closure');
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks readiness when the staged checkpoint is missing required subtrees', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-checkpoint-smoke-'));
+    const checkout = path.join(sandbox, 'repo');
+    const weightSourceRoot = path.join(sandbox, 'weight-source');
+    copyInstallSurface(checkout);
+
+    const checkpointPath = path.join(weightSourceRoot, 'broken-ultrashape.pt');
+    mkdirSync(weightSourceRoot, { recursive: true });
+    writeFileSync(
+      checkpointPath,
+      JSON.stringify({
+        vae: { tensors: { weights: [0.1, 0.2, 0.3, 0.4] } },
+        dit: { tensors: { weights: [0.5, 0.6, 0.7, 0.8] } },
+      }),
+      'utf8',
+    );
+
+    try {
+      const result = runSetup(checkout, {
+        extDir: checkout,
+        pythonExe: '/opt/modly/python/bin/python3',
+        payload: {},
+        env: {
+          ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+          ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+          ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+          ULTRASHAPE_WEIGHT_SOURCE_PATH: checkpointPath,
+        },
+      });
+
+      expect(result.status).toBe(1);
+
+      const readiness = readReadiness(checkout);
+      expect(readiness).toMatchObject({
+        required_imports_ok: true,
+        weights_ready: false,
+        install_success: false,
+        install_ready: false,
+        runtime_closure_ready: true,
+        status: 'blocked',
+        runtime_modes: {
+          selection: 'portable-only',
+          active: 'portable',
+        },
+      });
+      expect(readiness.missing_required).toContain('checkpoint-subtree:conditioner');
+      expect(JSON.stringify(readiness)).toContain('Required checkpoint subtrees are missing: conditioner.');
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }

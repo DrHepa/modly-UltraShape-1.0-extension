@@ -12,7 +12,14 @@ import subprocess
 import sys
 from typing import Any
 
-from services.generators.base import BaseGenerator
+try:
+    from services.generators.base import BaseGenerator
+except ModuleNotFoundError:
+    class BaseGenerator:  # type: ignore[override]
+        def __init__(self, model_dir: Path, outputs_dir: Path) -> None:
+            self.model_dir = model_dir
+            self.outputs_dir = outputs_dir
+            self._loaded = False
 
 PUBLIC_RUNTIME_ERROR_CODES = {
     "DEPENDENCY_MISSING",
@@ -31,6 +38,12 @@ PUBLIC_GENERATE_PARAM_DEFAULTS: dict[str, Any] = {
 NON_OPERATIVE_MODLY_GENERATE_PARAM_KEYS = {"remesh", "enable_texture", "texture_resolution"}
 PUBLIC_GENERATE_ALLOWED_PARAM_KEYS = {"mesh_path", *PUBLIC_GENERATE_PARAM_DEFAULTS.keys()}
 LEGACY_GENERATE_ALIAS_KEYS = {"reference_image", "coarse_mesh", "input", "input.filePath"}
+
+
+def _runtime_string_path(value: Any, default: Path) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return str(default)
 
 
 class PublicRuntimeError(RuntimeError):
@@ -291,9 +304,9 @@ class UltraShapeGenerator(BaseGenerator):
             "coarse_mesh": str(coarse_mesh),
             "output_dir": str(output_dir),
             "output_format": "glb",
-            "checkpoint": checkpoint if isinstance(checkpoint, str) else None,
-            "config_path": str(config_path) if isinstance(config_path, str) and config_path.strip() else str(self._config_path()),
-            "ext_dir": str(ext_dir) if isinstance(ext_dir, str) and ext_dir.strip() else str(self._repo_root()),
+            "checkpoint": _runtime_string_path(checkpoint, self._checkpoint_path()),
+            "config_path": _runtime_string_path(config_path, self._config_path()),
+            "ext_dir": _runtime_string_path(ext_dir, self._repo_root()),
             "backend": "local",
             "steps": params["steps"],
             "guidance_scale": params["guidance_scale"],

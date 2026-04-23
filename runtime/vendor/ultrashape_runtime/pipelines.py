@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from .models.autoencoders.model import ShapeVAE
@@ -12,10 +13,12 @@ from .models.autoencoders.volume_decoders import decode_volume
 from .models.conditioner_mask import SingleImageEncoder
 from .models.denoisers.dit_mask import RefineDiT
 from .preprocessors import ImageProcessorV2
+from .real_mode import REAL_MODE_ADAPTER, describe_real_mode, run_real_refine_pipeline
 from .schedulers import build_flow_matching_schedule
 from .surface_loaders import SharpEdgeSurfaceLoader
 from .utils.checkpoint import apply_checkpoint_state, load_checkpoint_subtrees
 from .utils import blend_sequences, clamp_unit, stable_signature
+from .utils.misc import instantiate_from_config, load_omega_config
 
 
 class PipelineDependencyError(Exception):
@@ -27,7 +30,51 @@ class PipelineUnavailableError(Exception):
 
 
 def build_refine_pipeline() -> dict[str, str]:
-    return {'name': 'ultrashape-refine', 'scope': 'mc-only'}
+    return {
+        'name': 'ultrashape-refine',
+        'scope': 'mc-only',
+        'entrypoint': 'scripts.infer_dit_refine.run_inference',
+        'loader': 'load_models',
+        'class': 'UltraShapePipeline',
+    }
+
+
+def _requested_runtime_mode() -> str:
+    candidate = os.environ.get('ULTRASHAPE_RUNTIME_MODE', 'auto').strip().lower()
+    return candidate if candidate in {'auto', 'real', 'portable'} else 'auto'
+
+
+def resolve_runtime_mode() -> dict[str, object]:
+    requested = _requested_runtime_mode()
+    real = describe_real_mode()
+    portable = {
+        'available': True,
+        'authoritative': False,
+        'reason': 'Portable fallback is active for reduced environments; it is not the authoritative upstream closure.',
+    }
+
+    if requested == 'real':
+        active = 'real' if bool(real.get('available')) else None
+    elif requested == 'portable':
+        active = 'portable'
+    else:
+        active = 'real' if bool(real.get('available')) else 'portable'
+
+    selection = 'real-available' if active == 'real' else 'portable-only'
+    return {
+        'selection': selection,
+        'requested': requested,
+        'active': active,
+        'real': real,
+        'portable': portable,
+    }
+
+
+def retrieve_timesteps(schedule: dict[str, object]) -> tuple[list[float], int]:
+    timesteps = _numeric_list(schedule.get('consumed_timesteps'))
+    if not timesteps:
+        timesteps = _numeric_list(schedule.get('timesteps'))
+    return timesteps, len(timesteps)
 
 
 def _parse_scalar(value: str):
@@ -106,11 +153,105 @@ def load_runtime_config(config_path: str) -> dict[str, object]:
     if not path.is_file():
         raise PipelineUnavailableError(f'config_path is not readable: {config_path}.')
 
-    config, _ = _parse_block(path.read_text(encoding='utf8').splitlines(), 0, 0)
+    try:
+        config = _normalize_runtime_config(load_omega_config(str(path)))
+        _validate_exact_closure_config(config)
+        return config
+    except Exception:
+        config, _ = _parse_block(path.read_text(encoding='utf8').splitlines(), 0, 0)
     if not isinstance(config, dict):
         raise PipelineUnavailableError('Runtime config root must be a mapping.')
+    config = _normalize_runtime_config(config)
     _validate_exact_closure_config(config)
     return config
+
+
+def describe_upstream_closure_markers(config_path: str) -> dict[str, object]:
+    config = load_runtime_config(config_path)
+    checkpoint = config.get('checkpoint') if isinstance(config.get('checkpoint'), dict) else {}
+    return {
+        'config_loader': 'OmegaConf.load',
+        'checkpoint_hydration': 'strict',
+        'preserve_scale_restore': 'coarse-normalization-inverse',
+        'required_subtrees': list(checkpoint.get('required_subtrees', ['vae', 'dit', 'conditioner'])),
+    }
+
+
+def _mapping(candidate: object) -> dict[str, object]:
+    return dict(candidate) if isinstance(candidate, Mapping) else {}
+
+
+def _numeric_triplet(candidate: object) -> tuple[float, float, float] | None:
+    if not isinstance(candidate, list) or len(candidate) != 3:
+        return None
+    values: list[float] = []
+    for axis in candidate:
+        if not isinstance(axis, (int, float)):
+            return None
+        values.append(float(axis))
+    return (values[0], values[1], values[2])
+
+
+def _restore_original_scale(mesh_payload: dict[str, object], normalization_transform: dict[str, object]) -> dict[str, object]:
+    vertices = mesh_payload.get('vertices') if isinstance(mesh_payload.get('vertices'), list) else []
+    center = _numeric_triplet(normalization_transform.get('center'))
+    scale_factor = normalization_transform.get('scale_factor')
+    if center is None or not isinstance(scale_factor, (int, float)) or float(scale_factor) == 0.0:
+        return dict(mesh_payload)
+
+    restored_vertices = []
+    for vertex in vertices:
+        if not isinstance(vertex, (list, tuple)) or len(vertex) < 3:
+            continue
+        restored_vertices.append(
+            (
+                round((float(vertex[0]) / float(scale_factor)) + center[0], 6),
+                round((float(vertex[1]) / float(scale_factor)) + center[1], 6),
+                round((float(vertex[2]) / float(scale_factor)) + center[2], 6),
+            )
+        )
+
+    return {
+        **mesh_payload,
+        'vertices': restored_vertices,
+        'bytes': None,
+        'is_binary_glb': False,
+        'restored_from_normalized': True,
+    }
+
+
+def _normalize_runtime_config(config: dict[str, object]) -> dict[str, object]:
+    normalized = dict(config)
+    model = _mapping(normalized.get('model'))
+    params = _mapping(model.get('params'))
+
+    if params:
+        for source_key, target_key in {
+            'vae_config': 'vae_config',
+            'dit_cfg': 'dit_cfg',
+            'conditioner_config': 'conditioner_config',
+            'scheduler_cfg': 'scheduler_cfg',
+            'image_processor_cfg': 'image_processor_cfg',
+            'surface_loader_cfg': 'surface_loader_cfg',
+        }.items():
+            if source_key in params and target_key not in normalized:
+                normalized[target_key] = params[source_key]
+
+    scheduler = _mapping(normalized.get('scheduler'))
+    scheduler_cfg = _mapping(normalized.get('scheduler_cfg'))
+    if 'target' not in scheduler and isinstance(scheduler_cfg.get('target'), str):
+        scheduler['target'] = scheduler_cfg['target']
+    if scheduler:
+        normalized['scheduler'] = scheduler
+
+    surface = _mapping(normalized.get('surface'))
+    surface_loader_cfg = _mapping(normalized.get('surface_loader_cfg'))
+    if 'target' not in surface and isinstance(surface_loader_cfg.get('target'), str):
+        surface['target'] = surface_loader_cfg['target']
+    if surface:
+        normalized['surface'] = surface
+
+    return normalized
 
 
 def _validate_exact_closure_config(config: dict[str, object]) -> None:
@@ -179,10 +320,181 @@ def validate_mvp_scope(config: dict[str, object], backend: str, output_format: s
     return 'mc', str(extraction or 'mc')
 
 
+def _instantiate_runtime_component(config: dict[str, object], key: str, fallback_cls, /, **kwargs):
+    component_config = config.get(key)
+    if isinstance(component_config, Mapping) and isinstance(component_config.get('target'), str):
+        return instantiate_from_config(component_config, **kwargs)
+    return fallback_cls(**kwargs)
+
+
 def _numeric_list(candidate: object) -> list[float]:
     if not isinstance(candidate, list):
         return []
     return [float(value) for value in candidate if isinstance(value, (int, float))]
+
+
+def _reference_asset_from_cond_inputs(cond_inputs: dict[str, object]) -> dict[str, object]:
+    image_tensor = cond_inputs.get('image')
+    mask_tensor = cond_inputs.get('mask')
+    image_values = _flatten_numeric(image_tensor)
+    mask_values = _flatten_numeric(mask_tensor)
+    return {
+        'processor': 'ImageProcessorV2',
+        'image_tensor': image_tensor,
+        'mask_tensor': mask_tensor,
+        'image_tensor_shape': getattr(image_tensor, 'shape', None),
+        'mask_tensor_shape': getattr(mask_tensor, 'shape', None),
+        'image_features': image_values,
+        'mask_features': mask_values,
+        'mean_intensity': clamp_unit(sum(image_values) / len(image_values) if image_values else 0.0),
+        'mask_coverage': clamp_unit(sum(mask_values) / len(mask_values) if mask_values else 1.0),
+        'cutout_applied': False,
+        'normalized_channels': 4,
+        'byte_length': len(image_values),
+        'source_format': 'tensor',
+        'pixel_count': max(len(image_values) // 4, 1),
+        'image_signature': stable_signature(image_values),
+        'mask_signature': stable_signature(mask_values),
+        'signature': stable_signature(image_values + mask_values),
+    }
+
+
+class DiTPipeline:
+    def __init__(self, *, vae, model, scheduler, conditioner, image_processor):
+        self.vae = vae
+        self.model = model
+        self.scheduler = scheduler
+        self.conditioner = conditioner
+        self.image_processor = image_processor
+
+    def prepare_image(self, image, mask=None) -> dict[str, object]:
+        if isinstance(image, dict):
+            return dict(image)
+        if hasattr(self.image_processor, 'process') and isinstance(image, str):
+            processed = self.image_processor.process(image)
+            return {'image': processed.get('image_tensor'), 'mask': processed.get('mask_tensor'), 'reference_asset': processed}
+        processed = self.image_processor(image, mask=mask) if callable(self.image_processor) else {'image': image, 'mask': mask}
+        if not isinstance(processed, dict):
+            processed = {'image': image, 'mask': mask}
+        processed.setdefault('image', image)
+        processed.setdefault('mask', mask)
+        return processed
+
+    def encode_cond(self, *, reference_asset: dict[str, object], coarse_surface: dict[str, object]) -> dict[str, object]:
+        return self.conditioner.build(reference_asset=reference_asset, coarse_surface=coarse_surface)
+
+    def prepare_latents(self, *, conditioning: dict[str, object], coarse_surface: dict[str, object]) -> list[float]:
+        return _initialize_latents(conditioning=conditioning, coarse_surface=coarse_surface)
+
+
+class UltraShapePipeline(DiTPipeline):
+    def __call__(
+        self,
+        *,
+        image,
+        voxel_cond: dict[str, object] | None = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 5.0,
+        seed: int | None = None,
+        coarse_surface: dict[str, object] | None = None,
+        reference_asset: dict[str, object] | None = None,
+        preserve_scale: bool = False,
+        output_type: str = 'mesh',
+        **kwargs,
+    ):
+        del kwargs
+        cond_inputs = self.prepare_image(image)
+        runtime_reference_asset = reference_asset or cond_inputs.get('reference_asset')
+        if not isinstance(runtime_reference_asset, dict):
+            runtime_reference_asset = _reference_asset_from_cond_inputs(cond_inputs)
+        if not isinstance(coarse_surface, dict):
+            raise PipelineUnavailableError('UltraShapePipeline requires a structured coarse_surface payload for faithful conditioning.')
+        runtime_coarse_surface = coarse_surface
+        conditioning = self.encode_cond(reference_asset=runtime_reference_asset, coarse_surface=runtime_coarse_surface)
+        schedule = self.scheduler if isinstance(self.scheduler, dict) else build_flow_matching_schedule(steps=num_inference_steps, guidance_scale=guidance_scale)
+        timesteps, _ = retrieve_timesteps(schedule)
+        latents = self.prepare_latents(conditioning=conditioning, coarse_surface=runtime_coarse_surface)
+        denoised = self.model.denoise(
+            latents=latents,
+            timesteps=timesteps,
+            context=_numeric_list(conditioning.get('context')),
+            context_mask=_numeric_list(conditioning.get('context_mask')),
+            voxel_cond=runtime_coarse_surface.get('voxel_cond') if isinstance(runtime_coarse_surface.get('voxel_cond'), dict) else {},
+            guidance_scale=guidance_scale,
+            schedule=schedule,
+            seed=seed,
+        )
+        decoded_latents = self.vae.decode_latents(
+            denoised,
+            runtime_reference_asset,
+            conditioning=conditioning,
+            coarse_surface=runtime_coarse_surface,
+        )
+        decoded_volume = decode_volume(decoded_latents)
+        execution_trace = ['prepare_image', 'encode_cond', 'prepare_latents', 'diffusion_sampling', 'decode', 'extract']
+        if output_type == 'latent':
+            return {
+                **decoded_volume,
+                'authority': 'UltraShapePipeline._export',
+                'execution_trace': execution_trace,
+            }, denoised
+        refined_surface = extract_surface(
+            extraction='mc',
+            coarse_surface=runtime_coarse_surface,
+            reference_asset=runtime_reference_asset,
+            decoded_volume=decoded_volume,
+            preserve_scale=preserve_scale,
+        )
+        refined_surface = {
+            **refined_surface,
+            'authority': 'UltraShapePipeline._export',
+            'execution_trace': execution_trace,
+        }
+        return refined_surface, denoised
+
+
+def load_runtime_components(
+    *,
+    config: dict[str, object],
+    checkpoint: str | None,
+    ext_dir: str,
+) -> tuple[dict[str, object], dict[str, object], object, object, object, object, object, dict[str, object], dict[str, object], dict[str, object]]:
+    checkpoint_config = config.get('checkpoint') if isinstance(config.get('checkpoint'), dict) else {}
+    weights = config.get('weights') if isinstance(config.get('weights'), dict) else {}
+    image_processor = _instantiate_runtime_component(config, 'image_processor_cfg', ImageProcessorV2)
+    surface_loader = _instantiate_runtime_component(config, 'surface_loader_cfg', SharpEdgeSurfaceLoader)
+    checkpoint_bundle = load_checkpoint_subtrees(
+        checkpoint,
+        weights.get('primary') if isinstance(weights, dict) else None,
+        ext_dir,
+        checkpoint_config.get('required_subtrees') if isinstance(checkpoint_config.get('required_subtrees'), list) else None,
+    )
+    checkpoint_state = checkpoint_bundle['bundle'] if isinstance(checkpoint_bundle.get('bundle'), dict) else {}
+    conditioner = _instantiate_runtime_component(
+        config,
+        'conditioner_config',
+        SingleImageEncoder,
+        checkpoint_state=checkpoint_state.get('conditioner'),
+    )
+    conditioner_hydration = apply_checkpoint_state(conditioner, checkpoint_state.get('conditioner'), strict=True)
+    conditioner.hydration = conditioner_hydration
+    denoiser = _instantiate_runtime_component(config, 'dit_cfg', RefineDiT, checkpoint_state=checkpoint_state.get('dit'))
+    denoiser_hydration = apply_checkpoint_state(denoiser, checkpoint_state.get('dit'), strict=True)
+    denoiser.hydration = denoiser_hydration
+    vae = _instantiate_runtime_component(config, 'vae_config', ShapeVAE, checkpoint_state=checkpoint_state.get('vae'))
+    vae_hydration = apply_checkpoint_state(vae, checkpoint_state.get('vae'), strict=True)
+    return (
+        checkpoint_bundle,
+        checkpoint_state,
+        image_processor,
+        surface_loader,
+        conditioner,
+        denoiser,
+        vae,
+        conditioner_hydration,
+        denoiser_hydration,
+        vae_hydration,
+    )
 
 
 def _voxel_seed(voxel_cond: dict[str, object], *, limit: int = 8) -> list[float]:
@@ -438,73 +750,85 @@ def run_refine_pipeline(
     config = load_runtime_config(config_path)
     require_imports(config)
     _, extraction = validate_mvp_scope(config, backend, output_format)
+    runtime_mode = resolve_runtime_mode()
 
-    checkpoint_config = config.get('checkpoint') if isinstance(config.get('checkpoint'), dict) else {}
-    weights = config.get('weights') if isinstance(config.get('weights'), dict) else {}
-    image_processor = ImageProcessorV2()
-    surface_loader = SharpEdgeSurfaceLoader()
+    if runtime_mode.get('active') == 'real':
+        return run_real_refine_pipeline(
+            reference_image=reference_image,
+            coarse_mesh=coarse_mesh,
+            output_dir=output_dir,
+            output_format=output_format,
+            checkpoint=checkpoint,
+            config_path=config_path,
+            ext_dir=ext_dir,
+            backend=backend,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            preserve_scale=preserve_scale,
+        )
+    if runtime_mode.get('requested') == 'real':
+        return run_real_refine_pipeline(
+            reference_image=reference_image,
+            coarse_mesh=coarse_mesh,
+            output_dir=output_dir,
+            output_format=output_format,
+            checkpoint=checkpoint,
+            config_path=config_path,
+            ext_dir=ext_dir,
+            backend=backend,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            preserve_scale=preserve_scale,
+        )
+
+    (
+        checkpoint_bundle,
+        checkpoint_state,
+        image_processor,
+        surface_loader,
+        conditioner,
+        denoiser,
+        vae,
+        conditioner_hydration,
+        denoiser_hydration,
+        vae_hydration,
+    ) = load_runtime_components(config=config, checkpoint=checkpoint, ext_dir=ext_dir)
     reference_asset = image_processor.process(reference_image)
     coarse_surface = surface_loader.load(coarse_mesh)
-    checkpoint_bundle = load_checkpoint_subtrees(
-        checkpoint,
-        weights.get('primary') if isinstance(weights, dict) else None,
-        ext_dir,
-        checkpoint_config.get('required_subtrees') if isinstance(checkpoint_config.get('required_subtrees'), list) else None,
-    )
-    checkpoint_state = checkpoint_bundle['bundle'] if isinstance(checkpoint_bundle.get('bundle'), dict) else {}
-    conditioner = SingleImageEncoder(checkpoint_state=checkpoint_state.get('conditioner'))
-    conditioner_hydration = apply_checkpoint_state(conditioner, checkpoint_state.get('conditioner'))
-    conditioner.hydration = conditioner_hydration
-    conditioning = conditioner.build(
-        reference_asset=reference_asset,
-        coarse_surface=coarse_surface,
-    )
     schedule = build_flow_matching_schedule(steps=steps, guidance_scale=guidance_scale)
-    denoiser = RefineDiT(checkpoint_state=checkpoint_state.get('dit'))
-    denoiser_hydration = apply_checkpoint_state(denoiser, checkpoint_state.get('dit'))
-    denoiser.hydration = denoiser_hydration
-    initial_latents = _initialize_latents(
-        conditioning=conditioning,
-        coarse_surface=coarse_surface,
+    pipeline = UltraShapePipeline(
+        vae=vae,
+        model=denoiser,
+        scheduler=schedule,
+        conditioner=conditioner,
+        image_processor=image_processor,
     )
-    denoised = denoiser.denoise(
-        latents=initial_latents,
-        timesteps=_numeric_list(schedule.get('consumed_timesteps')),
-        context=_numeric_list(conditioning.get('context')),
-        context_mask=_numeric_list(conditioning.get('context_mask')),
+    conditioning = conditioner.build(reference_asset=reference_asset, coarse_surface=coarse_surface)
+    refined_surface, denoised = pipeline(
+        image=reference_asset,
         voxel_cond=coarse_surface.get('voxel_cond') if isinstance(coarse_surface.get('voxel_cond'), dict) else {},
+        num_inference_steps=steps,
         guidance_scale=guidance_scale,
-        schedule=schedule,
         seed=seed,
-    )
-    vae = ShapeVAE()
-    vae_hydration = apply_checkpoint_state(vae, checkpoint_state.get('vae'))
-    decoded_latents = vae.decode_latents(
-        denoised,
-        reference_asset,
-        conditioning=conditioning,
-        coarse_surface=coarse_surface,
-    )
-    decoded_volume = decode_volume(decoded_latents)
-    refined_surface = extract_surface(
-        extraction=extraction,
         coarse_surface=coarse_surface,
         reference_asset=reference_asset,
-        decoded_volume=decoded_volume,
         preserve_scale=preserve_scale,
     )
+    decoded_latents = vae.decode_latents(denoised, reference_asset, conditioning=conditioning, coarse_surface=coarse_surface)
+    decoded_volume = decode_volume(decoded_latents)
+    normalization_transform = _mapping(coarse_surface.get('normalization_transform'))
     refined_payload = dict(refined_surface['payload'])
+    if preserve_scale and normalization_transform:
+        refined_payload = _restore_original_scale(refined_payload, normalization_transform)
 
-    if os.environ.get('ULTRASHAPE_TEST_FORCE_PASSTHROUGH') == '1':
-        refined_payload = {
-            **coarse_surface['mesh'],
-            'kind': 'refined-mesh',
-        }
-    elif os.environ.get('ULTRASHAPE_TEST_FORCE_SCALE_DRIFT') == '1':
-        refined_payload['test_extent_scale'] = [1.2, 1.2, 1.2]
+    coarse_gate_payload = coarse_surface.get('original_mesh') if preserve_scale else coarse_surface.get('mesh')
+    if not isinstance(coarse_gate_payload, dict):
+        coarse_gate_payload = coarse_surface['mesh']
 
     gate_metrics = evaluate_geometric_gate(
-        coarse_mesh_payload=coarse_surface['mesh'],
+        coarse_mesh_payload=coarse_gate_payload,
         refined_mesh_payload=refined_payload,
         preserve_scale=preserve_scale,
         reference_image_signature=reference_asset.get('image_signature'),
@@ -545,8 +869,22 @@ def run_refine_pipeline(
                 **(checkpoint_bundle.get('summary') if isinstance(checkpoint_bundle.get('summary'), dict) else {}),
                 'load_style': 'load_state_dict',
                 'hydrated_modules': ['conditioner', 'dit', 'vae'],
-                'strict': False,
+                'strict': True,
                 'hydration': [conditioner_hydration, denoiser_hydration, vae_hydration],
+            },
+            'pipeline': {
+                'entrypoint': 'scripts.infer_dit_refine.run_inference',
+                'loader': 'load_models',
+                'class': pipeline.__class__.__name__,
+                'returns_latents': True,
+                'execution_trace': refined_surface.get('execution_trace', []),
+            },
+            'runtime_mode': {
+                **runtime_mode,
+                'real': {
+                    **(runtime_mode.get('real') if isinstance(runtime_mode.get('real'), dict) else {}),
+                    'adapter': REAL_MODE_ADAPTER,
+                },
             },
             'preprocess': {
                 'processor': image_processor.__class__.__name__,
@@ -572,6 +910,7 @@ def run_refine_pipeline(
                 'surface_face_count': coarse_surface['mesh']['face_count'],
                 'surface_point_count': coarse_surface['mesh']['surface_point_count'],
                 'surface_bounds': coarse_surface['mesh']['bounds'],
+                'normalization_transform': normalization_transform,
                 'voxel_count': conditioning['voxel_count'],
                 'voxel_resolution': coarse_surface['voxels']['resolution'],
                 'context_token_count': len(conditioning['context']),
@@ -646,6 +985,7 @@ def run_refine_pipeline(
                 'checkpoint_signature': gate_metrics['checkpoint_signature'],
                 'preserve_scale': gate_metrics['preserve_scale'],
                 'scale_fit_applied': gate_metrics['scale_fit_applied'],
+                'scale_restore_applied': bool(preserve_scale and normalization_transform),
                 'attribution_signature': gate_metrics['attribution_signature'],
                 'coarse_vertex_count': gate_metrics['coarse_vertex_count'],
                 'refined_vertex_count': gate_metrics['refined_vertex_count'],

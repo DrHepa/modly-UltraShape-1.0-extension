@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -72,6 +72,42 @@ function createBinaryGlb() {
   return Buffer.concat([header, jsonHeader, paddedJson, binHeader, binaryChunk]);
 }
 
+function readGlbVertices(glbPath: string) {
+  const payload = readFileSync(glbPath);
+  const jsonChunkLength = payload.readUInt32LE(12);
+  const jsonChunk = payload.subarray(20, 20 + jsonChunkLength);
+  const document = JSON.parse(jsonChunk.toString('utf8').trimEnd()) as {
+    accessors: Array<{ bufferView: number; count: number; byteOffset?: number }>;
+    bufferViews: Array<{ byteOffset?: number; byteStride?: number }>;
+    meshes: Array<{ primitives: Array<{ attributes: { POSITION: number } }> }>;
+  };
+  const binaryOffset = 20 + jsonChunkLength + 8;
+  const positionAccessorIndex = document.meshes[0]?.primitives[0]?.attributes.POSITION;
+  const accessor = document.accessors[positionAccessorIndex];
+  const bufferView = document.bufferViews[accessor.bufferView];
+  const byteOffset = binaryOffset + (bufferView.byteOffset ?? 0) + (accessor.byteOffset ?? 0);
+  const stride = bufferView.byteStride ?? 12;
+  const vertices: Array<[number, number, number]> = [];
+
+  for (let index = 0; index < accessor.count; index += 1) {
+    const start = byteOffset + index * stride;
+    vertices.push([
+      payload.readFloatLE(start),
+      payload.readFloatLE(start + 4),
+      payload.readFloatLE(start + 8),
+    ]);
+  }
+
+  return vertices;
+}
+
+function meshExtents(vertices: Array<[number, number, number]>) {
+  const xs = vertices.map((vertex) => vertex[0]);
+  const ys = vertices.map((vertex) => vertex[1]);
+  const zs = vertices.map((vertex) => vertex[2]);
+  return [Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys), Math.max(...zs) - Math.min(...zs)];
+}
+
 function writeRuntimeStubModules(root: string) {
   const modules = [
     'torchvision.py',
@@ -129,9 +165,34 @@ function createRuntimeFixture() {
   writeFileSync(
     checkpoint,
     JSON.stringify({
-      vae: { tensors: { weights: [0.1, 0.2, 0.3, 0.4] } },
-      dit: { tensors: { weights: [0.5, 0.6, 0.7, 0.8] } },
-      conditioner: { tensors: { weights: [0.2, 0.4, 0.6, 0.8] } },
+      vae: {
+        state_dict: {
+          'post_kl.weight': [0.11, 0.12, 0.13, 0.14],
+          'post_kl.bias': [0.21, 0.22, 0.23, 0.24],
+          'transformer.resblocks.0.attn.c_qkv.weight': [0.31, 0.32, 0.33, 0.34],
+          'transformer.resblocks.0.attn.c_proj.bias': [0.41, 0.42, 0.43, 0.44],
+          'geo_decoder.query_proj.weight': [0.51, 0.52, 0.53, 0.54],
+        },
+      },
+      dit: {
+        state_dict: {
+          'x_embedder.weight': [0.15, 0.25, 0.35, 0.45],
+          'x_embedder.bias': [0.55, 0.65, 0.75, 0.85],
+          't_embedder.mlp.0.weight': [0.19, 0.29, 0.39, 0.49],
+          't_embedder.mlp.0.bias': [0.59, 0.69, 0.79, 0.89],
+          't_embedder.mlp.2.weight': [0.14, 0.24, 0.34, 0.44],
+          'final_layer.linear.weight': [0.54, 0.64, 0.74, 0.84],
+          'final_layer.linear.bias': [0.18, 0.28, 0.38, 0.48],
+        },
+      },
+      conditioner: {
+        state_dict: {
+          'main_image_encoder.model.embeddings.patch_embedding.weight': [0.12, 0.24, 0.36, 0.48],
+          'main_image_encoder.model.embeddings.patch_embedding.bias': [0.16, 0.26, 0.36, 0.46],
+          'main_image_encoder.model.post_layernorm.weight': [0.22, 0.32, 0.42, 0.52],
+          'main_image_encoder.model.post_layernorm.bias': [0.28, 0.38, 0.48, 0.58],
+        },
+      },
     }),
     'utf8',
   );
@@ -202,7 +263,7 @@ describe('private runtime flow behind the model shell', () => {
     const result = runPythonSnippet(
       [
         'import json, sys',
-        'from ultrashape_runtime import CHECKPOINT_REQUIRED_SUBTREES, RUNTIME_LAYOUT, RUNTIME_SCOPE, UPSTREAM_CLOSURE_READY',
+        'from ultrashape_runtime import CHECKPOINT_REQUIRED_SUBTREES, DEFAULT_RUNTIME_MODE, RUNTIME_LAYOUT, RUNTIME_MODE_STRATEGY, RUNTIME_SCOPE, SUPPORTED_RUNTIME_MODES, UPSTREAM_CLOSURE_READY, UPSTREAM_CLOSURE_REASON',
         'from ultrashape_runtime.local_runner import PUBLIC_ERROR_CODES',
         'from ultrashape_runtime.pipelines import build_refine_pipeline, load_runtime_config',
         'from ultrashape_runtime.preprocessors import ImageProcessorV2',
@@ -216,7 +277,11 @@ describe('private runtime flow behind the model shell', () => {
         '  "runtime": {',
         '    "scope": RUNTIME_SCOPE,',
         '    "layout": RUNTIME_LAYOUT,',
-        '    "ready": UPSTREAM_CLOSURE_READY,',
+        '    "mode_strategy": RUNTIME_MODE_STRATEGY,',
+        '    "default_mode": DEFAULT_RUNTIME_MODE,',
+        '    "supported_modes": list(SUPPORTED_RUNTIME_MODES),',
+        '    "real_closure_ready": UPSTREAM_CLOSURE_READY,',
+        '    "real_closure_reason": UPSTREAM_CLOSURE_REASON,',
         '    "checkpoint_required_subtrees": list(CHECKPOINT_REQUIRED_SUBTREES),',
         '    "public_error_codes": sorted(PUBLIC_ERROR_CODES),',
         '  },',
@@ -249,10 +314,15 @@ describe('private runtime flow behind the model shell', () => {
     expect(JSON.parse(result.stdout)).toEqual({
       runtime: {
         scope: 'mc-only',
-        layout: 'vendored-upstream-closure',
-        ready: true,
+        layout: 'vendored-dual-mode-closure',
+        mode_strategy: 'explicit-dual-mode',
+        default_mode: 'auto',
+        supported_modes: ['auto', 'real', 'portable'],
+        real_closure_ready: false,
+        real_closure_reason:
+          'Authoritative real mode is optional and remains unavailable until the exact upstream torch module graph adapter is vendored and the required runtime dependencies are present.',
         checkpoint_required_subtrees: ['vae', 'dit', 'conditioner'],
-        public_error_codes: ['DEPENDENCY_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE', 'WEIGHTS_MISSING'],
+        public_error_codes: ['DEPENDENCY_MISSING', 'INVALID_INPUT', 'LOCAL_RUNTIME_UNAVAILABLE', 'WEIGHTS_MISSING'],
       },
       config: {
         scope: 'mc-only',
@@ -265,7 +335,13 @@ describe('private runtime flow behind the model shell', () => {
         export_format: 'glb',
       },
       stages: {
-        pipeline: { name: 'ultrashape-refine', scope: 'mc-only' },
+        pipeline: {
+          name: 'ultrashape-refine',
+          scope: 'mc-only',
+          entrypoint: 'scripts.infer_dit_refine.run_inference',
+          loader: 'load_models',
+          class: 'UltraShapePipeline',
+        },
         preprocess: { class: 'ImageProcessorV2', method: 'process' },
         conditioning: { class: 'SingleImageEncoder', method: 'build' },
         surface: { class: 'SharpEdgeSurfaceLoader', method: 'load' },
@@ -276,7 +352,26 @@ describe('private runtime flow behind the model shell', () => {
     });
   });
 
-  it('rejects shorthand closure configs instead of re-authorizing synthetic runtime allowances', () => {
+  it('exposes upstream closure markers for OmegaConf loading, strict hydration, and preserve_scale restoration', () => {
+    const result = runPythonSnippet(
+      [
+        'import json, sys',
+        'from ultrashape_runtime.pipelines import describe_upstream_closure_markers',
+        'print(json.dumps(describe_upstream_closure_markers(sys.argv[1])))',
+      ].join('\n'),
+      [configPath],
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      config_loader: 'OmegaConf.load',
+      checkpoint_hydration: 'strict',
+      preserve_scale_restore: 'coarse-normalization-inverse',
+      required_subtrees: ['vae', 'dit', 'conditioner'],
+    });
+  });
+
+  it('rejects shorthand closure configs instead of re-authorizing non-upstream runtime allowances', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-runtime-config-'));
     const shorthandConfigPath = path.join(sandbox, 'shorthand.yaml');
     writeFileSync(
@@ -337,10 +432,524 @@ describe('private runtime flow behind the model shell', () => {
           backend: 'local',
           format: 'glb',
           file_path: path.join(outputDir, 'refined.glb'),
+          metrics: {
+            pipeline: {
+              entrypoint: 'scripts.infer_dit_refine.run_inference',
+              loader: 'load_models',
+              class: 'UltraShapePipeline',
+              returns_latents: true,
+            },
+            runtime_mode: {
+              selection: 'portable-only',
+              requested: 'auto',
+              active: 'portable',
+              real: {
+                available: false,
+                adapter: 'ultrashape_runtime.real_mode.run_real_refine_pipeline',
+              },
+              portable: {
+                available: true,
+              },
+            },
+            checkpoint: {
+              strict: true,
+              representation: 'module-state-dict-v2',
+              hydrated_modules: ['conditioner', 'dit', 'vae'],
+              hydration: [
+                {
+                  module: 'SingleImageEncoder',
+                  module_family: 'SingleImageEncoder',
+                  parameter_count: 4,
+                  module_roots: ['main_image_encoder'],
+                },
+                {
+                  module: 'RefineDiT',
+                  module_family: 'RefineDiT',
+                  parameter_count: 7,
+                  module_roots: ['final_layer', 't_embedder', 'x_embedder'],
+                },
+                {
+                  module: 'ShapeVAE',
+                  module_family: 'ShapeVAE',
+                  parameter_count: 5,
+                  module_roots: ['geo_decoder', 'post_kl', 'transformer'],
+                },
+              ],
+            },
+            gate: {
+              preserve_scale: true,
+            },
+            conditioning: {
+              hydration: {
+                module_family: 'SingleImageEncoder',
+                parameter_count: 4,
+              },
+            },
+            denoise: {
+              hydration: {
+                module_family: 'RefineDiT',
+                parameter_count: 7,
+              },
+            },
+            decode: {
+              state_hydrated: true,
+            },
+          },
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
         },
       });
       expect(existsSync(path.join(outputDir, 'refined.glb'))).toBe(true);
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('routes the portable closure through an UltraShapePipeline-compatible call graph', () => {
+    const result = runPythonSnippet(
+      [
+        'import json',
+        'from ultrashape_runtime.models.conditioner_mask import SingleImageEncoder',
+        'from ultrashape_runtime.models.denoisers.dit_mask import RefineDiT',
+        'from ultrashape_runtime.models.autoencoders.model import ShapeVAE',
+        'from ultrashape_runtime.pipelines import UltraShapePipeline',
+        'class StubProcessor:',
+        '    def __call__(self, image, mask=None):',
+        '        del mask',
+        '        return {"image": image, "mask": [[[ [1.0] ]]]}',
+        'reference = [[[[1.0, 0.5, 0.25, 1.0], [0.2, 0.4, 0.6, 1.0]]]]',
+        'voxel_cond = {"coords": [[0, 0, 0], [1, 1, 1]], "occupancies": [0.25, 0.75], "resolution": 4, "voxel_count": 2}',
+        'coarse_surface = {',
+        '    "mesh": {"bounds": {"min": (0.0, 0.0, 0.0), "extents": (1.0, 1.0, 1.0)}, "signature": 11, "vertex_count": 4, "face_count": 2, "surface_point_count": 4},',
+        '    "voxel_cond": voxel_cond,',
+        '    "sampled_surface_points": [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],',
+        '}',
+        'pipeline = UltraShapePipeline(',
+        '    vae=ShapeVAE(checkpoint_state={"tensors": {"weights": [0.7, 0.5, 0.3, 0.1]}}),',
+        '    model=RefineDiT(checkpoint_state={"tensors": {"weights": [0.3, 0.6, 0.9, 0.1]}}),',
+        '    scheduler={"consumed_timesteps": [2.0, 1.0, 0.0], "object_type": "FlowMatchEulerDiscreteScheduler"},',
+        '    conditioner=SingleImageEncoder(checkpoint_state={"tensors": {"weights": [0.2, 0.4, 0.6, 0.8]}}),',
+        '    image_processor=StubProcessor(),',
+        ')',
+        'mesh, latents = pipeline(image=reference, voxel_cond=voxel_cond, coarse_surface=coarse_surface, num_inference_steps=3, guidance_scale=5.5, seed=7, output_type="latent")',
+        'print(json.dumps({',
+        '    "pipeline": {',
+        '        "class": pipeline.__class__.__name__,',
+        '        "returns_latents": isinstance(latents, dict),',
+        '        "execution_trace": mesh["execution_trace"],',
+        '    },',
+        '    "mesh": {',
+        '        "authority": mesh["authority"],',
+        '        "extractor": mesh["decoder"],',
+        '    },',
+        '    "latents": {',
+        '        "model": latents["model"],',
+        '        "latent_count": latents["latent_count"],',
+        '        "timestep_count": latents["timestep_count"],',
+        '    },',
+        '}))',
+      ].join('\n'),
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      pipeline: {
+        class: 'UltraShapePipeline',
+        returns_latents: true,
+        execution_trace: ['prepare_image', 'encode_cond', 'prepare_latents', 'diffusion_sampling', 'decode', 'extract'],
+      },
+      mesh: {
+        authority: 'UltraShapePipeline._export',
+        extractor: 'VanillaVolumeDecoder',
+      },
+      latents: {
+        model: 'RefineDiT',
+        latent_count: expect.any(Number),
+        timestep_count: 3,
+      },
+    });
+  });
+
+  it('decodes field grids and extracts sparse mc surfaces through upstream-style decoder families', () => {
+    const result = runPythonSnippet(
+      [
+        'import json',
+        'import sys, types',
+        'cubvh = types.ModuleType("cubvh")',
+        'cubvh.sparse_marching_cubes = lambda coords, corners, iso, ensure_consistency=False: ([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 1.0, 1.0], [0.5, 0.5, 1.02]], [[0, 1, 4], [0, 4, 2], [0, 1, 5], [0, 5, 3], [2, 4, 7], [2, 7, 6], [3, 5, 8], [3, 8, 6]])',
+        'torch = types.ModuleType("torch")',
+        'class Tensor:',
+        '    def __init__(self, values, dtype=None):',
+        '        self._values = values',
+        '        self.dtype = dtype',
+        '        self.shape = (len(values), len(values[0]) if values and isinstance(values[0], (list, tuple)) else 0)',
+        '    def cpu(self):',
+        '        return self',
+        '    def tolist(self):',
+        '        return self._values',
+        'torch.int32 = "int32"',
+        'torch.float32 = "float32"',
+        'torch.tensor = lambda values, dtype=None: Tensor(values, dtype=dtype)',
+        'sys.modules["cubvh"] = cubvh',
+        'sys.modules["torch"] = torch',
+        'from ultrashape_runtime.models.autoencoders.volume_decoders import VanillaVolumeDecoder, HierarchicalVolumeDecoding, get_sparse_valid_voxels',
+        'from ultrashape_runtime.models.autoencoders.surface_extractors import SurfaceExtractors, extract_surface',
+        'decoded_latents = {',
+        '    "field_grid": [[[-1.0, -0.5], [-0.5, 0.25]], [[-0.25, 0.5], [0.5, 1.0]]],',
+        '    "field_signature": 321,',
+        '    "spatial_context": {"voxel_coords": [[0, 0, 0]]},',
+        '}',
+        'decoded_volume = VanillaVolumeDecoder().decode(decoded_latents)',
+        'grid_only_volume = dict(decoded_volume)',
+        'grid_only_volume.pop("coords", None)',
+        'grid_only_volume.pop("corners", None)',
+        'hierarchical = HierarchicalVolumeDecoding().decode(decoded_latents)',
+        'coords, corners = get_sparse_valid_voxels(decoded_volume["grid_logits"] if "grid_logits" in decoded_volume else decoded_volume["field_grid"])',
+        'surface = extract_surface(',
+        '    extraction="mc",',
+        '    coarse_surface={',
+        '        "mesh": {',
+        '            "vertices": [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],',
+        '            "faces": [(0, 1, 2), (0, 1, 3)],',
+        '            "signature": 17,',
+        '        },',
+        '    },',
+        '    reference_asset={"byte_length": 68, "signature": 23},',
+        '    decoded_volume=grid_only_volume,',
+        '    preserve_scale=False,',
+        ')',
+        'print(json.dumps({',
+        '    "decoder": {',
+        '        "class": decoded_volume["decoder"],',
+        '        "authority": decoded_volume["authority"],',
+        '        "has_grid_logits": "grid_logits" in decoded_volume,',
+        '        "sparse_cell_count": len(coords),',
+        '        "corner_count": len(corners),',
+        '    },',
+        '    "hierarchical": {',
+        '        "class": hierarchical["decoder"],',
+        '        "hierarchy": hierarchical["hierarchy"],',
+        '    },',
+        '    "extractor": {',
+        '        "family_keys": sorted(SurfaceExtractors.keys()),',
+        '        "marching_cubes": surface["marching_cubes"],',
+        '        "authority": surface["authority"],',
+        '        "vertex_count": surface["vertex_count"],',
+        '    },',
+        '}))',
+      ].join('\n'),
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      decoder: {
+        class: 'VanillaVolumeDecoder',
+        authority: 'geo_decoder(query_grid)',
+        has_grid_logits: true,
+        sparse_cell_count: expect.any(Number),
+        corner_count: expect.any(Number),
+      },
+      hierarchical: {
+        class: 'HierarchicalVolumeDecoding',
+        hierarchy: 'octree-near-surface',
+      },
+      extractor: {
+        family_keys: ['dmc', 'mc'],
+        marching_cubes: 'cubvh.sparse_marching_cubes',
+        authority: 'grid_logits',
+        vertex_count: expect.any(Number),
+      },
+    });
+    const payload = JSON.parse(result.stdout) as {
+      decoder: { sparse_cell_count: number; corner_count: number };
+      extractor: { vertex_count: number };
+    };
+    expect(payload.decoder.sparse_cell_count).toBeGreaterThan(0);
+    expect(payload.decoder.corner_count).toBe(payload.decoder.sparse_cell_count);
+    expect(payload.extractor.vertex_count).toBeGreaterThan(0);
+  });
+
+  it('maps unsupported backend requests to INVALID_INPUT through the public runner envelope', () => {
+    const fixture = createRuntimeFixture();
+
+    try {
+      const result = runLocalRunner(
+        {
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: path.join(fixture.sandbox, 'output'),
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'remote',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        },
+        fixture.stubRoot,
+      );
+
+      expect(result.status).toBe(1);
+      expect(JSON.parse(result.stdout)).toEqual({
+        ok: false,
+        error_code: 'INVALID_INPUT',
+        error_message: 'UltraShape local runner is local-only in this MVP.',
+      });
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('fails honestly when real mode is explicitly requested but unavailable', () => {
+    const fixture = createRuntimeFixture();
+
+    try {
+      const result = spawnSync('python3', ['-m', 'ultrashape_runtime.local_runner'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        input: JSON.stringify({
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: path.join(fixture.sandbox, 'output-real'),
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        }),
+        env: {
+          ...process.env,
+          ULTRASHAPE_RUNTIME_MODE: 'real',
+          PYTHONPATH: [fixture.stubRoot, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+        },
+      });
+
+      expect(result.status).toBe(1);
+      expect(JSON.parse(result.stdout)).toEqual({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        error_message:
+          'Real runtime mode requested but unavailable: authoritative upstream torch module graph adapter is not vendored yet.',
+      });
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('exposes a portable upstream-shaped model subset API for conditioning, denoising, and decoding', () => {
+    const result = runPythonSnippet(
+      [
+        'import json',
+        'from ultrashape_runtime.models.conditioner_mask import SingleImageEncoder',
+        'from ultrashape_runtime.models.denoisers.dit_mask import RefineDiT',
+        'from ultrashape_runtime.models.autoencoders.model import ShapeVAE',
+        'reference_asset = {',
+        '    "image_tensor": [[[[1.0, 0.5, 0.25, 1.0], [0.1, 0.2, 0.3, 1.0]]]],',
+        '    "mask_tensor": [[[[1.0], [0.0]]]],',
+        '}',
+        'coarse_surface = {',
+        '    "mesh": {"bounds": {"extents": (1.0, 2.0, 3.0)}, "signature": 41},',
+        '    "voxel_cond": {',
+        '        "coords": [[0, 0, 0], [1, 1, 1]],',
+        '        "occupancies": [0.25, 0.75],',
+        '        "resolution": 4,',
+        '        "voxel_count": 2,',
+        '    },',
+        '}',
+        'conditioner = SingleImageEncoder(checkpoint_state={"tensors": {"weights": [0.2, 0.4, 0.6, 0.8]}})',
+        'conditioning = conditioner.build(reference_asset=reference_asset, coarse_surface=coarse_surface)',
+        'forward_tokens = conditioner.forward(reference_asset["image_tensor"], mask=reference_asset["mask_tensor"])',
+        'unconditional = conditioner.unconditional_embedding(batch_size=1, num_tokens=len(forward_tokens["main"]))',
+        'dit = RefineDiT(checkpoint_state={"tensors": {"weights": [0.3, 0.6, 0.9, 0.1]}})',
+        'forward_latents = dit.forward([[0.1, 0.2, 0.3, 0.4]], [1.0], forward_tokens, voxel_cond=coarse_surface["voxel_cond"], guidance_cond=[4.0])',
+        'guided = dit.denoise(latents=[0.1, 0.2, 0.3, 0.4], timesteps=[3.0, 1.0], context=conditioning["context"], context_mask=conditioning["context_mask"], voxel_cond=coarse_surface["voxel_cond"], guidance_scale=8.0, schedule={"step_count": 2, "object_type": "FlowMatchEulerDiscreteScheduler"}, seed=7)',
+        'unguided = dit.denoise(latents=[0.1, 0.2, 0.3, 0.4], timesteps=[3.0, 1.0], context=conditioning["context"], context_mask=conditioning["context_mask"], voxel_cond=coarse_surface["voxel_cond"], guidance_scale=1.0, schedule={"step_count": 2, "object_type": "FlowMatchEulerDiscreteScheduler"}, seed=7)',
+        'vae = ShapeVAE(checkpoint_state={"tensors": {"weights": [0.7, 0.5, 0.3, 0.1]}})',
+        'decoded = vae.decode([[0.2, 0.4, 0.6, 0.8]])',
+        'query_logits = vae.query(decoded, [[-1.0, -1.0, -1.0], [0.0, 0.5, 1.0]])',
+        'latent_mesh, latent_grid = vae.latents2mesh(decoded)',
+        'print(json.dumps({',
+        '    "conditioning": {',
+        '        "token_count": len(forward_tokens["main"]),',
+        '        "feature_count": len(forward_tokens["main"][0]),',
+        '        "mask_count": len(forward_tokens["main_mask"]),',
+        '        "unconditional_sum": round(sum(sum(row) for row in unconditional["main"]), 6),',
+        '        "conditioning_signature": conditioning["conditioning_signature"],',
+        '        "has_main_image_encoder": hasattr(conditioner, "main_image_encoder"),',
+        '    },',
+        '    "dit": {',
+        '        "forward_token_count": len(forward_latents),',
+        '        "forward_feature_count": len(forward_latents[0]),',
+        '        "guided_signature": guided["latent_signature"],',
+        '        "unguided_signature": unguided["latent_signature"],',
+        '        "has_timestep_embedder": hasattr(dit, "t_embedder"),',
+        '    },',
+        '    "vae": {',
+        '        "decoded_token_count": len(decoded),',
+        '        "decoded_feature_count": len(decoded[0]),',
+        '        "query_count": len(query_logits),',
+        '        "query_signature": round(sum(query_logits), 6),',
+        '        "latent_mesh_count": len(latent_mesh),',
+        '        "latent_grid_decoder": latent_grid["decoder"],',
+        '    },',
+        '}))',
+      ].join('\n'),
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      conditioning: {
+        token_count: 1,
+        feature_count: 4,
+        mask_count: 1,
+        unconditional_sum: 0,
+        conditioning_signature: expect.any(Number),
+        has_main_image_encoder: true,
+      },
+      dit: {
+        forward_token_count: 1,
+        forward_feature_count: 4,
+        guided_signature: expect.any(Number),
+        unguided_signature: expect.any(Number),
+        has_timestep_embedder: true,
+      },
+      vae: {
+        decoded_token_count: 1,
+        decoded_feature_count: 4,
+        query_count: 2,
+        query_signature: expect.any(Number),
+        latent_mesh_count: 1,
+        latent_grid_decoder: 'VanillaVolumeDecoder',
+      },
+    });
+    const payload = JSON.parse(result.stdout) as {
+      dit: { guided_signature: number; unguided_signature: number };
+    };
+    expect(payload.dit.guided_signature).not.toBe(payload.dit.unguided_signature);
+  });
+
+  it('restores coarse-mesh scale only when preserve_scale is enabled', () => {
+    const fixture = createRuntimeFixture();
+    const outputPreserved = path.join(fixture.sandbox, 'output-preserved');
+    const outputNormalized = path.join(fixture.sandbox, 'output-normalized');
+
+    try {
+      const preserved = runLocalRunner(
+        {
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: outputPreserved,
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        },
+        fixture.stubRoot,
+      );
+      const normalized = runLocalRunner(
+        {
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: outputNormalized,
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: false,
+        },
+        fixture.stubRoot,
+      );
+
+      expect(preserved.status).toBe(0);
+      expect(normalized.status).toBe(0);
+
+      const coarseExtents = meshExtents(readGlbVertices(fixture.meshInputPath));
+      const preservedExtents = meshExtents(readGlbVertices(path.join(outputPreserved, 'refined.glb')));
+      const normalizedExtents = meshExtents(readGlbVertices(path.join(outputNormalized, 'refined.glb')));
+
+      expect(preservedExtents[0]).toBeCloseTo(coarseExtents[0], 5);
+      expect(preservedExtents[1]).toBeCloseTo(coarseExtents[1], 5);
+      expect(preservedExtents[2]).toBeCloseTo(coarseExtents[2], 5);
+      expect(normalizedExtents[0]).toBeCloseTo(1.9998, 3);
+      expect(normalizedExtents[1]).toBeCloseTo(1.9998, 3);
+      expect(normalizedExtents[2]).toBeCloseTo(1.9998, 3);
+      expect(normalizedExtents[0]).not.toBeCloseTo(coarseExtents[0], 3);
+
+      expect(JSON.parse(preserved.stdout)).toMatchObject({
+        ok: true,
+        result: {
+          metrics: {
+            conditioning: {
+              normalization_transform: {
+                max_extent: 1,
+                scale_factor: 1.9998,
+              },
+            },
+            gate: {
+              preserve_scale: true,
+            },
+          },
+        },
+      });
+      expect(JSON.parse(normalized.stdout)).toMatchObject({
+        ok: true,
+        result: {
+          metrics: {
+            gate: {
+              preserve_scale: false,
+            },
+          },
+        },
+      });
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects JPEG payloads until true JPEG preprocessing exists', () => {
+    const fixture = createRuntimeFixture();
+    const jpegPath = path.join(fixture.sandbox, 'reference.jpg');
+    writeFileSync(jpegPath, Buffer.from([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x01]));
+
+    try {
+      const result = runLocalRunner(
+        {
+          reference_image: jpegPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: path.join(fixture.sandbox, 'output-jpeg'),
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        },
+        fixture.stubRoot,
+      );
+
+      expect(result.status).toBe(1);
+      expect(JSON.parse(result.stdout)).toEqual({
+        ok: false,
+        error_code: 'INVALID_INPUT',
+        error_message: `reference_image must be a decodable PNG payload: ${jpegPath}.`,
+      });
     } finally {
       rmSync(fixture.sandbox, { recursive: true, force: true });
     }

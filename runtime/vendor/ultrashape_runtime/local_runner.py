@@ -11,7 +11,8 @@ from .pipelines import load_runtime_config, run_refine_pipeline
 
 
 PUBLIC_ERROR_CODE = 'LOCAL_RUNTIME_UNAVAILABLE'
-PUBLIC_ERROR_CODES = {'DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE'}
+INVALID_INPUT_CODE = 'INVALID_INPUT'
+PUBLIC_ERROR_CODES = {'DEPENDENCY_MISSING', 'WEIGHTS_MISSING', 'LOCAL_RUNTIME_UNAVAILABLE', INVALID_INPUT_CODE}
 REQUIRED_FIELDS = {
     'reference_image',
     'coarse_mesh',
@@ -60,18 +61,64 @@ def collapse_public_message(code: str, message: object) -> str:
     return text
 
 
+def invalid_input(message: str) -> LocalRunnerError:
+    return LocalRunnerError(message, code=INVALID_INPUT_CODE)
+
+
+def _require_string_field(payload: dict[str, object], field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise invalid_input(f'{field} must be a non-empty string.')
+    return value.strip()
+
+
+def _require_existing_file(path_value: str, field: str) -> Path:
+    candidate = Path(path_value)
+    if not candidate.is_file():
+        raise invalid_input(f'{field} is not a readable file: {path_value}.')
+    return candidate
+
+
+def _validate_reference_image(reference_image: str) -> None:
+    candidate = _require_existing_file(reference_image, 'reference_image')
+    payload = candidate.read_bytes()
+    if len(payload) == 0:
+        raise invalid_input(f'reference_image is empty: {reference_image}.')
+    png_signature = b'\x89PNG\r\n\x1a\n'
+    if not payload.startswith(png_signature):
+        raise invalid_input(f'reference_image must be a decodable PNG payload: {reference_image}.')
+
+
+def _validate_coarse_mesh(coarse_mesh: str) -> None:
+    candidate = _require_existing_file(coarse_mesh, 'coarse_mesh')
+    payload = candidate.read_bytes()
+    if not payload.startswith(b'glTF'):
+        raise invalid_input(f'coarse_mesh is not a readable binary glb payload: {coarse_mesh}.')
+
+
 def read_job() -> dict[str, object]:
     line = sys.stdin.readline()
     if not line:
-        raise LocalRunnerError('Missing job JSON on stdin.')
+        raise invalid_input('Missing job JSON on stdin.')
 
-    payload = json.loads(line)
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise invalid_input(f'Runner job is not valid JSON: {error.msg}.') from error
     if not isinstance(payload, dict):
-        raise LocalRunnerError('Runner job must be a JSON object.')
+        raise invalid_input('Runner job must be a JSON object.')
 
     missing = sorted(REQUIRED_FIELDS.difference(payload.keys()))
     if missing:
-        raise LocalRunnerError(f'Missing required runner fields: {", ".join(missing)}.')
+        raise invalid_input(f'Missing required runner fields: {", ".join(missing)}.')
+
+    _require_string_field(payload, 'reference_image')
+    _require_string_field(payload, 'coarse_mesh')
+    _require_string_field(payload, 'output_dir')
+    _require_string_field(payload, 'output_format')
+    _require_string_field(payload, 'config_path')
+    _require_string_field(payload, 'ext_dir')
+    _require_string_field(payload, 'backend')
 
     return payload
 
@@ -92,17 +139,20 @@ def run_refine_job(
     preserve_scale: bool,
 ) -> dict[str, object]:
     if backend != 'local':
-        raise LocalRunnerError('UltraShape local runner is local-only in this MVP.')
+        raise invalid_input('UltraShape local runner is local-only in this MVP.')
     if output_format != 'glb':
-        raise LocalRunnerError('UltraShape local runner is glb-only in this MVP.')
+        raise invalid_input('UltraShape local runner is glb-only in this MVP.')
     if not isinstance(steps, int) or steps <= 0:
-        raise LocalRunnerError('steps must be a positive integer.')
+        raise invalid_input('steps must be a positive integer.')
     if not isinstance(guidance_scale, (int, float)) or guidance_scale <= 0:
-        raise LocalRunnerError('guidance_scale must be a positive number.')
+        raise invalid_input('guidance_scale must be a positive number.')
     if seed is not None and not isinstance(seed, int):
-        raise LocalRunnerError('seed must be an integer or null.')
+        raise invalid_input('seed must be an integer or null.')
     if not isinstance(preserve_scale, bool):
-        raise LocalRunnerError('preserve_scale must be a boolean.')
+        raise invalid_input('preserve_scale must be a boolean.')
+
+    _validate_reference_image(reference_image)
+    _validate_coarse_mesh(coarse_mesh)
 
     os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '1')
 

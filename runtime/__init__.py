@@ -1,1 +1,1 @@
-"""Runtime package root for the clean-room rewrite."""
+"""Runtime package root for the UltraShape dual-mode private closure."""

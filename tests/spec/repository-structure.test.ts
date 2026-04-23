@@ -10,8 +10,8 @@ function repoPath(...segments: string[]) {
   return path.join(repoRoot, ...segments);
 }
 
-describe('clean-room repository structure', () => {
-  it('keeps only the clean-room harness paths for now', () => {
+describe('runtime closure repository structure', () => {
+  it('keeps only the runtime closure harness paths', () => {
     expect(existsSync(repoPath('README.md'))).toBe(true);
     expect(existsSync(repoPath('package.json'))).toBe(true);
     expect(existsSync(repoPath('tsconfig.json'))).toBe(true);
@@ -40,23 +40,32 @@ describe('clean-room repository structure', () => {
     expect(manifestText).not.toContain('coarse_mesh');
   });
 
-  it('documents shell authority and current non-goals in the README', () => {
+  it('documents shell authority and the explicit dual-mode runtime without legacy cleanup language', () => {
     const readme = readFileSync(repoPath('README.md'), 'utf8');
+    const runtimeRoot = readFileSync(repoPath('runtime', '__init__.py'), 'utf8');
+    const vendoredRuntime = readFileSync(repoPath('runtime', 'vendor', 'ultrashape_runtime', '__init__.py'), 'utf8');
 
     expect(readme).toContain('The model shell is the sole public authority: `manifest.json`, `setup.py`, and `generator.py`.');
     expect(readme).toContain('`runtime/**` and `models/ultrashape/**` remain private implementation details.');
+    expect(readme).toContain('The private runtime is an explicit dual-mode UltraShape seam: real mode targets the closest achievable upstream closure when the exact environment is available, and portable mode is the reduced-environment fallback.');
     expect(readme).not.toContain('process-shell authority');
     expect(readme).not.toContain('temporary migration seam');
     expect(readme).not.toContain('temporary compatibility seam');
     expect(readme).not.toContain('later removal batch');
-    expect(readme).toContain('Batch 1 non-goals');
-    expect(readme).toContain('Do not recreate `src/`');
-    expect(readme).toContain('Do not restore fallback fixture bundles');
-    expect(readme).toContain('Do not restore patch-authority directories');
+    expect(readme).not.toContain('clean-room');
+    expect(readme).not.toContain('synthetic success');
+    expect(readme).not.toContain('fallback alias');
+    expect(readme).not.toContain('Batch 1 non-goals');
     expect(readme).not.toContain('- `processor.py`');
     expect(readme).not.toContain('reference_image');
     expect(readme).not.toContain('coarse_mesh');
     expect(readme).not.toContain('required_inputs: input.filePath');
     expect(readme).not.toContain('required_inputs: params.coarse_mesh');
+    expect(runtimeRoot).toContain('Runtime package root for the UltraShape dual-mode private closure.');
+    expect(runtimeRoot).not.toContain('clean-room');
+    expect(vendoredRuntime).toContain('UltraShape runtime package markers for the explicit dual-mode closure.');
+    expect(vendoredRuntime).toContain("RUNTIME_MODE_STRATEGY = 'explicit-dual-mode'");
+    expect(vendoredRuntime).toContain("UPSTREAM_CLOSURE_READY = False");
+    expect(vendoredRuntime).not.toContain('clean-room');
   });
 });

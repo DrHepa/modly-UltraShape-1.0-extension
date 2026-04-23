@@ -8,12 +8,8 @@ The model shell is the sole public authority: `manifest.json`, `setup.py`, and `
 
 `runtime/**` and `models/ultrashape/**` remain private implementation details.
 
-`setup.py` stages the vendored runtime closure into the install root and writes truthful readiness artifacts for the generator lifecycle. `ready` means the staged config, vendored runtime, required imports, and required checkpoint are all actually present. The shell does NOT claim synthetic success.
+The private runtime is an explicit dual-mode UltraShape seam: real mode targets the closest achievable upstream closure when the exact environment is available, and portable mode is the reduced-environment fallback.
 
-No legacy process entrypoint or fallback alias remains public.
+`setup.py` stages that private runtime into the install root and writes truthful readiness artifacts for the generator lifecycle, including whether real mode is unavailable, portable fallback is active, or the runtime is blocked. `ready` means the staged config, vendored runtime, required imports, and required checkpoint are all actually present.
 
-## Batch 1 non-goals
-
-- Do not recreate `src/`.
-- Do not restore fallback fixture bundles.
-- Do not restore patch-authority directories.
+The public shell exposes only the supported local refinement contract and keeps legacy processor-era paths out of authority.

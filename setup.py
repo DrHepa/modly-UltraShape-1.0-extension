@@ -71,9 +71,22 @@ CONFIG_RELATIVE = Path('runtime/configs/infer_dit_refine.yaml')
 VENDOR_RELATIVE = Path('runtime/vendor/ultrashape_runtime')
 READINESS_FILE = '.runtime-readiness.json'
 SUMMARY_FILE = '.setup-summary.json'
+REAL_MODE_ADAPTER = 'ultrashape_runtime.real_mode.run_real_refine_pipeline'
+REAL_MODE_REASON = (
+    'Authoritative real mode is optional and remains unavailable until the exact upstream '
+    'torch module graph adapter is vendored and the required runtime dependencies are present.'
+)
+PORTABLE_MODE_REASON = 'Portable fallback is active for reduced environments; it is not the authoritative upstream closure.'
 
 PACKAGE_STUBS = {
-    'torch': '__version__ = "0.0-test"\n',
+    'torch': (
+        'import json\n\n'
+        '__version__ = "0.0-test"\n\n'
+        'def load(path, map_location=None):\n'
+        '    del map_location\n'
+        '    with open(path, "r", encoding="utf8") as handle:\n'
+        '        return json.load(handle)\n'
+    ),
     'torchvision': '__version__ = "0.0-test"\n',
     'numpy': '__version__ = "0.0-test"\n',
     'trimesh': '__version__ = "0.0-test"\n',
@@ -85,6 +98,7 @@ PACKAGE_STUBS = {
     'einops': '__version__ = "0.0-test"\n',
     'transformers': '__version__ = "0.0-test"\n',
     'huggingface_hub': (
+        'import json\n'
         'import os\n'
         'from pathlib import Path\n\n'
         'class GatedRepoError(Exception):\n'
@@ -117,7 +131,15 @@ PACKAGE_STUBS = {
         '    target_dir = Path(local_dir) if local_dir else Path.cwd()\n'
         '    target_dir.mkdir(parents=True, exist_ok=True)\n'
         '    target_path = target_dir / filename\n'
-        '    target_path.write_text(os.environ.get("ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE", "stub-weight"), encoding="utf8")\n'
+        '    default_checkpoint = json.dumps({\n'
+        '        "vae": {"tensors": {"weights": [0.1, 0.2, 0.3, 0.4]}},\n'
+        '        "dit": {"tensors": {"weights": [0.5, 0.6, 0.7, 0.8]}},\n'
+        '        "conditioner": {"tensors": {"weights": [0.2, 0.4, 0.6, 0.8]}},\n'
+        '    })\n'
+        '    payload = os.environ.get("ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE", default_checkpoint)\n'
+        '    if payload == "stub-weight":\n'
+        '        payload = default_checkpoint\n'
+        '    target_path.write_text(payload, encoding="utf8")\n'
         '    return str(target_path)\n'
     ),
     'accelerate': '__version__ = "0.0-test"\n',
@@ -553,6 +575,107 @@ def run_import_smoke(venv_dir: Path, ext_dir: Path, modules: list[str]) -> list[
     return [item for item in payload if isinstance(item, str)]
 
 
+def run_runtime_import_smoke(venv_dir: Path, ext_dir: Path) -> dict[str, Any]:
+    script = [
+        'import importlib, json, sys, types',
+        f'sys.path.insert(0, {str((ext_dir / VENDOR_RELATIVE.parent).resolve())!r})',
+        'pipelines_stub = types.ModuleType("ultrashape_runtime.pipelines")',
+        'pipelines_stub.load_runtime_config = lambda path: {"config_path": path}',
+        'pipelines_stub.run_refine_pipeline = lambda **kwargs: {"file_path": "", "format": kwargs.get("output_format", "glb"), "backend": kwargs.get("backend", "local"), "metrics": {}, "fallbacks": [], "subtrees_loaded": []}',
+        'sys.modules["ultrashape_runtime.pipelines"] = pipelines_stub',
+        'try:',
+        '    importlib.import_module("ultrashape_runtime.local_runner")',
+        '    print(json.dumps({"ok": True, "target": "ultrashape_runtime.local_runner"}))',
+        'except Exception as error:',
+        '    print(json.dumps({"ok": False, "target": "ultrashape_runtime.local_runner", "error_class": error.__class__.__name__, "error_message": str(error)}))',
+        '    sys.exit(1)',
+    ]
+    result = subprocess.run(
+        [str(venv_python(venv_dir)), '-c', '\n'.join(script)],
+        capture_output=True,
+        text=True,
+        env=child_env(),
+        check=False,
+    )
+    try:
+        payload = json.loads(result.stdout or '{}')
+    except json.JSONDecodeError:
+        payload = {}
+
+    ok = bool(payload.get('ok')) and result.returncode == 0
+    return {
+        'target': 'ultrashape_runtime.local_runner',
+        'ok': ok,
+        'status': 'ready' if ok else 'blocked',
+        'error_class': payload.get('error_class') if isinstance(payload.get('error_class'), str) else None,
+        'failure_message': None if ok else (payload.get('error_message') if isinstance(payload.get('error_message'), str) else (result.stderr.strip() or result.stdout.strip())),
+    }
+
+
+def _missing_checkpoint_subtree_tokens(message: str) -> list[str]:
+    prefix = 'Required checkpoint subtrees are missing:'
+    if not message.startswith(prefix):
+        return []
+    raw_names = message[len(prefix):].strip().rstrip('.')
+    return [f'checkpoint-subtree:{name.strip()}' for name in raw_names.split(',') if name.strip()]
+
+
+def run_checkpoint_smoke(venv_dir: Path, ext_dir: Path, checkpoint_path: Path) -> dict[str, Any]:
+    if not checkpoint_path.is_file():
+        return {
+            'ok': False,
+            'status': 'blocked',
+            'required_subtrees': ['vae', 'dit', 'conditioner'],
+            'missing_required': [f'weight:{CHECKPOINT_RELATIVE.as_posix()}'],
+            'failure_message': f'Required checkpoint is not readable: {checkpoint_path}.',
+        }
+
+    script = [
+        'import json, sys',
+        f'sys.path.insert(0, {str((ext_dir / VENDOR_RELATIVE.parent).resolve())!r})',
+        'from ultrashape_runtime.utils.checkpoint import load_checkpoint_subtrees, expected_checkpoint_subtrees',
+        f'checkpoint = {str(checkpoint_path)!r}',
+        f'ext_dir = {str(ext_dir)!r}',
+        'required = list(expected_checkpoint_subtrees())',
+        'try:',
+        '    bundle = load_checkpoint_subtrees(checkpoint, None, ext_dir, required)',
+        '    print(json.dumps({"ok": True, "required_subtrees": required, "subtrees_loaded": bundle.get("subtrees_loaded", []), "summary": bundle.get("summary", {})}))',
+        'except Exception as error:',
+        '    print(json.dumps({"ok": False, "required_subtrees": required, "error_class": error.__class__.__name__, "error_code": getattr(error, "code", None), "error_message": str(error)}))',
+        '    sys.exit(1)',
+    ]
+    result = subprocess.run(
+        [str(venv_python(venv_dir)), '-c', '\n'.join(script)],
+        capture_output=True,
+        text=True,
+        env=child_env(),
+        check=False,
+    )
+    try:
+        payload = json.loads(result.stdout or '{}')
+    except json.JSONDecodeError:
+        payload = {}
+
+    ok = bool(payload.get('ok')) and result.returncode == 0
+    required_subtrees = payload.get('required_subtrees') if isinstance(payload.get('required_subtrees'), list) else ['vae', 'dit', 'conditioner']
+    failure_message = payload.get('error_message') if isinstance(payload.get('error_message'), str) else (result.stderr.strip() or result.stdout.strip())
+    missing_required = [] if ok else _missing_checkpoint_subtree_tokens(failure_message)
+    if not ok and not missing_required:
+        missing_required = [f'weight:{CHECKPOINT_RELATIVE.as_posix()}']
+
+    return {
+        'ok': ok,
+        'status': 'ready' if ok else 'blocked',
+        'required_subtrees': [item for item in required_subtrees if isinstance(item, str)],
+        'subtrees_loaded': payload.get('subtrees_loaded') if isinstance(payload.get('subtrees_loaded'), list) else [],
+        'summary': payload.get('summary') if isinstance(payload.get('summary'), dict) else {},
+        'error_class': payload.get('error_class') if isinstance(payload.get('error_class'), str) else None,
+        'error_code': payload.get('error_code') if isinstance(payload.get('error_code'), str) else None,
+        'failure_message': None if ok else failure_message,
+        'missing_required': missing_required,
+    }
+
+
 def build_weight_source_descriptor(kind: str, source: Path | str) -> dict[str, Any]:
     source_value = str(Path(source).resolve()) if kind in {'ext-dir', 'required_weight_path', 'env-local', 'repo-local'} else str(source)
     return {'kind': kind, 'source': source_value}
@@ -714,6 +837,8 @@ def build_summary_and_readiness(
     dependency_install: dict[str, Any],
     native_install: dict[str, Any],
     weight_result: dict[str, Any],
+    runtime_import_smoke: dict[str, Any],
+    checkpoint_smoke: dict[str, Any],
     required_import_failures: list[str],
     conditional_import_failures: list[str],
     degradable_import_failures: list[str],
@@ -727,6 +852,13 @@ def build_summary_and_readiness(
     missing_required.extend(f'import:{name}' for name in required_import_failures)
     if not weight_result.get('acquired'):
         missing_required.append(f'weight:{CHECKPOINT_RELATIVE.as_posix()}')
+    if not runtime_import_smoke.get('ok'):
+        missing_required.append(f'runtime-import:{runtime_import_smoke.get("target", "ultrashape_runtime.local_runner")}')
+    missing_required.extend(
+        item
+        for item in checkpoint_smoke.get('missing_required', [])
+        if isinstance(item, str) and item not in missing_required
+    )
 
     cubvh_state = native_install.get('cubvh') if isinstance(native_install.get('cubvh'), dict) else {}
     if cubvh_state.get('status') == 'blocked':
@@ -736,9 +868,17 @@ def build_summary_and_readiness(
     missing_degradable = [f'import:{name}' for name in degradable_import_failures]
     missing_optional = [*missing_conditional, *missing_degradable]
 
-    required_imports_ok = config_ready and vendor_ready and not required_import_failures and cubvh_state.get('status') != 'blocked'
-    weights_ready = checkpoint_path.is_file() and bool(weight_result.get('acquired'))
-    runtime_ready = required_imports_ok and weights_ready
+    required_imports_ok = (
+        config_ready
+        and vendor_ready
+        and bool(runtime_import_smoke.get('ok'))
+        and not required_import_failures
+        and cubvh_state.get('status') != 'blocked'
+    )
+    weights_ready = checkpoint_path.is_file() and bool(weight_result.get('acquired')) and bool(checkpoint_smoke.get('ok'))
+    runtime_closure_ready = config_ready and vendor_ready and bool(runtime_import_smoke.get('ok'))
+    runtime_ready = required_imports_ok and weights_ready and runtime_closure_ready
+    runtime_modes = build_runtime_modes(portable_available=required_imports_ok and runtime_closure_ready)
 
     status = 'blocked'
     if runtime_ready and missing_optional:
@@ -765,11 +905,18 @@ def build_summary_and_readiness(
         'native_install': native_install,
         'pip_bootstrap': pip_bootstrap,
         'python_exe': args.python_exe,
-        'required_checkpoint_subtrees': ['vae', 'dit', 'conditioner'],
+        'required_checkpoint_subtrees': checkpoint_smoke.get('required_subtrees', ['vae', 'dit', 'conditioner']),
         'required_imports_ok': required_imports_ok,
+        'runtime_closure_import': runtime_import_smoke,
         'runtime_ready': runtime_ready,
-        'runtime_closure_ready': config_ready and vendor_ready,
-        'runtime_closure_reason': 'The clean-room vendored closure is staged for local refinement.' if config_ready and vendor_ready else None,
+        'runtime_closure_ready': runtime_closure_ready,
+        'runtime_closure_reason': (
+            'The vendored dual-mode runtime seam is staged and importable for local refinement.'
+            if runtime_closure_ready
+            else runtime_import_smoke.get('failure_message')
+        ),
+        'runtime_modes': runtime_modes,
+        'checkpoint_smoke': checkpoint_smoke,
         'status': status,
         'vendor_path': str(ext_dir / VENDOR_RELATIVE),
         'vendor_ready': vendor_ready,
@@ -783,6 +930,26 @@ def build_summary_and_readiness(
     summary['dependency_install'] = dependency_install
     summary['native_install'] = native_install
     return readiness, summary
+
+
+def build_runtime_modes(*, portable_available: bool) -> dict[str, Any]:
+    selection = 'portable-only' if portable_available else 'blocked'
+    return {
+        'selection': selection,
+        'requested': 'auto',
+        'active': 'portable' if portable_available else None,
+        'real': {
+            'available': False,
+            'adapter': REAL_MODE_ADAPTER,
+            'reason': REAL_MODE_REASON,
+            'blockers': ['adapter:authoritative-upstream-module-graph'],
+        },
+        'portable': {
+            'available': portable_available,
+            'authoritative': False,
+            'reason': PORTABLE_MODE_REASON if portable_available else 'Portable fallback is blocked because required runtime prerequisites are missing.',
+        },
+    }
 
 
 def build_weight_diagnostics(weight_result: dict[str, Any]) -> dict[str, Any]:
@@ -801,6 +968,16 @@ def build_weight_diagnostics(weight_result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def skipped_stage(name: str, reason: str) -> dict[str, Any]:
+    return {
+        'mode': 'skipped',
+        'stage': name,
+        'commands': [],
+        'installed_modules': [],
+        'reason': reason,
+    }
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf8')
 
@@ -813,11 +990,13 @@ def main() -> int:
 
     config_ready, vendor_ready = stage_runtime_assets(ext_dir)
     venv_dir = ensure_venv(ext_dir)
-    pip_bootstrap = bootstrap_packaging_tools(venv_dir)
-    dependency_install = install_core_dependencies(venv_dir)
+    runtime_import_smoke = run_runtime_import_smoke(venv_dir, ext_dir)
 
     cubvh_prerequisites = detect_cubvh_prerequisites(host_facts)
     if not cubvh_prerequisites['ok']:
+        blocked_reason = 'Skipped because cubvh prerequisites are already blocked.'
+        pip_bootstrap = skipped_stage('pip_bootstrap', blocked_reason)
+        dependency_install = skipped_stage('dependency_install', blocked_reason)
         native_install = {
             'cubvh': {
                 'attempted': False,
@@ -853,6 +1032,8 @@ def main() -> int:
                 'attempted_sources': [],
                 'weight_source_filename': WEIGHT_FILENAME,
             },
+            runtime_import_smoke=runtime_import_smoke,
+            checkpoint_smoke=run_checkpoint_smoke(venv_dir, ext_dir, ext_dir / CHECKPOINT_RELATIVE),
             required_import_failures=['cubvh'],
             conditional_import_failures=[],
             degradable_import_failures=[],
@@ -863,6 +1044,8 @@ def main() -> int:
         sys.stdout.write('\n')
         return 1
 
+    pip_bootstrap = bootstrap_packaging_tools(venv_dir)
+    dependency_install = install_core_dependencies(venv_dir)
     cubvh_stage, cubvh_missing = install_cubvh_stage(venv_dir, ext_dir)
     flash_attn_stage, flash_attn_missing = install_flash_attn_stage(venv_dir, ext_dir, host_facts)
     native_install = {
@@ -871,6 +1054,7 @@ def main() -> int:
     }
 
     weight_result = acquire_required_weight(ext_dir, args.payload, venv_dir)
+    checkpoint_smoke = run_checkpoint_smoke(venv_dir, ext_dir, ext_dir / CHECKPOINT_RELATIVE)
     required_import_failures = run_import_smoke(venv_dir, ext_dir, REQUIRED_IMPORTS)
     conditional_import_failures = run_import_smoke(venv_dir, ext_dir, CONDITIONAL_IMPORTS)
     degradable_import_failures = sorted(set(run_import_smoke(venv_dir, ext_dir, DEGRADABLE_IMPORTS) + flash_attn_missing))
@@ -889,6 +1073,8 @@ def main() -> int:
         dependency_install=dependency_install,
         native_install=native_install,
         weight_result=weight_result,
+        runtime_import_smoke=runtime_import_smoke,
+        checkpoint_smoke=checkpoint_smoke,
         required_import_failures=sorted(set(required_import_failures)),
         conditional_import_failures=conditional_import_failures,
         degradable_import_failures=degradable_import_failures,
