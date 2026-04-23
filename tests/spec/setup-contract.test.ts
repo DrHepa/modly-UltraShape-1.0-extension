@@ -63,6 +63,19 @@ function readSetupSummary(extDir: string) {
 const FLASH_ATTN_SKIP_MESSAGE =
   'flash_attn stage skipped on Linux ARM64 host; continuing with degraded PyTorch SDPA fallback.';
 
+function createFakeUpstreamCheckout(root: string) {
+  const checkout = path.join(root, 'fake-ultrashape-checkout');
+  mkdirSync(path.join(checkout, 'scripts'), { recursive: true });
+  mkdirSync(path.join(checkout, 'configs'), { recursive: true });
+  mkdirSync(path.join(checkout, 'ultrashape'), { recursive: true });
+  writeFileSync(path.join(checkout, 'LICENSE'), 'Fake UltraShape checkout for setup readiness contract tests.\n', 'utf8');
+  writeFileSync(path.join(checkout, 'scripts', '__init__.py'), '', 'utf8');
+  writeFileSync(path.join(checkout, 'scripts', 'infer_dit_refine.py'), 'def run_inference(args):\n    return None\n', 'utf8');
+  writeFileSync(path.join(checkout, 'configs', 'infer_dit_refine.yaml'), 'runtime:\n  fake: true\n', 'utf8');
+  writeFileSync(path.join(checkout, 'ultrashape', '__init__.py'), '', 'utf8');
+  return checkout;
+}
+
 describe('setup.py install truth', () => {
   it('creates a venv, installs dependencies, acquires weights, and stays honest when payload host facts are absent', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-contract-'));
@@ -122,6 +135,11 @@ describe('setup.py install truth', () => {
       });
       expect(readiness.missing_required).toEqual([]);
       expect(readiness.missing_optional).toEqual(['import:flash_attn']);
+      expect(readiness.runtime_modes?.selection).toBe('portable-only');
+      expect(readiness.runtime_modes?.real).toMatchObject({
+        available: false,
+        blockers: expect.arrayContaining(['dependency:flash_attn']),
+      });
       expect(JSON.stringify(readiness.runtime_modes ?? {})).toContain('Portable fallback');
       expect(existsSync(path.join(checkout, 'venv', 'bin', 'python'))).toBe(true);
       expect(existsSync(path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'))).toBe(true);
@@ -165,6 +183,64 @@ describe('setup.py install truth', () => {
       expect(readSetupSummary(checkout)).not.toContain('params.coarse_mesh');
       expect(readSetupSummary(checkout)).toContain(FLASH_ATTN_SKIP_MESSAGE);
       expect(readSetupSummary(checkout).toLowerCase()).not.toContain('hunyuan');
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('reports real-available when explicit checkout, flash_attn, config, checkpoint, and smoke imports are ready', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-real-available-'));
+    const checkout = path.join(sandbox, 'repo');
+    const upstreamCheckout = createFakeUpstreamCheckout(sandbox);
+    copyInstallSurface(checkout);
+
+    try {
+      const result = runSetup(checkout, {
+        extDir: checkout,
+        pythonExe: '/opt/modly/python/bin/python3',
+        payload: { ultrashape_checkout_path: upstreamCheckout },
+        env: {
+          ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+          ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+          ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'stub-weight',
+          ULTRASHAPE_SETUP_TEST_FORCE_FLASH_ATTN_READY: '1',
+        },
+      });
+
+      expect(result.status).toBe(0);
+
+      const readiness = readReadiness(checkout);
+      const summary = JSON.parse(readSetupSummary(checkout)) as Readiness;
+      expect(readiness).toMatchObject({
+        install_success: true,
+        install_ready: true,
+        status: 'ready',
+        runtime_modes: {
+          selection: 'real-available',
+          requested: 'auto',
+          active: 'real',
+          real: {
+            available: true,
+            source: 'checkout',
+            checkout_path: upstreamCheckout,
+            entrypoint: 'scripts.infer_dit_refine.run_inference',
+            blockers: [],
+            config: { available: true },
+            checkpoint: { available: true },
+            dependencies: {
+              flash_attn: { available: true, required: true },
+            },
+          },
+          portable: {
+            available: true,
+            authoritative: false,
+          },
+        },
+      });
+      expect(readiness.missing_optional).toEqual([]);
+      expect(summary.runtime_modes).toMatchObject(readiness.runtime_modes ?? {});
+      expect(JSON.stringify(summary.runtime_modes ?? {})).toContain('torch_cuda_profile');
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }

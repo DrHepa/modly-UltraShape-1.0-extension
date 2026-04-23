@@ -200,6 +200,72 @@ function createRuntimeFixture() {
   return { sandbox, stubRoot, extDir, imageInputPath, meshInputPath, checkpoint };
 }
 
+function createFakeUpstreamCheckout(
+  root: string,
+  options: { writesOutput?: boolean; checkoutName?: string; checkoutMarker?: string } = {},
+) {
+  const checkout = path.join(root, options.checkoutName ?? 'fake-ultrashape-checkout');
+  const scriptsDir = path.join(checkout, 'scripts');
+  const configsDir = path.join(checkout, 'configs');
+  const packageDir = path.join(checkout, 'ultrashape');
+  mkdirSync(scriptsDir, { recursive: true });
+  mkdirSync(configsDir, { recursive: true });
+  mkdirSync(packageDir, { recursive: true });
+  writeFileSync(path.join(checkout, 'LICENSE'), 'Fake UltraShape checkout for contract tests.\n', 'utf8');
+  writeFileSync(path.join(scriptsDir, '__init__.py'), '', 'utf8');
+  writeFileSync(path.join(packageDir, '__init__.py'), `CHECKOUT_MARKER = ${JSON.stringify(options.checkoutMarker ?? 'default')}\n`, 'utf8');
+  writeFileSync(
+    path.join(configsDir, 'infer_dit_refine.yaml'),
+    'model:\n  params:\n    upstream_schema_marker: fake-ultrashape-checkout\n',
+    'utf8',
+  );
+  writeFileSync(
+    path.join(scriptsDir, 'infer_dit_refine.py'),
+    [
+      'import json',
+      'from pathlib import Path',
+      'from ultrashape import CHECKOUT_MARKER',
+      'def run_inference(args):',
+      '    expected_config = Path(__file__).resolve().parents[1] / "configs" / "infer_dit_refine.yaml"',
+      '    if Path(args.config).resolve() != expected_config.resolve():',
+      '        raise AssertionError(f"upstream args.config must point at checkout config, got {args.config}")',
+      '    config_text = expected_config.read_text(encoding="utf8")',
+      '    if "upstream_schema_marker" not in config_text:',
+      '        raise AssertionError("upstream config fixture must expose an upstream-compatible schema marker")',
+      '    record = Path(args.output_dir) / "entrypoint-called.json"',
+      '    required = {',
+      '        "image": args.image,',
+      '        "mesh": args.mesh,',
+      '        "ckpt": args.ckpt,',
+      '        "config": args.config,',
+      '        "output_dir": args.output_dir,',
+      '        "steps": args.steps,',
+      '        "scale": args.scale,',
+      '        "num_latents": args.num_latents,',
+      '        "chunk_size": args.chunk_size,',
+      '        "octree_res": args.octree_res,',
+      '        "seed": args.seed,',
+      '        "remove_bg": args.remove_bg,',
+      '        "low_vram": args.low_vram,',
+      '        "checkout_marker": CHECKOUT_MARKER,',
+      '    }',
+      '    record.write_text(json.dumps(required, sort_keys=True), encoding="utf8")',
+      options.writesOutput === false
+        ? '    return {"ok": True, "output_written": False}'
+        : '    (Path(args.output_dir) / f"{Path(args.image).stem}_refined.glb").write_bytes(record.read_bytes())',
+      '    return {"ok": True, "output_written": True}',
+    ].join('\n'),
+    'utf8',
+  );
+
+  return checkout;
+}
+
+function writeRealDependencyStubs(root: string) {
+  mkdirSync(path.join(root, 'flash_attn'), { recursive: true });
+  writeFileSync(path.join(root, 'flash_attn', '__init__.py'), '__version__ = "0.0-test"\n', 'utf8');
+}
+
 function runPythonSnippet(source: string, args: string[] = []) {
   return spawnSync('python3', ['-c', source, ...args], {
     cwd: repoRoot,
@@ -211,13 +277,14 @@ function runPythonSnippet(source: string, args: string[] = []) {
   });
 }
 
-function runLocalRunner(job: Record<string, unknown>, stubRoot: string) {
+function runLocalRunner(job: Record<string, unknown>, stubRoot: string, env: NodeJS.ProcessEnv = {}) {
   return spawnSync('python3', ['-m', 'ultrashape_runtime.local_runner'], {
     cwd: repoRoot,
     encoding: 'utf8',
     input: JSON.stringify(job),
     env: {
       ...process.env,
+      ...env,
       PYTHONPATH: [stubRoot, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
     },
   });
@@ -733,9 +800,412 @@ describe('private runtime flow behind the model shell', () => {
       expect(JSON.parse(result.stdout)).toEqual({
         ok: false,
         error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
-        error_message:
-          'Real runtime mode requested but unavailable: authoritative upstream torch module graph adapter is not vendored yet.',
+        error_message: 'Real runtime mode requested but unavailable: checkout-config:ultrashape_upstream_checkout.',
       });
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts only explicitly configured upstream checkouts with required real-mode markers', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-real-checkout-'));
+    const checkout = createFakeUpstreamCheckout(sandbox);
+    const driftedCheckout = path.join(sandbox, 'drifted-checkout');
+    mkdirSync(driftedCheckout, { recursive: true });
+    writeFileSync(path.join(driftedCheckout, 'LICENSE'), 'not enough markers\n', 'utf8');
+
+    try {
+      const result = runPythonSnippet(
+        [
+          'import json, sys',
+          'from ultrashape_runtime.real_mode import describe_real_mode, validate_upstream_checkout',
+          'valid = validate_upstream_checkout(sys.argv[1])',
+          'missing = describe_real_mode(checkout_path=sys.argv[2])',
+          'print(json.dumps({"valid": valid, "missing": missing}))',
+        ].join('\n'),
+        [checkout, driftedCheckout],
+      );
+
+      expect(result.status).toBe(0);
+      const payload = JSON.parse(result.stdout) as {
+        valid: { available: boolean; source: string; entrypoint: string; blockers: string[]; checkout_path: string };
+        missing: { available: boolean; blockers: string[] };
+      };
+      expect(payload.valid).toMatchObject({
+        available: true,
+        source: 'checkout',
+        checkout_path: checkout,
+        entrypoint: 'scripts.infer_dit_refine.run_inference',
+        blockers: [],
+      });
+      expect(payload.missing.available).toBe(false);
+      expect(payload.missing.blockers).toContain('checkout-marker:scripts/infer_dit_refine.py');
+      expect(payload.missing.blockers).toContain('checkout-marker:configs/infer_dit_refine.yaml');
+      expect(payload.missing.blockers).toContain('checkout-marker:ultrashape');
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('invokes a configured upstream-like real entrypoint and normalizes output_dir/refined.glb', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox);
+    const upstreamConfigPath = path.join(checkout, 'configs', 'infer_dit_refine.yaml');
+    writeRealDependencyStubs(fixture.stubRoot);
+    const outputDir = path.join(fixture.sandbox, 'output-real-success');
+
+    try {
+      const result = spawnSync('python3', ['-m', 'ultrashape_runtime.local_runner'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        input: JSON.stringify({
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: outputDir,
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        }),
+        env: {
+          ...process.env,
+          ULTRASHAPE_RUNTIME_MODE: 'real',
+          ULTRASHAPE_UPSTREAM_CHECKOUT: checkout,
+          PYTHONPATH: [fixture.stubRoot, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+        },
+      });
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(readFileSync(path.join(outputDir, 'refined.glb'), 'utf8'))).toMatchObject({
+        image: fixture.imageInputPath,
+        mesh: fixture.meshInputPath,
+        ckpt: fixture.checkpoint,
+        config: upstreamConfigPath,
+        steps: 4,
+        scale: 0.99,
+        num_latents: 32768,
+        chunk_size: 8000,
+        octree_res: 1024,
+        seed: 7,
+        remove_bg: false,
+        low_vram: false,
+        checkout_marker: 'default',
+      });
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: true,
+        result: {
+          backend: 'local',
+          format: 'glb',
+          file_path: path.join(outputDir, 'refined.glb'),
+          metrics: {
+            runtime_mode: {
+              selection: 'real-available',
+              requested: 'real',
+              active: 'real',
+              real: {
+                available: true,
+                source: 'checkout',
+                checkout_path: checkout,
+                entrypoint: 'scripts.infer_dit_refine.run_inference',
+                runtime_config: { path: configPath, available: true },
+                upstream_config: { path: upstreamConfigPath, available: true },
+              },
+            },
+            upstream: {
+              output_name: 'reference_refined.glb',
+            },
+          },
+          subtrees_loaded: ['upstream-real'],
+        },
+      });
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('restores checkout-loaded scripts and ultrashape modules between real executions', () => {
+    const fixture = createRuntimeFixture();
+    const firstCheckout = createFakeUpstreamCheckout(fixture.sandbox, {
+      checkoutName: 'fake-ultrashape-checkout-one',
+      checkoutMarker: 'first-checkout',
+    });
+    const secondCheckout = createFakeUpstreamCheckout(fixture.sandbox, {
+      checkoutName: 'fake-ultrashape-checkout-two',
+      checkoutMarker: 'second-checkout',
+    });
+    writeRealDependencyStubs(fixture.stubRoot);
+    const firstOutput = path.join(fixture.sandbox, 'output-real-first');
+    const secondOutput = path.join(fixture.sandbox, 'output-real-second');
+
+    try {
+      const result = spawnSync(
+        'python3',
+        [
+          '-c',
+          [
+            'import json, os, sys',
+            'from pathlib import Path',
+            'from ultrashape_runtime.real_mode import run_real_refine_pipeline',
+            'def run_once(checkout, output_dir):',
+            '    os.environ["ULTRASHAPE_UPSTREAM_CHECKOUT"] = checkout',
+            '    run_real_refine_pipeline(',
+            '        reference_image=sys.argv[5],',
+            '        coarse_mesh=sys.argv[6],',
+            '        output_dir=output_dir,',
+            '        output_format="glb",',
+            '        checkpoint=sys.argv[3],',
+            '        config_path=sys.argv[4],',
+            '        ext_dir="unused",',
+            '        backend="local",',
+            '        steps=4,',
+            '        guidance_scale=6,',
+            '        seed=7,',
+            '        preserve_scale=True,',
+            '    )',
+            'run_once(sys.argv[1], sys.argv[7])',
+            'run_once(sys.argv[2], sys.argv[8])',
+            'print(json.dumps({',
+            '    "first": json.loads((Path(sys.argv[7]) / "refined.glb").read_text(encoding="utf8"))["checkout_marker"],',
+            '    "second": json.loads((Path(sys.argv[8]) / "refined.glb").read_text(encoding="utf8"))["checkout_marker"],',
+            '    "checkout_modules": sorted(name for name in sys.modules if name == "scripts" or name.startswith("scripts.") or name == "ultrashape" or name.startswith("ultrashape.")),',
+            '}))',
+          ].join('\n'),
+          firstCheckout,
+          secondCheckout,
+          fixture.checkpoint,
+          configPath,
+          fixture.imageInputPath,
+          fixture.meshInputPath,
+          firstOutput,
+          secondOutput,
+        ],
+        {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PYTHONPATH: [fixture.stubRoot, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+          },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        first: 'first-checkout',
+        second: 'second-checkout',
+        checkout_modules: [],
+      });
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('fails forced real honestly when the upstream entrypoint does not produce the expected refined mesh', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox, { writesOutput: false });
+    writeRealDependencyStubs(fixture.stubRoot);
+
+    try {
+      const result = spawnSync('python3', ['-m', 'ultrashape_runtime.local_runner'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        input: JSON.stringify({
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: path.join(fixture.sandbox, 'output-real-missing'),
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        }),
+        env: {
+          ...process.env,
+          ULTRASHAPE_RUNTIME_MODE: 'real',
+          ULTRASHAPE_UPSTREAM_CHECKOUT: checkout,
+          PYTHONPATH: [fixture.stubRoot, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+        },
+      });
+
+      expect(result.status).toBe(1);
+      expect(JSON.parse(result.stdout)).toEqual({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        error_message: 'Upstream real mode did not produce expected refined output: reference_refined.glb.',
+      });
+      expect(existsSync(path.join(fixture.sandbox, 'output-real-missing', 'refined.glb'))).toBe(false);
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('selects authoritative real mode in auto only when checkout and real-only dependencies are ready', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox);
+    const upstreamConfigPath = path.join(checkout, 'configs', 'infer_dit_refine.yaml');
+    writeRealDependencyStubs(fixture.stubRoot);
+    const outputDir = path.join(fixture.sandbox, 'output-auto-real');
+
+    try {
+      const result = runLocalRunner(
+        {
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: outputDir,
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        },
+        fixture.stubRoot,
+        { ULTRASHAPE_UPSTREAM_CHECKOUT: checkout },
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(readFileSync(path.join(outputDir, 'refined.glb'), 'utf8'))).toMatchObject({
+        ckpt: fixture.checkpoint,
+        config: upstreamConfigPath,
+        checkout_marker: 'default',
+      });
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: true,
+        result: {
+          metrics: {
+            runtime_mode: {
+              selection: 'real-available',
+              requested: 'auto',
+              active: 'real',
+              real: {
+                available: true,
+                dependencies: {
+                  flash_attn: { available: true, required: true },
+                },
+              },
+            },
+          },
+        },
+      });
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to portable in auto when real is blocked by real-only dependencies', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox);
+    const outputDir = path.join(fixture.sandbox, 'output-auto-portable');
+
+    try {
+      const result = runLocalRunner(
+        {
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: outputDir,
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        },
+        fixture.stubRoot,
+        { ULTRASHAPE_UPSTREAM_CHECKOUT: checkout },
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: true,
+        result: {
+          metrics: {
+            runtime_mode: {
+              selection: 'portable-only',
+              requested: 'auto',
+              active: 'portable',
+              real: {
+                available: false,
+                blockers: expect.arrayContaining(['dependency:flash_attn']),
+              },
+              portable: {
+                available: true,
+                authoritative: false,
+              },
+            },
+          },
+          fallbacks: ['flash_attn->sdpa'],
+        },
+      });
+      expect(readFileSync(path.join(outputDir, 'refined.glb')).subarray(0, 4).toString('ascii')).toBe('glTF');
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('bypasses ready real mode when portable is forced and keeps portable non-authoritative', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox);
+    writeRealDependencyStubs(fixture.stubRoot);
+    const outputDir = path.join(fixture.sandbox, 'output-forced-portable');
+
+    try {
+      const result = runLocalRunner(
+        {
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: outputDir,
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        },
+        fixture.stubRoot,
+        { ULTRASHAPE_RUNTIME_MODE: 'portable', ULTRASHAPE_UPSTREAM_CHECKOUT: checkout },
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: true,
+        result: {
+          metrics: {
+            runtime_mode: {
+              selection: 'portable-only',
+              requested: 'portable',
+              active: 'portable',
+              real: {
+                available: false,
+                reason: expect.stringContaining('bypassed because portable mode was forced'),
+              },
+              portable: {
+                available: true,
+                authoritative: false,
+                reason: expect.stringContaining('not the authoritative upstream closure'),
+              },
+            },
+          },
+        },
+      });
+      expect(readFileSync(path.join(outputDir, 'refined.glb')).subarray(0, 4).toString('ascii')).toBe('glTF');
     } finally {
       rmSync(fixture.sandbox, { recursive: true, force: true });
     }

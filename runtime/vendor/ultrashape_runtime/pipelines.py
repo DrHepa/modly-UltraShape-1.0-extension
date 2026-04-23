@@ -13,7 +13,7 @@ from .models.autoencoders.volume_decoders import decode_volume
 from .models.conditioner_mask import SingleImageEncoder
 from .models.denoisers.dit_mask import RefineDiT
 from .preprocessors import ImageProcessorV2
-from .real_mode import REAL_MODE_ADAPTER, describe_real_mode, run_real_refine_pipeline
+from .real_mode import REAL_MODE_ADAPTER, describe_real_readiness, run_real_refine_pipeline
 from .schedulers import build_flow_matching_schedule
 from .surface_loaders import SharpEdgeSurfaceLoader
 from .utils.checkpoint import apply_checkpoint_state, load_checkpoint_subtrees
@@ -44,9 +44,20 @@ def _requested_runtime_mode() -> str:
     return candidate if candidate in {'auto', 'real', 'portable'} else 'auto'
 
 
-def resolve_runtime_mode() -> dict[str, object]:
+def resolve_runtime_mode(*, checkpoint: str | None = None, config_path: str | None = None, upstream_config_path: str | None = None) -> dict[str, object]:
     requested = _requested_runtime_mode()
-    real = describe_real_mode()
+    real = describe_real_readiness(
+        checkpoint=checkpoint,
+        runtime_config_path=config_path,
+        upstream_config_path=upstream_config_path,
+    ) if requested in {'auto', 'real'} else {
+        'available': False,
+        'adapter': REAL_MODE_ADAPTER,
+        'source': None,
+        'entrypoint': 'scripts.infer_dit_refine.run_inference',
+        'blockers': [],
+        'reason': 'Real readiness was bypassed because portable mode was forced.',
+    }
     portable = {
         'available': True,
         'authoritative': False,
@@ -61,6 +72,8 @@ def resolve_runtime_mode() -> dict[str, object]:
         active = 'real' if bool(real.get('available')) else 'portable'
 
     selection = 'real-available' if active == 'real' else 'portable-only'
+    if active is None:
+        selection = 'blocked'
     return {
         'selection': selection,
         'requested': requested,
@@ -746,11 +759,12 @@ def run_refine_pipeline(
     guidance_scale: float,
     seed: int | None,
     preserve_scale: bool,
+    upstream_config_path: str | None = None,
 ) -> dict[str, object]:
     config = load_runtime_config(config_path)
     require_imports(config)
     _, extraction = validate_mvp_scope(config, backend, output_format)
-    runtime_mode = resolve_runtime_mode()
+    runtime_mode = resolve_runtime_mode(checkpoint=checkpoint, config_path=config_path, upstream_config_path=upstream_config_path)
 
     if runtime_mode.get('active') == 'real':
         return run_real_refine_pipeline(
@@ -760,6 +774,7 @@ def run_refine_pipeline(
             output_format=output_format,
             checkpoint=checkpoint,
             config_path=config_path,
+            upstream_config_path=upstream_config_path,
             ext_dir=ext_dir,
             backend=backend,
             steps=steps,
@@ -775,6 +790,7 @@ def run_refine_pipeline(
             output_format=output_format,
             checkpoint=checkpoint,
             config_path=config_path,
+            upstream_config_path=upstream_config_path,
             ext_dir=ext_dir,
             backend=backend,
             steps=steps,

@@ -72,9 +72,16 @@ VENDOR_RELATIVE = Path('runtime/vendor/ultrashape_runtime')
 READINESS_FILE = '.runtime-readiness.json'
 SUMMARY_FILE = '.setup-summary.json'
 REAL_MODE_ADAPTER = 'ultrashape_runtime.real_mode.run_real_refine_pipeline'
+REAL_MODE_ENTRYPOINT = 'scripts.infer_dit_refine.run_inference'
+UPSTREAM_CONFIG_ENV = 'ULTRASHAPE_UPSTREAM_CONFIG'
+REQUIRED_CHECKOUT_MARKERS = (
+    ('scripts/infer_dit_refine.py', 'file'),
+    ('configs/infer_dit_refine.yaml', 'file'),
+    ('ultrashape', 'dir'),
+)
+LICENSE_MARKERS = ('LICENSE', 'LICENSE.txt', 'NOTICE', 'Notice.txt')
 REAL_MODE_REASON = (
-    'Authoritative real mode is optional and remains unavailable until the exact upstream '
-    'torch module graph adapter is vendored and the required runtime dependencies are present.'
+    'Authoritative real mode requires an explicit validated upstream UltraShape checkout and real-only dependencies.'
 )
 PORTABLE_MODE_REASON = 'Portable fallback is active for reduced environments; it is not the authoritative upstream closure.'
 
@@ -494,7 +501,8 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: Path) -> tuple[dict[str, Any], 
 
 
 def install_flash_attn_stage(venv_dir: Path, ext_dir: Path, host_facts: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    if is_linux_arm64_host(host_facts):
+    force_ready = os.environ.get('ULTRASHAPE_SETUP_TEST_FORCE_FLASH_ATTN_READY') == '1'
+    if is_linux_arm64_host(host_facts) and not force_ready:
         missing = ['flash_attn']
         message = 'flash_attn stage skipped on Linux ARM64 host; continuing with degraded PyTorch SDPA fallback.'
         return (
@@ -673,6 +681,107 @@ def run_checkpoint_smoke(venv_dir: Path, ext_dir: Path, checkpoint_path: Path) -
         'error_code': payload.get('error_code') if isinstance(payload.get('error_code'), str) else None,
         'failure_message': None if ok else failure_message,
         'missing_required': missing_required,
+    }
+
+
+def configured_upstream_checkout(payload: dict[str, Any]) -> Path | None:
+    raw = payload.get('ultrashape_checkout_path') or os.environ.get('ULTRASHAPE_UPSTREAM_CHECKOUT')
+    if isinstance(raw, str) and raw.strip():
+        return Path(raw.strip()).expanduser().resolve()
+    return None
+
+
+def configured_upstream_config(payload: dict[str, Any], checkout: Path | None) -> Path | None:
+    raw = payload.get('ultrashape_upstream_config_path') or os.environ.get(UPSTREAM_CONFIG_ENV)
+    if isinstance(raw, str) and raw.strip():
+        return Path(raw.strip()).expanduser().resolve()
+    if checkout is not None:
+        return checkout / 'configs' / 'infer_dit_refine.yaml'
+    return None
+
+
+def checkout_marker_blockers(checkout: Path | None) -> list[str]:
+    if checkout is None:
+        return ['checkout-config:ultrashape_upstream_checkout']
+    if not checkout.is_dir():
+        return [f'checkout-path:not-directory:{checkout}']
+    blockers: list[str] = []
+    for relative_path, marker_type in REQUIRED_CHECKOUT_MARKERS:
+        marker = checkout / relative_path
+        if marker_type == 'file' and not marker.is_file():
+            blockers.append(f'checkout-marker:{relative_path}')
+        if marker_type == 'dir' and not marker.is_dir():
+            blockers.append(f'checkout-marker:{relative_path}')
+    if not any((checkout / marker).is_file() for marker in LICENSE_MARKERS):
+        blockers.append('checkout-marker:license')
+    return blockers
+
+
+def checkout_revision(checkout: Path | None) -> str:
+    if checkout is None:
+        return 'unknown'
+    head = checkout / '.git' / 'HEAD'
+    if not head.is_file():
+        return 'unknown'
+    raw_head = head.read_text(encoding='utf8').strip()
+    if raw_head.startswith('ref:'):
+        ref_path = checkout / '.git' / raw_head.split(':', 1)[1].strip()
+        if ref_path.is_file():
+            return ref_path.read_text(encoding='utf8').strip() or 'unknown'
+    return raw_head or 'unknown'
+
+
+def build_real_runtime_mode(
+    *,
+    payload: dict[str, Any],
+    checkpoint_path: Path,
+    runtime_config_path: Path,
+    config_ready: bool,
+    weights_ready: bool,
+    runtime_closure_ready: bool,
+    missing_degradable: list[str],
+    native_install: dict[str, Any],
+) -> dict[str, Any]:
+    checkout = configured_upstream_checkout(payload)
+    upstream_config = configured_upstream_config(payload, checkout)
+    blockers = checkout_marker_blockers(checkout)
+    if 'import:flash_attn' in missing_degradable:
+        blockers.append('dependency:flash_attn')
+    if not config_ready:
+        blockers.append(f'runtime_config:{CONFIG_RELATIVE.as_posix()}')
+    if upstream_config is None or not upstream_config.is_file():
+        blockers.append(f'upstream_config:{upstream_config or "missing"}')
+    if not weights_ready:
+        blockers.append(f'checkpoint:{CHECKPOINT_RELATIVE.as_posix()}')
+    if not runtime_closure_ready:
+        blockers.append('runtime-import:ultrashape_runtime.local_runner')
+
+    flash_state = native_install.get('flash_attn') if isinstance(native_install.get('flash_attn'), dict) else {}
+    available = not blockers
+    return {
+        'available': available,
+        'adapter': REAL_MODE_ADAPTER,
+        'source': 'checkout' if checkout and not checkout_marker_blockers(checkout) else None,
+        'checkout_path': str(checkout) if checkout else None,
+        'revision': checkout_revision(checkout),
+        'entrypoint': REAL_MODE_ENTRYPOINT,
+        'reason': None if available else REAL_MODE_REASON,
+        'blockers': blockers,
+        'runtime_config': {'available': config_ready, 'path': str(runtime_config_path)},
+        'upstream_config': {'available': upstream_config is not None and upstream_config.is_file(), 'path': str(upstream_config) if upstream_config else None},
+        'config': {'available': upstream_config is not None and upstream_config.is_file(), 'path': str(upstream_config) if upstream_config else None},
+        'checkpoint': {'available': weights_ready, 'path': str(checkpoint_path)},
+        'dependencies': {
+            'torch': {'available': True, 'required': True, 'torch_cuda_profile': detect_torch_cuda_profile()},
+            'flash_attn': {
+                'available': 'dependency:flash_attn' not in blockers,
+                'required': True,
+                'degradable_for_portable': True,
+                'status': flash_state.get('status'),
+                'failure_message': flash_state.get('failure_message'),
+            },
+        },
+        'torch_cuda_profile': detect_torch_cuda_profile(),
     }
 
 
@@ -878,7 +987,19 @@ def build_summary_and_readiness(
     weights_ready = checkpoint_path.is_file() and bool(weight_result.get('acquired')) and bool(checkpoint_smoke.get('ok'))
     runtime_closure_ready = config_ready and vendor_ready and bool(runtime_import_smoke.get('ok'))
     runtime_ready = required_imports_ok and weights_ready and runtime_closure_ready
-    runtime_modes = build_runtime_modes(portable_available=required_imports_ok and runtime_closure_ready)
+    runtime_modes = build_runtime_modes(
+        portable_available=required_imports_ok and runtime_closure_ready,
+        real=build_real_runtime_mode(
+            payload=args.payload,
+            checkpoint_path=checkpoint_path,
+            runtime_config_path=ext_dir / CONFIG_RELATIVE,
+            config_ready=config_ready,
+            weights_ready=weights_ready,
+            runtime_closure_ready=runtime_closure_ready,
+            missing_degradable=missing_degradable,
+            native_install=native_install,
+        ),
+    )
 
     status = 'blocked'
     if runtime_ready and missing_optional:
@@ -932,18 +1053,18 @@ def build_summary_and_readiness(
     return readiness, summary
 
 
-def build_runtime_modes(*, portable_available: bool) -> dict[str, Any]:
-    selection = 'portable-only' if portable_available else 'blocked'
+def build_runtime_modes(*, portable_available: bool, real: dict[str, Any]) -> dict[str, Any]:
+    if real.get('available'):
+        selection = 'real-available'
+        active = 'real'
+    else:
+        selection = 'portable-only' if portable_available else 'blocked'
+        active = 'portable' if portable_available else None
     return {
         'selection': selection,
         'requested': 'auto',
-        'active': 'portable' if portable_available else None,
-        'real': {
-            'available': False,
-            'adapter': REAL_MODE_ADAPTER,
-            'reason': REAL_MODE_REASON,
-            'blockers': ['adapter:authoritative-upstream-module-graph'],
-        },
+        'active': active,
+        'real': real,
         'portable': {
             'available': portable_available,
             'authoritative': False,

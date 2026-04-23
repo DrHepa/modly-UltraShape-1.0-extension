@@ -48,6 +48,9 @@ describe('runtime closure repository structure', () => {
     expect(readme).toContain('The model shell is the sole public authority: `manifest.json`, `setup.py`, and `generator.py`.');
     expect(readme).toContain('`runtime/**` and `models/ultrashape/**` remain private implementation details.');
     expect(readme).toContain('The private runtime is an explicit dual-mode UltraShape seam: real mode targets the closest achievable upstream closure when the exact environment is available, and portable mode is the reduced-environment fallback.');
+    expect(readme).toContain('Configure authoritative real mode explicitly with `ultrashape_checkout_path` or `ULTRASHAPE_UPSTREAM_CHECKOUT` pointing at a validated `PKU-YuanGroup/UltraShape-1.0` checkout.');
+    expect(readme).toContain('Portable mode remains non-authoritative: it is only a reduced-environment fallback when real mode is unavailable or when `ULTRASHAPE_RUNTIME_MODE=portable` is forced.');
+    expect(readme).toContain('Future work remains to durably vendor the pinned upstream inference graph with the required upstream license and notice files; this repository currently records checkout revision diagnostics but does not claim a pinned vendored graph.');
     expect(readme).not.toContain('process-shell authority');
     expect(readme).not.toContain('temporary migration seam');
     expect(readme).not.toContain('temporary compatibility seam');

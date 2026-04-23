@@ -10,6 +10,12 @@ The model shell is the sole public authority: `manifest.json`, `setup.py`, and `
 
 The private runtime is an explicit dual-mode UltraShape seam: real mode targets the closest achievable upstream closure when the exact environment is available, and portable mode is the reduced-environment fallback.
 
+Configure authoritative real mode explicitly with `ultrashape_checkout_path` or `ULTRASHAPE_UPSTREAM_CHECKOUT` pointing at a validated `PKU-YuanGroup/UltraShape-1.0` checkout.
+
+Portable mode remains non-authoritative: it is only a reduced-environment fallback when real mode is unavailable or when `ULTRASHAPE_RUNTIME_MODE=portable` is forced.
+
 `setup.py` stages that private runtime into the install root and writes truthful readiness artifacts for the generator lifecycle, including whether real mode is unavailable, portable fallback is active, or the runtime is blocked. `ready` means the staged config, vendored runtime, required imports, and required checkpoint are all actually present.
 
 The public shell exposes only the supported local refinement contract and keeps legacy processor-era paths out of authority.
+
+Future work remains to durably vendor the pinned upstream inference graph with the required upstream license and notice files; this repository currently records checkout revision diagnostics but does not claim a pinned vendored graph.
