@@ -6,6 +6,10 @@ from ...utils.checkpoint import checkpoint_parameter_map, checkpoint_signature, 
 from ...utils import clamp_unit, stable_signature
 from .moe_layers import moe_enabled, voxel_cond_signal
 
+
+REFINEDIT_REQUIRED_ROOTS = ('x_embedder', 't_embedder', 'final_layer')
+REFINEDIT_UPSTREAM_ROOTS = (*REFINEDIT_REQUIRED_ROOTS, 'blocks')
+
 try:
     import flash_attn  # type: ignore # pragma: no cover
 except ImportError:  # pragma: no cover - expected on MVP installs
@@ -71,6 +75,7 @@ def _hydrate_module_family(
     state_dict: dict[str, object],
     *,
     allowed_roots: tuple[str, ...],
+    required_roots: tuple[str, ...] | None = None,
     strict: bool,
 ) -> tuple[dict[str, object], list[str], list[str]]:
     recognized: dict[str, object] = {}
@@ -81,7 +86,8 @@ def _hydrate_module_family(
         else:
             unexpected_keys.append(parameter_name)
 
-    missing_roots = [root for root in allowed_roots if not any(name == root or name.startswith(f'{root}.') for name in recognized)]
+    roots_required = required_roots or allowed_roots
+    missing_roots = [root for root in roots_required if not any(name == root or name.startswith(f'{root}.') for name in recognized)]
     legacy_keys = [name for name in state_dict if name == 'tensors' or name.startswith('tensors.')]
     if legacy_keys and not recognized and all(name in legacy_keys for name in state_dict):
         return dict(state_dict), [], []
@@ -113,14 +119,16 @@ class RefineDiT:
         normalized_state = checkpoint_parameter_map({'state_dict': state_dict}) or dict(state_dict)
         hydrated_state, missing_roots, unexpected_keys = _hydrate_module_family(
             normalized_state,
-            allowed_roots=('x_embedder', 't_embedder', 'final_layer'),
+            allowed_roots=REFINEDIT_UPSTREAM_ROOTS,
+            required_roots=REFINEDIT_REQUIRED_ROOTS,
             strict=strict,
         )
+        module_roots = sorted({name.split('.', 1)[0] for name in hydrated_state if isinstance(name, str) and name.strip()})
         self.checkpoint_state = {
             'state_dict': hydrated_state,
             'state_dict_metadata': {
                 'parameter_count': len(hydrated_state),
-                'module_roots': ['final_layer', 't_embedder', 'x_embedder'],
+                'module_roots': module_roots,
                 'module_family': self.__class__.__name__,
             },
             'representation': 'module-state-dict-v2',

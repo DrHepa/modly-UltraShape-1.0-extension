@@ -438,6 +438,53 @@ describe('private runtime flow behind the model shell', () => {
     });
   });
 
+  it('accepts upstream RefineDiT block parameters during strict portable hydration while rejecting unknown roots', () => {
+    const result = runPythonSnippet(
+      [
+        'import json',
+        'from ultrashape_runtime.models.denoisers.dit_mask import RefineDiT',
+        'accepted = RefineDiT()',
+        'state_dict = {',
+        '    "x_embedder.weight": [0.1, 0.2],',
+        '    "t_embedder.mlp.0.weight": [0.3, 0.4],',
+        '    "final_layer.linear.weight": [0.5, 0.6],',
+        '    "blocks.0.norm1.weight": [0.7, 0.8],',
+        '    "blocks.0.attn.qkv.weight": [0.9, 1.0],',
+        '}',
+        'accepted_result = accepted.load_state_dict(state_dict, strict=True)',
+        'try:',
+        '    RefineDiT().load_state_dict({**state_dict, "unknown_root.weight": [0.11]}, strict=True)',
+        'except ValueError as error:',
+        '    rejected = {"message": str(error)}',
+        'else:',
+        '    rejected = None',
+        'print(json.dumps({',
+        '    "accepted": accepted_result,',
+        '    "hydrated_keys": sorted(accepted.state_dict.keys()),',
+        '    "module_roots": accepted.checkpoint_state["state_dict_metadata"]["module_roots"],',
+        '    "rejected": rejected,',
+        '}))',
+      ].join('\n'),
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      accepted: { missing_keys: [], unexpected_keys: [], strict: true },
+      hydrated_keys: [
+        'blocks.0.attn.qkv.weight',
+        'blocks.0.norm1.weight',
+        'final_layer.linear.weight',
+        't_embedder.mlp.0.weight',
+        'x_embedder.weight',
+      ],
+      module_roots: ['blocks', 'final_layer', 't_embedder', 'x_embedder'],
+      rejected: {
+        message:
+          "RefineDiT strict hydration requires upstream module-family keys for ('x_embedder', 't_embedder', 'final_layer', 'blocks'); missing=[], unexpected=['unknown_root.weight'].",
+      },
+    });
+  });
+
   it('rejects shorthand closure configs instead of re-authorizing non-upstream runtime allowances', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-runtime-config-'));
     const shorthandConfigPath = path.join(sandbox, 'shorthand.yaml');
