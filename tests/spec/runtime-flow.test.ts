@@ -485,6 +485,57 @@ describe('private runtime flow behind the model shell', () => {
     });
   });
 
+  it('accepts upstream ShapeVAE encoder and pre_kl parameters during strict portable hydration while rejecting unknown roots', () => {
+    const result = runPythonSnippet(
+      [
+        'import json',
+        'from ultrashape_runtime.models.autoencoders.model import ShapeVAE',
+        'accepted = ShapeVAE()',
+        'state_dict = {',
+        '    "encoder.input_proj_q.weight": [0.1, 0.2],',
+        '    "encoder.input_proj_v.bias": [0.3, 0.4],',
+        '    "pre_kl.weight": [0.5, 0.6],',
+        '    "pre_kl.bias": [0.7, 0.8],',
+        '    "post_kl.weight": [0.11, 0.12],',
+        '    "transformer.resblocks.0.attn.c_qkv.weight": [0.21, 0.22],',
+        '    "geo_decoder.query_proj.weight": [0.31, 0.32],',
+        '}',
+        'accepted_result = accepted.load_state_dict(state_dict, strict=True)',
+        'try:',
+        '    ShapeVAE().load_state_dict({**state_dict, "unknown_root.weight": [0.41]}, strict=True)',
+        'except ValueError as error:',
+        '    rejected = {"message": str(error)}',
+        'else:',
+        '    rejected = None',
+        'print(json.dumps({',
+        '    "accepted": accepted_result,',
+        '    "hydrated_keys": sorted(accepted.state_dict.keys()),',
+        '    "module_roots": accepted.checkpoint_state["state_dict_metadata"]["module_roots"],',
+        '    "rejected": rejected,',
+        '}))',
+      ].join('\n'),
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      accepted: { missing_keys: [], unexpected_keys: [], strict: true },
+      hydrated_keys: [
+        'encoder.input_proj_q.weight',
+        'encoder.input_proj_v.bias',
+        'geo_decoder.query_proj.weight',
+        'post_kl.weight',
+        'pre_kl.bias',
+        'pre_kl.weight',
+        'transformer.resblocks.0.attn.c_qkv.weight',
+      ],
+      module_roots: ['encoder', 'geo_decoder', 'post_kl', 'pre_kl', 'transformer'],
+      rejected: {
+        message:
+          "ShapeVAE strict hydration requires upstream module-family keys for ('post_kl', 'transformer', 'geo_decoder', 'encoder', 'pre_kl'); missing=[], unexpected=['unknown_root.weight'].",
+      },
+    });
+  });
+
   it('rejects shorthand closure configs instead of re-authorizing non-upstream runtime allowances', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-runtime-config-'));
     const shorthandConfigPath = path.join(sandbox, 'shorthand.yaml');
