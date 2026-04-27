@@ -108,7 +108,15 @@ function meshExtents(vertices: Array<[number, number, number]>) {
   return [Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys), Math.max(...zs) - Math.min(...zs)];
 }
 
-function writeRuntimeStubModules(root: string) {
+const COHESIVE_CUBVH_STUB = `def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    vertices = [\n        [0.0, 0.0, 0.0],\n        [1.0, 0.0, 0.0],\n        [1.0, 1.0, 0.0],\n        [0.0, 1.0, 0.0],\n        [0.0, 0.0, 1.0],\n        [1.0, 0.0, 1.0],\n        [1.0, 1.0, 1.0],\n        [0.0, 1.0, 1.0],\n        [0.5, 0.5, 0.5],\n    ]\n    faces = [\n        [0, 2, 1], [0, 3, 2],\n        [4, 5, 6], [4, 6, 7],\n        [0, 1, 5], [0, 5, 4],\n        [1, 2, 6], [1, 6, 5],\n        [2, 3, 7], [2, 7, 6],\n        [3, 0, 4], [3, 4, 7],\n    ]\n    return vertices, faces\n`;
+
+const LAMELLAR_CUBVH_STUB = `def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    vertices = []\n    faces = []\n    for z in [0.0, 0.5, 1.0]:\n        base = len(vertices)\n        vertices.extend([\n            [0.0, 0.0, z],\n            [1.0, 0.0, z],\n            [1.0, 1.0, z],\n            [0.0, 1.0, z],\n            [0.5, 0.5, z],\n        ])\n        faces.extend([\n            [base + 0, base + 1, base + 4],\n            [base + 1, base + 2, base + 4],\n            [base + 2, base + 3, base + 4],\n            [base + 3, base + 0, base + 4],\n        ])\n    return vertices, faces\n`;
+
+function writeCubvhStub(root: string, source: string) {
+  writeFileSync(path.join(root, 'cubvh.py'), source, 'utf8');
+}
+
+function writeRuntimeStubModules(root: string, options: { cubvhSource?: string } = {}) {
   const modules = [
     'torchvision.py',
     'cv2.py',
@@ -135,11 +143,7 @@ function writeRuntimeStubModules(root: string) {
     'utf8',
   );
 
-  writeFileSync(
-    path.join(root, 'cubvh.py'),
-    `def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    vertices = [\n        [0.0, 0.0, 0.0],\n        [1.0, 0.0, 0.0],\n        [0.0, 1.0, 0.0],\n        [0.0, 0.0, 1.0],\n        [1.0, 1.0, 0.0],\n        [1.0, 0.0, 1.0],\n        [0.0, 1.0, 1.0],\n        [1.0, 1.0, 1.0],\n        [0.5, 0.5, 1.02],\n    ]\n    faces = [\n        [0, 1, 4],\n        [0, 4, 2],\n        [0, 1, 5],\n        [0, 5, 3],\n        [2, 4, 7],\n        [2, 7, 6],\n        [3, 5, 8],\n        [3, 8, 6],\n    ]\n    return vertices, faces\n`,
-    'utf8',
-  );
+  writeCubvhStub(root, options.cubvhSource ?? COHESIVE_CUBVH_STUB);
 
   writeFileSync(
     path.join(root, 'trimesh.py'),
@@ -148,14 +152,14 @@ function writeRuntimeStubModules(root: string) {
   );
 }
 
-function createRuntimeFixture() {
+function createRuntimeFixture(options: { cubvhSource?: string } = {}) {
   const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-runtime-flow-'));
   const stubRoot = path.join(sandbox, 'stubs');
   const extDir = path.join(sandbox, 'ext');
   const modelsDir = path.join(extDir, 'models', 'ultrashape');
   mkdirSync(stubRoot, { recursive: true });
   mkdirSync(modelsDir, { recursive: true });
-  writeRuntimeStubModules(stubRoot);
+  writeRuntimeStubModules(stubRoot, options);
 
   const imageInputPath = path.join(sandbox, 'reference.png');
   const meshInputPath = path.join(sandbox, 'coarse.glb');
@@ -643,6 +647,13 @@ describe('private runtime flow behind the model shell', () => {
             },
             gate: {
               preserve_scale: true,
+              portable_quality: {
+                passed: true,
+                reason: 'ok',
+                component_count: 1,
+                boundary_edge_count: 0,
+                non_manifold_edge_count: 0,
+              },
             },
             conditioning: {
               hydration: {
@@ -660,10 +671,49 @@ describe('private runtime flow behind the model shell', () => {
               state_hydrated: true,
             },
           },
+          warnings: ['PORTABLE_FALLBACK_NON_AUTHORITATIVE'],
           subtrees_loaded: ['vae', 'dit', 'conditioner'],
         },
       });
       expect(existsSync(path.join(outputDir, 'refined.glb'))).toBe(true);
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects lamellar portable output before exporting output_dir/refined.glb', () => {
+    const fixture = createRuntimeFixture({ cubvhSource: LAMELLAR_CUBVH_STUB });
+    const outputDir = path.join(fixture.sandbox, 'output-lamellar');
+
+    try {
+      const result = runLocalRunner(
+        {
+          reference_image: fixture.imageInputPath,
+          coarse_mesh: fixture.meshInputPath,
+          output_dir: outputDir,
+          checkpoint: fixture.checkpoint,
+          config_path: configPath,
+          ext_dir: fixture.extDir,
+          output_format: 'glb',
+          backend: 'local',
+          steps: 4,
+          guidance_scale: 6,
+          seed: 7,
+          preserve_scale: true,
+        },
+        fixture.stubRoot,
+        { ULTRASHAPE_RUNTIME_MODE: 'portable' },
+      );
+
+      expect(result.status).toBe(1);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        error_message: expect.stringContaining('portable lamellar geometry rejected'),
+      });
+      expect(JSON.parse(result.stdout).error_message).toContain('boundary_edge_count=');
+      expect(JSON.parse(result.stdout).error_message).toContain('component_count=');
+      expect(existsSync(path.join(outputDir, 'refined.glb'))).toBe(false);
     } finally {
       rmSync(fixture.sandbox, { recursive: true, force: true });
     }
@@ -831,6 +881,59 @@ describe('private runtime flow behind the model shell', () => {
     expect(payload.decoder.sparse_cell_count).toBeGreaterThan(0);
     expect(payload.decoder.corner_count).toBe(payload.decoder.sparse_cell_count);
     expect(payload.extractor.vertex_count).toBeGreaterThan(0);
+  });
+
+  it('reports lamellar mesh-quality metrics without relying on screenshots', () => {
+    const result = runPythonSnippet(
+      [
+        'import json',
+        'from ultrashape_runtime.models.autoencoders.surface_extractors import evaluate_portable_mesh_quality_gate',
+        'vertices = []',
+        'faces = []',
+        'for z in [0.0, 0.5, 1.0]:',
+        '    base = len(vertices)',
+        '    vertices.extend([(0.0, 0.0, z), (1.0, 0.0, z), (1.0, 1.0, z), (0.0, 1.0, z), (0.5, 0.5, z)])',
+        '    faces.extend([(base + 0, base + 1, base + 4), (base + 1, base + 2, base + 4), (base + 2, base + 3, base + 4), (base + 3, base + 0, base + 4)])',
+        'try:',
+        '    evaluate_portable_mesh_quality_gate({"vertices": vertices, "faces": faces})',
+        'except Exception as error:',
+        '    print(json.dumps({"ok": False, "code": getattr(error, "code", None), "message": str(error)}))',
+        'else:',
+        '    print(json.dumps({"ok": True}))',
+      ].join('\n'),
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: false,
+      code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      message: expect.stringContaining('portable lamellar geometry rejected'),
+    });
+    expect(JSON.parse(result.stdout).message).toContain('boundary_edge_count=');
+    expect(JSON.parse(result.stdout).message).toContain('slab_concentration=');
+  });
+
+  it('passes cohesive valid-ish portable geometry while labeling it non-authoritative fallback', () => {
+    const result = runPythonSnippet(
+      [
+        'import json',
+        'from ultrashape_runtime.models.autoencoders.surface_extractors import evaluate_portable_mesh_quality_gate',
+        'vertices = [(0,0,0),(1,0,0),(1,1,0),(0,1,0),(0,0,1),(1,0,1),(1,1,1),(0,1,1),(0.5,0.5,0.5)]',
+        'faces = [(0,2,1),(0,3,2),(4,5,6),(4,6,7),(0,1,5),(0,5,4),(1,2,6),(1,6,5),(2,3,7),(2,7,6),(3,0,4),(3,4,7)]',
+        'metrics = evaluate_portable_mesh_quality_gate({"vertices": vertices, "faces": faces})',
+        'print(json.dumps(metrics, sort_keys=True))',
+      ].join('\n'),
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      passed: true,
+      reason: 'ok',
+      component_count: 1,
+      largest_component_ratio: 1,
+      boundary_edge_count: 0,
+      non_manifold_edge_count: 0,
+    });
   });
 
   it('maps unsupported backend requests to INVALID_INPUT through the public runner envelope', () => {
@@ -1246,7 +1349,7 @@ describe('private runtime flow behind the model shell', () => {
               },
             },
           },
-          fallbacks: ['flash_attn->sdpa'],
+          fallbacks: ['real->portable', 'flash_attn->sdpa'],
         },
       });
       expect(readFileSync(path.join(outputDir, 'refined.glb')).subarray(0, 4).toString('ascii')).toBe('glTF');

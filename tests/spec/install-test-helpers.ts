@@ -117,7 +117,7 @@ export function writeRuntimeStubModules(root: string) {
 
   writeFileSync(
     path.join(root, 'cubvh.py'),
-    `def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    vertices = [\n        [0.0, 0.0, 0.0],\n        [1.0, 0.0, 0.0],\n        [0.0, 1.0, 0.0],\n        [0.0, 0.0, 1.0],\n        [1.0, 1.0, 0.0],\n        [1.0, 0.0, 1.0],\n        [0.0, 1.0, 1.0],\n        [1.0, 1.0, 1.0],\n        [0.5, 0.5, 1.02],\n    ]\n    faces = [\n        [0, 1, 4],\n        [0, 4, 2],\n        [0, 1, 5],\n        [0, 5, 3],\n        [2, 4, 7],\n        [2, 7, 6],\n        [3, 5, 8],\n        [3, 8, 6],\n    ]\n    return vertices, faces\n`,
+    `def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    vertices = [\n        [0.0, 0.0, 0.0],\n        [1.0, 0.0, 0.0],\n        [1.0, 1.0, 0.0],\n        [0.0, 1.0, 0.0],\n        [0.0, 0.0, 1.0],\n        [1.0, 0.0, 1.0],\n        [1.0, 1.0, 1.0],\n        [0.0, 1.0, 1.0],\n        [0.5, 0.5, 0.5],\n    ]\n    faces = [\n        [0, 2, 1], [0, 3, 2],\n        [4, 5, 6], [4, 6, 7],\n        [0, 1, 5], [0, 5, 4],\n        [1, 2, 6], [1, 6, 5],\n        [2, 3, 7], [2, 7, 6],\n        [3, 0, 4], [3, 4, 7],\n    ]\n    return vertices, faces\n`,
     'utf8',
   );
 

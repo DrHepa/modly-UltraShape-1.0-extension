@@ -38,6 +38,19 @@ RMS_DISPLACEMENT_THRESHOLD = 0.01
 TOPOLOGY_DELTA_THRESHOLD = 0.01
 PRESERVE_SCALE_TOLERANCE = (0.97, 1.03)
 
+# Portable output is a degraded fallback, so thresholds are intentionally conservative:
+# reject only when multiple topology/shape signals agree. False-positive tuning remains a
+# rollout risk as more real portable meshes become available.
+PORTABLE_MIN_VERTEX_COUNT = 8
+PORTABLE_MIN_FACE_COUNT = 8
+PORTABLE_MIN_LARGEST_COMPONENT_RATIO = 0.85
+PORTABLE_MAX_BOUNDARY_EDGE_RATIO = 0.12
+PORTABLE_MAX_NON_MANIFOLD_EDGES = 0
+PORTABLE_MIN_THINNESS_RATIO = 0.08
+PORTABLE_MIN_VOLUME_BBOX_RATIO = 0.02
+PORTABLE_SLAB_CONCENTRATION_THRESHOLD = 0.8
+PORTABLE_SLAB_BIN_FRACTION = 0.03
+
 
 def _mesh_payload_bytes(mesh_payload: object) -> bytes:
     if not isinstance(mesh_payload, dict):
@@ -302,6 +315,168 @@ def _gate_signature(*values: object) -> int:
                 if _is_number(item):
                     flattened.append(float(item))
     return stable_signature(flattened)
+
+
+def _edge_topology(faces: list[tuple[int, int, int]]) -> dict[str, object]:
+    edge_counts: dict[tuple[int, int], int] = {}
+    adjacency: dict[int, set[int]] = {}
+    for face in faces:
+        a, b, c = face
+        for left, right in ((a, b), (b, c), (c, a)):
+            edge = tuple(sorted((left, right)))
+            edge_counts[edge] = edge_counts.get(edge, 0) + 1
+            adjacency.setdefault(left, set()).add(right)
+            adjacency.setdefault(right, set()).add(left)
+
+    boundary_edges = [edge for edge, count in edge_counts.items() if count == 1]
+    non_manifold_edges = [edge for edge, count in edge_counts.items() if count > 2]
+    return {
+        'edge_count': len(edge_counts),
+        'boundary_edge_count': len(boundary_edges),
+        'non_manifold_edge_count': len(non_manifold_edges),
+        'adjacency': adjacency,
+    }
+
+
+def _component_metrics(vertex_count: int, adjacency: dict[int, set[int]]) -> tuple[int, float]:
+    seen: set[int] = set()
+    component_sizes: list[int] = []
+    active_vertices = sorted(adjacency.keys()) or list(range(vertex_count))
+    for vertex_index in active_vertices:
+        if vertex_index in seen:
+            continue
+        stack = [vertex_index]
+        seen.add(vertex_index)
+        size = 0
+        while stack:
+            current = stack.pop()
+            size += 1
+            for neighbor in adjacency.get(current, set()):
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        component_sizes.append(size)
+
+    largest = max(component_sizes) if component_sizes else 0
+    return len(component_sizes), round(largest / max(len(active_vertices), 1), 6)
+
+
+def _signed_mesh_volume(vertices: list[tuple[float, float, float]], faces: list[tuple[int, int, int]]) -> float:
+    volume = 0.0
+    for a_index, b_index, c_index in faces:
+        if a_index >= len(vertices) or b_index >= len(vertices) or c_index >= len(vertices):
+            continue
+        a = vertices[a_index]
+        b = vertices[b_index]
+        c = vertices[c_index]
+        volume += (
+            (a[0] * ((b[1] * c[2]) - (b[2] * c[1])))
+            - (a[1] * ((b[0] * c[2]) - (b[2] * c[0])))
+            + (a[2] * ((b[0] * c[1]) - (b[1] * c[0])))
+        ) / 6.0
+    return abs(volume)
+
+
+def _slab_concentration(vertices: list[tuple[float, float, float]], extents: tuple[float, float, float]) -> tuple[str | None, float]:
+    best_axis = None
+    best_concentration = 0.0
+    for axis_index, axis_name in enumerate(('x', 'y', 'z')):
+        tolerance = max(extents[axis_index] * PORTABLE_SLAB_BIN_FRACTION, 1e-6)
+        bins: list[float] = []
+        concentrated = 0
+        for vertex in vertices:
+            value = vertex[axis_index]
+            for bin_value in bins:
+                if abs(value - bin_value) <= tolerance:
+                    concentrated += 1
+                    break
+            else:
+                bins.append(value)
+                concentrated += 1
+        concentration = concentrated / max(len(vertices), 1) if len(bins) <= max(3, len(vertices) // 4) else 0.0
+        if concentration > best_concentration:
+            best_axis = axis_name
+            best_concentration = concentration
+    return best_axis, round(best_concentration, 6)
+
+
+def evaluate_portable_mesh_quality_gate(mesh_payload: object) -> dict[str, object]:
+    if not isinstance(mesh_payload, dict):
+        raise MeshGateError('GEOMETRIC_GATE_REJECTED: portable mesh payload must be a structured dictionary.')
+
+    geometry = _mesh_geometry(mesh_payload)
+    vertices = geometry['vertices']
+    faces = geometry['faces']
+    extents = geometry['extents']
+    vertex_count = int(geometry['vertex_count'])
+    face_count = int(geometry['face_count'])
+    topology = _edge_topology(faces)
+    component_count, largest_component_ratio = _component_metrics(vertex_count, topology['adjacency'])
+    edge_count = int(topology['edge_count'])
+    boundary_edge_count = int(topology['boundary_edge_count'])
+    non_manifold_edge_count = int(topology['non_manifold_edge_count'])
+    boundary_edge_ratio = round(boundary_edge_count / max(edge_count, 1), 6)
+    thinness_ratio = round(min(extents) / max(max(extents), 1e-6), 6)
+    bbox_volume = max(extents[0] * extents[1] * extents[2], 1e-9)
+    volume_bbox_ratio = round(_signed_mesh_volume(vertices, faces) / bbox_volume, 6)
+    slab_axis, slab_concentration = _slab_concentration(vertices, extents)
+
+    metrics = {
+        'passed': True,
+        'reason': 'ok',
+        'vertex_count': vertex_count,
+        'face_count': face_count,
+        'component_count': component_count,
+        'largest_component_ratio': largest_component_ratio,
+        'boundary_edge_count': boundary_edge_count,
+        'boundary_edge_ratio': boundary_edge_ratio,
+        'non_manifold_edge_count': non_manifold_edge_count,
+        'thinness_ratio': thinness_ratio,
+        'volume_bbox_ratio': volume_bbox_ratio,
+        'slab_axis': slab_axis,
+        'slab_concentration': slab_concentration,
+    }
+
+    if vertex_count < PORTABLE_MIN_VERTEX_COUNT or face_count < PORTABLE_MIN_FACE_COUNT:
+        metrics['passed'] = False
+        metrics['reason'] = 'degenerate_volume'
+    elif non_manifold_edge_count > PORTABLE_MAX_NON_MANIFOLD_EDGES:
+        metrics['passed'] = False
+        metrics['reason'] = 'open_surface'
+    elif (
+        component_count > 1
+        and largest_component_ratio < PORTABLE_MIN_LARGEST_COMPONENT_RATIO
+        and slab_concentration >= PORTABLE_SLAB_CONCENTRATION_THRESHOLD
+    ) or (
+        boundary_edge_ratio > PORTABLE_MAX_BOUNDARY_EDGE_RATIO
+        and slab_concentration >= PORTABLE_SLAB_CONCENTRATION_THRESHOLD
+    ):
+        metrics['passed'] = False
+        metrics['reason'] = 'lamellar_geometry'
+    elif thinness_ratio < PORTABLE_MIN_THINNESS_RATIO or volume_bbox_ratio < PORTABLE_MIN_VOLUME_BBOX_RATIO:
+        metrics['passed'] = False
+        metrics['reason'] = 'degenerate_volume'
+
+    if metrics['passed'] is not True:
+        detail = ', '.join(
+            f'{key}={metrics[key]}'
+            for key in [
+                'reason',
+                'vertex_count',
+                'face_count',
+                'component_count',
+                'largest_component_ratio',
+                'boundary_edge_count',
+                'non_manifold_edge_count',
+                'thinness_ratio',
+                'volume_bbox_ratio',
+                'slab_axis',
+                'slab_concentration',
+            ]
+        )
+        raise MeshGateError(f'GEOMETRIC_GATE_REJECTED: portable lamellar geometry rejected ({detail}).')
+
+    return metrics
 
 
 def evaluate_geometric_gate(

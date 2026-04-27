@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .models.autoencoders.model import ShapeVAE
-from .models.autoencoders.surface_extractors import evaluate_geometric_gate, export_refined_glb, extract_surface
+from .models.autoencoders.surface_extractors import evaluate_geometric_gate, evaluate_portable_mesh_quality_gate, export_refined_glb, extract_surface
 from .models.autoencoders.volume_decoders import decode_volume
 from .models.conditioner_mask import SingleImageEncoder
 from .models.denoisers.dit_mask import RefineDiT
@@ -850,6 +850,7 @@ def run_refine_pipeline(
         reference_image_signature=reference_asset.get('image_signature'),
         checkpoint_signature=conditioning.get('checkpoint_signature'),
     )
+    portable_quality_metrics = evaluate_portable_mesh_quality_gate(refined_payload)
     output_path = export_refined_glb(
         output_dir=output_dir,
         output_format=output_format,
@@ -869,12 +870,16 @@ def run_refine_pipeline(
         refined_surface=refined_surface,
         gate_metrics=gate_metrics,
     )
+    fallback_reasons = []
+    if runtime_mode.get('requested') == 'auto' and runtime_mode.get('active') == 'portable':
+        fallback_reasons.append('real->portable')
+    if denoised['attention'] == 'sdpa':
+        fallback_reasons.append('flash_attn->sdpa')
 
     return {
         'file_path': output_path,
         'format': 'glb',
         'backend': 'local',
-        'warnings': [],
         'metrics': {
             'chamfer': gate_metrics['chamfer'],
             'rms': gate_metrics['rms'],
@@ -1007,6 +1012,7 @@ def run_refine_pipeline(
                 'refined_vertex_count': gate_metrics['refined_vertex_count'],
                 'coarse_face_count': gate_metrics['coarse_face_count'],
                 'refined_face_count': gate_metrics['refined_face_count'],
+                'portable_quality': portable_quality_metrics,
             },
             'causality': causality,
             'stage_evidence': _stage_evidence(
@@ -1021,8 +1027,9 @@ def run_refine_pipeline(
                 exported_payload_bytes=exported_payload_bytes,
             ),
         },
-        'fallbacks': ['flash_attn->sdpa'] if denoised['attention'] == 'sdpa' else [],
+        'fallbacks': fallback_reasons,
         'subtrees_loaded': checkpoint_bundle['subtrees_loaded'],
+        'warnings': ['PORTABLE_FALLBACK_NON_AUTHORITATIVE'],
         'checkpoint': checkpoint_bundle['path'],
         'execution': {
             'steps': steps,
