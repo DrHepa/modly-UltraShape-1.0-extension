@@ -18,6 +18,7 @@ try:
 except ImportError:  # pragma: no cover - expected on degraded installs
     torch = None
 
+from ... import cubvh_diagnostics
 from ...utils import clamp_unit, stable_signature
 from .volume_decoders import get_sparse_valid_voxels
 
@@ -637,7 +638,9 @@ def export_refined_glb(*, output_dir: str, output_format: str, mesh_payload: obj
 
 
 def preferred_surface_extractor() -> str:
-    return 'cubvh.sparse_marching_cubes' if cubvh is not None else 'cubvh.missing'
+    if cubvh_diagnostics.get_callable(cubvh, 'sparse_marching_cubes') is not None:
+        return 'cubvh.sparse_marching_cubes'
+    return 'cubvh.missing'
 
 
 class SurfaceExtractionError(Exception):
@@ -703,52 +706,6 @@ def _fit_vertices_to_target(
             )
         )
     return fitted
-
-
-def _cpu_python_rows(values: object) -> list[object]:
-    if hasattr(values, 'cpu') and callable(values.cpu):
-        values = values.cpu()
-    if hasattr(values, 'tolist') and callable(values.tolist):
-        values = values.tolist()
-    return list(values) if isinstance(values, (list, tuple)) else []
-
-
-def _tensor_shape(values: list[tuple[float, ...]] | list[tuple[int, ...]], tensor: object) -> tuple[int, ...]:
-    raw_shape = getattr(tensor, 'shape', None)
-    if isinstance(raw_shape, (list, tuple)) and raw_shape:
-        return tuple(int(axis) for axis in raw_shape)
-    column_count = len(values[0]) if values else 0
-    return (len(values), column_count)
-
-
-def _flatten_numeric_rows(values: list[tuple[float, ...]] | list[tuple[int, ...]]) -> list[float]:
-    return [float(value) for row in values for value in row]
-
-
-def _cubvh_input_diagnostics(
-    *,
-    coords: list[tuple[int, int, int]],
-    corners: list[tuple[float, float, float, float, float, float, float, float]],
-    coords_tensor: object,
-    corners_tensor: object,
-    iso: float,
-) -> str:
-    flat_coords = _flatten_numeric_rows(coords)
-    flat_corners = _flatten_numeric_rows(corners)
-    return (
-        'cubvh_inputs('
-        f'coords_shape={_tensor_shape(coords, coords_tensor)}, '
-        f'coords_dtype={getattr(coords_tensor, "dtype", None)}, '
-        f'coords_min={min(flat_coords) if flat_coords else 0.0}, '
-        f'coords_max={max(flat_coords) if flat_coords else 0.0}, '
-        f'corners_shape={_tensor_shape(corners, corners_tensor)}, '
-        f'corners_dtype={getattr(corners_tensor, "dtype", None)}, '
-        f'corners_min={round(min(flat_corners), 6) if flat_corners else 0.0}, '
-        f'corners_max={round(max(flat_corners), 6) if flat_corners else 0.0}, '
-        f'cell_count={len(coords)}, '
-        f'iso={round(float(iso), 6)}'
-        ')'
-    )
 
 
 class SurfaceExtractor:
@@ -821,7 +778,7 @@ class MCSurfaceExtractor(SurfaceExtractor):
         if not normalized_coords or not normalized_corners:
             raise SurfaceExtractionError('decoded_volume marching-cubes inputs must contain valid coords/corners rows.')
 
-        sparse_marching_cubes = getattr(cubvh, 'sparse_marching_cubes', None)
+        sparse_marching_cubes = cubvh_diagnostics.get_callable(cubvh, 'sparse_marching_cubes')
         if not callable(sparse_marching_cubes):
             raise SurfaceExtractionDependencyError('Required runtime import is unavailable: cubvh.sparse_marching_cubes.')
 
@@ -830,13 +787,22 @@ class MCSurfaceExtractor(SurfaceExtractor):
 
         coords_tensor = torch.tensor(normalized_coords, dtype=torch.int32)
         corners_tensor = torch.tensor(normalized_corners, dtype=torch.float32)
-        cubvh_diagnostics = _cubvh_input_diagnostics(
+        input_info = cubvh_diagnostics.input_summary(
             coords=normalized_coords,
             corners=normalized_corners,
             coords_tensor=coords_tensor,
             corners_tensor=corners_tensor,
             iso=float(iso),
         )
+        cubvh_metadata = cubvh_diagnostics.capture_metadata(cubvh, torch)
+        extraction_diagnostics: dict[str, object] = {
+            'extraction_path': 'cuda',
+            'degraded': False,
+            'authoritative': False,
+            'input': input_info,
+            'metadata': cubvh_metadata,
+            'readiness_summary': cubvh_diagnostics.readiness_summary(),
+        }
 
         try:
             raw_vertices, raw_faces = sparse_marching_cubes(
@@ -845,12 +811,56 @@ class MCSurfaceExtractor(SurfaceExtractor):
                 float(iso),
                 ensure_consistency=False,
             )
-        except Exception as error:
-            raise SurfaceExtractionError(f'cubvh.sparse_marching_cubes failed: {error} [{cubvh_diagnostics}]') from error
-        raw_vertices = _cpu_python_rows(raw_vertices)
-        raw_faces = _cpu_python_rows(raw_faces)
-        vertices = [tuple(float(axis) for axis in vertex[:3]) for vertex in raw_vertices if isinstance(vertex, (list, tuple)) and len(vertex) >= 3]
-        faces = [tuple(int(index) for index in face[:3]) for face in raw_faces if isinstance(face, (list, tuple)) and len(face) >= 3]
+        except Exception as cuda_error:
+            cuda_error_class = cubvh_diagnostics.classify_error(cuda_error, path='cuda', input_info=input_info)
+            cpu_marching_cubes = cubvh_diagnostics.get_callable(cubvh, 'sparse_marching_cubes_cpu')
+            extraction_diagnostics.update(
+                {
+                    'cuda_failure': {
+                        'error_class': cuda_error_class,
+                        'error_message': str(cuda_error),
+                    },
+                    'fallback_reason': cuda_error_class,
+                    'rebuild_guidance': cubvh_diagnostics.rebuild_guidance(cuda_error_class, cubvh_metadata),
+                }
+            )
+            if cpu_marching_cubes is None:
+                message = cubvh_diagnostics.failure_message(
+                    error_class='cpu_fallback_unavailable',
+                    input_info=input_info,
+                    readiness=cubvh_diagnostics.readiness_summary(),
+                    guidance=extraction_diagnostics['rebuild_guidance'],
+                    cuda_error=cuda_error,
+                )
+                raise SurfaceExtractionError(message) from cuda_error
+            try:
+                raw_vertices, raw_faces = cpu_marching_cubes(
+                    coords_tensor,
+                    corners_tensor,
+                    float(iso),
+                    ensure_consistency=False,
+                )
+            except Exception as cpu_error:
+                message = cubvh_diagnostics.failure_message(
+                    error_class=cuda_error_class,
+                    input_info=input_info,
+                    readiness=cubvh_diagnostics.readiness_summary(),
+                    guidance=extraction_diagnostics['rebuild_guidance'],
+                    cuda_error=cuda_error,
+                    cpu_error=cpu_error,
+                )
+                raise SurfaceExtractionError(message) from cpu_error
+            extraction_diagnostics.update(
+                {
+                    'extraction_path': 'cpu-fallback',
+                    'degraded': True,
+                    'fallback_reason': cuda_error_class,
+                }
+            )
+
+        normalized_output = cubvh_diagnostics.normalize_output(raw_vertices, raw_faces)
+        vertices = normalized_output['vertices']
+        faces = normalized_output['faces']
 
         coarse_renderable = build_renderable_mesh_payload(mesh_payload)
         coarse_vertices = coarse_renderable.get('vertices') if isinstance(coarse_renderable.get('vertices'), list) else None
@@ -859,8 +869,19 @@ class MCSurfaceExtractor(SurfaceExtractor):
 
         if not faces:
             faces = _triangle_strip_faces(len(vertices))
+            normalized_output = {**normalized_output, 'face_count': len(faces), 'faces_generated': 'triangle_strip'}
         if len(vertices) < 9 or len(faces) < 8:
             raise SurfaceExtractionError('marching-cubes extraction did not produce enough geometry evidence.')
+        normalized_output = {
+            **normalized_output,
+            'vertex_count': len(vertices),
+            'face_count': len(faces),
+        }
+        extraction_diagnostics['output'] = {
+            'normalized': True,
+            'vertex_count': len(vertices),
+            'face_count': len(faces),
+        }
 
         renderable_payload = build_renderable_mesh_payload(
             {
@@ -886,6 +907,7 @@ class MCSurfaceExtractor(SurfaceExtractor):
             'surface_signature': surface_signature,
             'vertex_count': len(vertices),
             'face_count': len(faces),
+            'cubvh': extraction_diagnostics,
         }
 
 

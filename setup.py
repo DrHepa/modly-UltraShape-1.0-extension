@@ -151,7 +151,15 @@ PACKAGE_STUBS = {
     ),
     'accelerate': '__version__ = "0.0-test"\n',
     'diffusers': '__version__ = "0.0-test"\n',
-    'cubvh': '__version__ = "0.0-test"\n',
+    'cubvh': (
+        '__version__ = "0.0-test"\n\n'
+        'def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n'
+        '    del coords, corners, iso, ensure_consistency\n'
+        '    return [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [[0, 1, 2]]\n\n'
+        'def sparse_marching_cubes_cpu(coords, corners, iso, ensure_consistency=False):\n'
+        '    del coords, corners, iso, ensure_consistency\n'
+        '    return [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [[0, 1, 2]]\n'
+    ),
     'safetensors': '__version__ = "0.0-test"\n',
     'tqdm': '__version__ = "0.0-test"\n',
     'rembg': 'def remove(payload):\n    return payload\n',
@@ -377,7 +385,11 @@ def bootstrap_packaging_tools(venv_dir: Path) -> dict[str, Any]:
 def create_stub_package(site_packages: Path, module_name: str) -> None:
     package_dir = site_packages / module_name
     package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / '__init__.py').write_text(PACKAGE_STUBS[module_name], encoding='utf8')
+    if module_name == 'cubvh' and os.environ.get('ULTRASHAPE_SETUP_TEST_CUBVH_STUB_SCENARIO') == 'import-only':
+        source = '__version__ = "0.0-test"\n'
+    else:
+        source = PACKAGE_STUBS[module_name]
+    (package_dir / '__init__.py').write_text(source, encoding='utf8')
 
 
 def install_core_dependencies(venv_dir: Path) -> dict[str, Any]:
@@ -480,11 +492,24 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: Path) -> tuple[dict[str, Any], 
         subprocess.run(command, check=True, env=child_env(cuda_toolkit['env_overrides']))
 
     missing = run_import_smoke(venv_dir, ext_dir, ['cubvh'])
+    executable = run_cubvh_executable_self_tests(venv_dir, ext_dir, cuda_toolkit['env_overrides'])
+    cuda_self_test = executable['self_tests']['cuda'] if isinstance(executable.get('self_tests'), dict) else {}
+    cpu_self_test = executable['self_tests']['cpu'] if isinstance(executable.get('self_tests'), dict) else {}
+    executable_ready = (
+        not missing
+        and bool(cuda_self_test.get('executable'))
+        and (not bool(cpu_self_test.get('available')) or bool(cpu_self_test.get('executable')))
+    )
+    failure_message = None
+    if missing:
+        failure_message = 'cubvh build completed but import smoke failed.'
+    elif not executable_ready:
+        failure_message = 'cubvh import succeeded but executable sparse marching-cubes readiness failed.'
     return (
         {
             'attempted': True,
             'required': True,
-            'status': 'ready' if not missing else 'blocked',
+            'status': 'ready' if executable_ready else 'blocked',
             'commands': [rendered_command],
             'source': CUBVH_SOURCE,
             'pinned_ref': CUBVH_PINNED_REF,
@@ -494,10 +519,129 @@ def install_cubvh_stage(venv_dir: Path, ext_dir: Path) -> tuple[dict[str, Any], 
             'toolkit_pinned': cuda_toolkit['toolkit_pinned'],
             'env_overrides': cuda_toolkit['env_overrides'],
             'import_smoke_missing': missing,
-            'failure_message': None if not missing else 'cubvh build completed but import smoke failed.',
+            'diagnostics': executable.get('diagnostics', {}),
+            'self_tests': executable.get('self_tests', {}),
+            'rebuild_guidance': executable.get('rebuild_guidance', {}),
+            'failure_message': failure_message,
         },
-        missing,
+        missing if executable_ready else sorted(set([*missing, 'cubvh'])),
     )
+
+
+def blocked_cubvh_diagnostics_schema(cubvh_prerequisites: dict[str, Any]) -> dict[str, Any]:
+    input_info = {'coords_shape': [1, 3], 'corners_shape': [1, 8], 'cell_count': 1, 'iso': 0.0}
+    missing = cubvh_prerequisites.get('missing_prerequisites') if isinstance(cubvh_prerequisites.get('missing_prerequisites'), list) else []
+    fields = {
+        'missing_prerequisites': missing,
+        'detected_prerequisites': cubvh_prerequisites.get('detected_prerequisites') if isinstance(cubvh_prerequisites.get('detected_prerequisites'), dict) else {},
+    }
+    return {
+        'diagnostics': {
+            'cubvh_module_path': None,
+            'cubvh_callables': {
+                'sparse_marching_cubes': False,
+                'sparse_marching_cubes_cpu': False,
+            },
+            'selected_cuda_home': os.environ.get('CUDA_HOME'),
+            'env_torch_cuda_arch_list': os.environ.get('TORCH_CUDA_ARCH_LIST'),
+            'cuda_available': False,
+            'cuda_unavailable_reason': 'cubvh prerequisites blocked before CUDA metadata probing',
+        },
+        'self_tests': {
+            'cuda': {
+                'available': False,
+                'executable': False,
+                'skipped': True,
+                'error_class': 'cubvh_prerequisites_blocked',
+                'error_message': cubvh_prerequisites.get('failure_message'),
+                'elapsed_ms': 0,
+                'input': input_info,
+                'launch_blocking': None,
+            },
+            'cpu': {
+                'available': False,
+                'executable': False,
+                'skipped': True,
+                'error_class': 'cpu_fallback_unavailable',
+                'error_message': 'cubvh CPU fallback self-test skipped because cubvh prerequisites are blocked',
+                'elapsed_ms': 0,
+                'input': input_info,
+            },
+        },
+        'rebuild_guidance': {
+            'recommended': True,
+            'reason': 'install_cubvh_prerequisites_before_self_test',
+            'fields': fields,
+            'commands_hint': 'Install missing cubvh build prerequisites before retrying source install and executable CUDA/CPU self-tests; no build was attempted in this blocked stage.',
+        },
+    }
+
+
+def run_cubvh_executable_self_tests(venv_dir: Path, ext_dir: Path, env_overrides: dict[str, str]) -> dict[str, Any]:
+    script = [
+        'import importlib, json, sys',
+        f'sys.path.insert(0, {str((ext_dir / VENDOR_RELATIVE.parent).resolve())!r})',
+        'from ultrashape_runtime import cubvh_diagnostics as diagnostics',
+        'try:',
+        '    cubvh = importlib.import_module("cubvh")',
+        'except Exception as error:',
+        '    payload = {',
+        '        "diagnostics": diagnostics.capture_metadata(None, None),',
+        '        "self_tests": {',
+        '            "cuda": {"available": False, "executable": False, "skipped": False, "error_class": diagnostics.classify_error(error, path="import"), "error_message": str(error), "input": diagnostics.minimal_self_test_fixture()["input"]},',
+        '            "cpu": {"available": False, "executable": False, "skipped": True, "error_class": "cpu_fallback_unavailable", "error_message": "cubvh import failed", "input": diagnostics.minimal_self_test_fixture()["input"]},',
+        '        },',
+        '        "rebuild_guidance": diagnostics.rebuild_guidance("import_failure", {}),',
+        '    }',
+        '    print(json.dumps(payload))',
+        '    raise SystemExit(0)',
+        'try:',
+        '    torch = importlib.import_module("torch")',
+        'except Exception:',
+        '    torch = None',
+        'metadata = diagnostics.capture_metadata(cubvh, torch)',
+        'cuda = diagnostics.self_test_result(cubvh, path="cuda", torch_module=torch, metadata=metadata)',
+        'cpu = diagnostics.self_test_result(cubvh, path="cpu", torch_module=torch, metadata=metadata)',
+        'classes = [item.get("error_class") for item in (cuda, cpu) if item.get("error_class")]',
+        'guidance_class = classes[0] if classes else "ready"',
+        'print(json.dumps({"diagnostics": metadata, "self_tests": {"cuda": cuda, "cpu": cpu}, "rebuild_guidance": diagnostics.rebuild_guidance(guidance_class, metadata)}))',
+    ]
+    env = child_env({**env_overrides, 'CUDA_LAUNCH_BLOCKING': '1'})
+    timeout_seconds = int(os.environ.get('ULTRASHAPE_CUBVH_SELF_TEST_TIMEOUT_SECONDS', '10'))
+    try:
+        result = subprocess.run(
+            [str(venv_python(venv_dir)), '-c', '\n'.join(script)],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        input_info = {'coords_shape': [1, 3], 'corners_shape': [1, 8], 'cell_count': 1, 'iso': 0.0}
+        return {
+            'diagnostics': {},
+            'self_tests': {
+                'cuda': {'available': True, 'executable': False, 'skipped': False, 'error_class': 'cuda_kernel_failure', 'error_message': f'cubvh self-test timed out after {timeout_seconds}s', 'input': input_info, 'launch_blocking': '1'},
+                'cpu': {'available': False, 'executable': False, 'skipped': True, 'error_class': 'cpu_fallback_unavailable', 'error_message': str(error), 'input': input_info},
+            },
+            'rebuild_guidance': {'recommended': True, 'reason': 'force_source_compile_or_match_torch_cuda_arch', 'fields': {}, 'commands_hint': 'Reinstall cubvh from source with compatible CUDA settings; timeout occurred during executable self-test.'},
+        }
+    try:
+        payload = json.loads(result.stdout or '{}')
+    except json.JSONDecodeError:
+        payload = {}
+    if result.returncode != 0 or not isinstance(payload, dict):
+        input_info = {'coords_shape': [1, 3], 'corners_shape': [1, 8], 'cell_count': 1, 'iso': 0.0}
+        return {
+            'diagnostics': {},
+            'self_tests': {
+                'cuda': {'available': True, 'executable': False, 'skipped': False, 'error_class': 'cuda_kernel_failure', 'error_message': result.stderr.strip() or result.stdout.strip(), 'input': input_info, 'launch_blocking': '1'},
+                'cpu': {'available': False, 'executable': False, 'skipped': True, 'error_class': 'cpu_fallback_unavailable', 'error_message': 'cubvh self-test subprocess failed before CPU test', 'input': input_info},
+            },
+            'rebuild_guidance': {'recommended': True, 'reason': 'force_source_compile_or_match_torch_cuda_arch', 'fields': {}, 'commands_hint': 'Reinstall cubvh from source with compatible CUDA settings; subprocess failed during executable self-test.'},
+        }
+    return payload
 
 
 def install_flash_attn_stage(venv_dir: Path, ext_dir: Path, host_facts: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -1116,6 +1260,7 @@ def main() -> int:
     cubvh_prerequisites = detect_cubvh_prerequisites(host_facts)
     if not cubvh_prerequisites['ok']:
         blocked_reason = 'Skipped because cubvh prerequisites are already blocked.'
+        cubvh_blocked_schema = blocked_cubvh_diagnostics_schema(cubvh_prerequisites)
         pip_bootstrap = skipped_stage('pip_bootstrap', blocked_reason)
         dependency_install = skipped_stage('dependency_install', blocked_reason)
         native_install = {
@@ -1128,6 +1273,9 @@ def main() -> int:
                 'detected_prerequisites': cubvh_prerequisites['detected_prerequisites'],
                 'missing_prerequisites': cubvh_prerequisites['missing_prerequisites'],
                 'failure_message': cubvh_prerequisites['failure_message'],
+                'diagnostics': cubvh_blocked_schema['diagnostics'],
+                'self_tests': cubvh_blocked_schema['self_tests'],
+                'rebuild_guidance': cubvh_blocked_schema['rebuild_guidance'],
             },
             'flash_attn': {
                 'attempted': False,

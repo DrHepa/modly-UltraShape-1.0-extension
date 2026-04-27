@@ -905,6 +905,10 @@ def run_refine_pipeline(
         fallback_reasons.append('real->portable')
     if denoised['attention'] == 'sdpa':
         fallback_reasons.append('flash_attn->sdpa')
+    warnings = ['PORTABLE_FALLBACK_NON_AUTHORITATIVE']
+    cubvh_metrics = refined_surface.get('cubvh') if isinstance(refined_surface.get('cubvh'), dict) else {}
+    if cubvh_metrics.get('extraction_path') == 'cpu-fallback':
+        warnings.append('CUBVH_CPU_FALLBACK_DEGRADED')
 
     return {
         'file_path': output_path,
@@ -1028,6 +1032,7 @@ def run_refine_pipeline(
                 'source_field_signature': refined_surface['source_field_signature'],
                 'source_corner_signature': refined_surface['source_corner_signature'],
                 'surface_signature': refined_surface['surface_signature'],
+                'cubvh': cubvh_metrics,
             },
             'gate': {
                 'coarse_signature': gate_metrics['coarse_signature'],
@@ -1059,7 +1064,7 @@ def run_refine_pipeline(
         },
         'fallbacks': fallback_reasons,
         'subtrees_loaded': checkpoint_bundle['subtrees_loaded'],
-        'warnings': ['PORTABLE_FALLBACK_NON_AUTHORITATIVE'],
+        'warnings': warnings,
         'checkpoint': checkpoint_bundle['path'],
         'execution': {
             'steps': steps,

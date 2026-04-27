@@ -157,6 +157,30 @@ describe('setup.py install truth', () => {
             LD_LIBRARY_PATH: expect.stringMatching(/^\/usr\/local\/cuda-12\.8\/lib64:/),
             LIBRARY_PATH: expect.stringMatching(/^\/usr\/local\/cuda-12\.8\/lib64:/),
           }),
+          diagnostics: expect.objectContaining({
+            cubvh_callables: {
+              sparse_marching_cubes: true,
+              sparse_marching_cubes_cpu: true,
+            },
+          }),
+          self_tests: {
+            cuda: expect.objectContaining({
+              available: true,
+              executable: true,
+              skipped: false,
+              launch_blocking: '1',
+              input: expect.objectContaining({ cell_count: 1 }),
+            }),
+            cpu: expect.objectContaining({
+              available: true,
+              executable: true,
+              skipped: false,
+              input: expect.objectContaining({ cell_count: 1 }),
+            }),
+          },
+          rebuild_guidance: expect.objectContaining({
+            recommended: false,
+          }),
         }),
         flash_attn: {
           attempted: false,
@@ -183,6 +207,72 @@ describe('setup.py install truth', () => {
       expect(readSetupSummary(checkout)).not.toContain('params.coarse_mesh');
       expect(readSetupSummary(checkout)).toContain(FLASH_ATTN_SKIP_MESSAGE);
       expect(readSetupSummary(checkout).toLowerCase()).not.toContain('hunyuan');
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('does not mark cubvh executable readiness from import-only success', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-cubvh-import-only-'));
+    const checkout = path.join(sandbox, 'repo');
+    copyInstallSurface(checkout);
+
+    try {
+      const result = runSetup(checkout, {
+        extDir: checkout,
+        pythonExe: '/opt/modly/python/bin/python3',
+        payload: {},
+        env: {
+          ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+          ULTRASHAPE_SETUP_TEST_CUBVH_STUB_SCENARIO: 'import-only',
+          ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+          ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'stub-weight',
+        },
+      });
+
+      expect(result.status).toBe(1);
+      const readiness = readReadiness(checkout);
+      const summary = JSON.parse(readSetupSummary(checkout)) as Readiness;
+      expect(readiness).toMatchObject({
+        install_success: false,
+        install_ready: false,
+        required_imports_ok: false,
+        status: 'blocked',
+        native_install: {
+          cubvh: expect.objectContaining({
+            status: 'blocked',
+            import_smoke_missing: [],
+            diagnostics: expect.objectContaining({
+              cubvh_callables: {
+                sparse_marching_cubes: false,
+                sparse_marching_cubes_cpu: false,
+              },
+            }),
+            self_tests: {
+              cuda: expect.objectContaining({
+                available: false,
+                executable: false,
+                skipped: false,
+                error_class: 'missing_callable',
+                input: expect.objectContaining({ cell_count: 1 }),
+              }),
+              cpu: expect.objectContaining({
+                available: false,
+                executable: false,
+                skipped: true,
+                error_class: 'cpu_fallback_unavailable',
+              }),
+            },
+            rebuild_guidance: expect.objectContaining({
+              recommended: true,
+              reason: 'force_source_compile_or_match_torch_cuda_arch',
+            }),
+          }),
+        },
+      });
+      expect(readiness.missing_required).toContain('native-stage:cubvh');
+      expect(summary.native_install).toMatchObject(readiness.native_install ?? {});
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }
@@ -297,6 +387,38 @@ describe('setup.py install truth', () => {
         venv_dir: path.join(checkout, 'venv'),
       });
       expect(readiness.missing_required).toContain('native-stage:cubvh');
+      expect(readiness.native_install).toMatchObject({
+        cubvh: expect.objectContaining({
+          diagnostics: expect.objectContaining({
+            cuda_available: false,
+            cuda_unavailable_reason: 'cubvh prerequisites blocked before CUDA metadata probing',
+            cubvh_callables: {
+              sparse_marching_cubes: false,
+              sparse_marching_cubes_cpu: false,
+            },
+          }),
+          self_tests: {
+            cuda: expect.objectContaining({
+              available: false,
+              executable: false,
+              skipped: true,
+              error_class: 'cubvh_prerequisites_blocked',
+              input: expect.objectContaining({ cell_count: 1 }),
+            }),
+            cpu: expect.objectContaining({
+              available: false,
+              executable: false,
+              skipped: true,
+              error_class: 'cpu_fallback_unavailable',
+              input: expect.objectContaining({ cell_count: 1 }),
+            }),
+          },
+          rebuild_guidance: expect.objectContaining({
+            recommended: true,
+            reason: 'install_cubvh_prerequisites_before_self_test',
+          }),
+        }),
+      });
       expect(existsSync(path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime', 'local_runner.py'))).toBe(true);
       expect(existsSync(path.join(checkout, 'venv', 'bin', 'python'))).toBe(true);
       expect(result.stdout).not.toContain('filePath');
@@ -360,6 +482,19 @@ describe('setup.py install truth', () => {
 
       expect(result.status).toBe(1);
       expect(result.stderr).not.toContain('should not run when cubvh prerequisites are already blocked');
+      const readiness = readReadiness(checkout);
+      expect(readiness.native_install).toMatchObject({
+        cubvh: expect.objectContaining({
+          diagnostics: expect.objectContaining({
+            cuda_unavailable_reason: 'cubvh prerequisites blocked before CUDA metadata probing',
+          }),
+          self_tests: {
+            cuda: expect.objectContaining({ skipped: true, error_class: 'cubvh_prerequisites_blocked' }),
+            cpu: expect.objectContaining({ skipped: true, error_class: 'cpu_fallback_unavailable' }),
+          },
+          rebuild_guidance: expect.objectContaining({ reason: 'install_cubvh_prerequisites_before_self_test' }),
+        }),
+      });
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }

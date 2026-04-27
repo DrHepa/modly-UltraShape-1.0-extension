@@ -112,6 +112,13 @@ const COHESIVE_CUBVH_STUB = `def sparse_marching_cubes(coords, corners, iso, ens
 
 const LAMELLAR_CUBVH_STUB = `def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    vertices = []\n    faces = []\n    for z in [0.0, 0.5, 1.0]:\n        base = len(vertices)\n        vertices.extend([\n            [0.0, 0.0, z],\n            [1.0, 0.0, z],\n            [1.0, 1.0, z],\n            [0.0, 1.0, z],\n            [0.5, 0.5, z],\n        ])\n        faces.extend([\n            [base + 0, base + 1, base + 4],\n            [base + 1, base + 2, base + 4],\n            [base + 2, base + 3, base + 4],\n            [base + 3, base + 0, base + 4],\n        ])\n    return vertices, faces\n`;
 
+const CUDA_OOM_CPU_COHESIVE_CUBVH_STUB = `${COHESIVE_CUBVH_STUB.replace(
+  'def sparse_marching_cubes',
+  'def sparse_marching_cubes_cpu',
+)}\ndef sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    raise RuntimeError("CUDA out of memory while launching sparse_marching_cubes on tiny input")\n`;
+
+const CUDA_OOM_CPU_FAIL_CUBVH_STUB = `def sparse_marching_cubes(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    raise RuntimeError("CUDA out of memory while launching sparse_marching_cubes on tiny input")\n\ndef sparse_marching_cubes_cpu(coords, corners, iso, ensure_consistency=False):\n    del coords, corners, iso, ensure_consistency\n    raise RuntimeError("CPU sparse marching cubes failed after CUDA OOM")\n`;
+
 function writeCubvhStub(root: string, source: string) {
   writeFileSync(path.join(root, 'cubvh.py'), source, 'utf8');
 }
@@ -202,6 +209,23 @@ function createRuntimeFixture(options: { cubvhSource?: string } = {}) {
   );
 
   return { sandbox, stubRoot, extDir, imageInputPath, meshInputPath, checkpoint };
+}
+
+function defaultLocalRunnerJob(fixture: ReturnType<typeof createRuntimeFixture>, outputDir: string) {
+  return {
+    reference_image: fixture.imageInputPath,
+    coarse_mesh: fixture.meshInputPath,
+    output_dir: outputDir,
+    checkpoint: fixture.checkpoint,
+    config_path: configPath,
+    ext_dir: fixture.extDir,
+    output_format: 'glb',
+    backend: 'local',
+    steps: 4,
+    guidance_scale: 6,
+    seed: 7,
+    preserve_scale: true,
+  };
 }
 
 function createFakeUpstreamCheckout(
@@ -692,6 +716,114 @@ describe('private runtime flow behind the model shell', () => {
         },
       });
       expect(existsSync(path.join(outputDir, 'refined.glb'))).toBe(true);
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('records CUDA cubvh extraction diagnostics when sparse_marching_cubes succeeds', () => {
+    const fixture = createRuntimeFixture();
+    const outputDir = path.join(fixture.sandbox, 'output-cuda-diagnostics');
+
+    try {
+      const result = runLocalRunner(defaultLocalRunnerJob(fixture, outputDir), fixture.stubRoot);
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: true,
+        result: {
+          metrics: {
+            extract: {
+              marching_cubes: 'cubvh.sparse_marching_cubes',
+              cubvh: {
+                extraction_path: 'cuda',
+                degraded: false,
+                output: {
+                  normalized: true,
+                },
+              },
+            },
+          },
+        },
+      });
+      expect(existsSync(path.join(outputDir, 'refined.glb'))).toBe(true);
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back from CUDA OOM to CPU cubvh while remaining degraded and gated', () => {
+    const fixture = createRuntimeFixture({ cubvhSource: CUDA_OOM_CPU_COHESIVE_CUBVH_STUB });
+    const outputDir = path.join(fixture.sandbox, 'output-cpu-fallback');
+
+    try {
+      const result = runLocalRunner(defaultLocalRunnerJob(fixture, outputDir), fixture.stubRoot, {
+        ULTRASHAPE_RUNTIME_MODE: 'portable',
+      });
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: true,
+        result: {
+          metrics: {
+            runtime_mode: {
+              active: 'portable',
+              portable: {
+                authoritative: false,
+              },
+            },
+            extract: {
+              cubvh: {
+                extraction_path: 'cpu-fallback',
+                degraded: true,
+                authoritative: false,
+                fallback_reason: expect.stringContaining('cuda'),
+                cuda_failure: {
+                  error_class: expect.stringContaining('cuda'),
+                },
+                output: {
+                  normalized: true,
+                },
+              },
+            },
+            gate: {
+              portable_quality: {
+                passed: true,
+                reason: 'ok',
+              },
+            },
+          },
+          warnings: expect.arrayContaining(['PORTABLE_FALLBACK_NON_AUTHORITATIVE', 'CUBVH_CPU_FALLBACK_DEGRADED']),
+        },
+      });
+      expect(existsSync(path.join(outputDir, 'refined.glb'))).toBe(true);
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('fails CUDA OOM plus CPU failure with public cubvh diagnostics and rebuild guidance', () => {
+    const fixture = createRuntimeFixture({ cubvhSource: CUDA_OOM_CPU_FAIL_CUBVH_STUB });
+    const outputDir = path.join(fixture.sandbox, 'output-cpu-fallback-failure');
+
+    try {
+      const result = runLocalRunner(defaultLocalRunnerJob(fixture, outputDir), fixture.stubRoot, {
+        ULTRASHAPE_RUNTIME_MODE: 'portable',
+      });
+
+      expect(result.status).toBe(1);
+      const payload = JSON.parse(result.stdout) as { error_code: string; error_message: string; ok: boolean };
+      expect(payload).toMatchObject({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
+      expect(payload.error_message).toContain('cubvh_error_class=cuda_oom_tiny_input_suspected_kernel_or_arch_mismatch');
+      expect(payload.error_message).toContain('coords_shape=');
+      expect(payload.error_message).toContain('corners_shape=');
+      expect(payload.error_message).toContain('cell_count=');
+      expect(payload.error_message).toContain('readiness_summary=runtime-live-no-setup-self-test');
+      expect(payload.error_message).toContain('rebuild_guidance=force_source_compile_or_match_torch_cuda_arch');
+      expect(existsSync(path.join(outputDir, 'refined.glb'))).toBe(false);
     } finally {
       rmSync(fixture.sandbox, { recursive: true, force: true });
     }
