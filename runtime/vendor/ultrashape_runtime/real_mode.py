@@ -21,7 +21,7 @@ REQUIRED_CHECKOUT_MARKERS = (
     ('ultrashape', 'dir'),
 )
 LICENSE_MARKERS = ('LICENSE', 'LICENSE.txt', 'NOTICE', 'Notice.txt')
-REAL_REQUIRED_IMPORTS = ('torch', 'flash_attn')
+REAL_REQUIRED_IMPORTS = ('torch', 'flash_attn', 'cubvh', 'omegaconf')
 
 
 class RealModeUnavailableError(Exception):
@@ -104,6 +104,8 @@ def describe_real_readiness(
     config_path: str | os.PathLike[str] | None = None,
     runtime_config_path: str | os.PathLike[str] | None = None,
     upstream_config_path: str | os.PathLike[str] | None = None,
+    python_exe: str | os.PathLike[str] | None = None,
+    venv_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
     description = validate_upstream_checkout(checkout_path)
     if description.get('available'):
@@ -112,6 +114,8 @@ def describe_real_readiness(
             checkpoint=checkpoint,
             runtime_config_path=runtime_config_path or config_path,
             upstream_config_path=upstream_config_path,
+            python_exe=python_exe,
+            venv_dir=venv_dir,
         )
     return {
         **description,
@@ -120,19 +124,34 @@ def describe_real_readiness(
         'config': {'available': False, 'path': None},
         'checkpoint': {'available': False, 'path': str(checkpoint) if checkpoint else None},
         'dependencies': _dependency_status([]),
+        'interpreter': _interpreter_status(python_exe=python_exe, venv_dir=venv_dir),
         'reason': 'Authoritative real mode requires an explicit validated upstream UltraShape checkout.',
     }
 
 
 def _dependency_status(missing: list[str]) -> dict[str, object]:
-    return {
+    status = {
         name: {
             'available': name not in missing,
             'required': True,
-            'degradable_for_portable': name == 'flash_attn',
+            'degradable_for_portable': False,
         }
         for name in REAL_REQUIRED_IMPORTS
     }
+    torch_status = status.get('torch')
+    if isinstance(torch_status, dict) and torch_status.get('available') is True:
+        torch_status['cuda_available'] = _torch_cuda_available()
+    return status
+
+
+def _torch_cuda_available() -> bool:
+    try:
+        torch = importlib.import_module('torch')
+        cuda = getattr(torch, 'cuda', None)
+        is_available = getattr(cuda, 'is_available', None)
+        return bool(is_available()) if callable(is_available) else False
+    except Exception:
+        return False
 
 
 def _missing_imports(module_names: tuple[str, ...]) -> list[str]:
@@ -143,6 +162,39 @@ def _missing_imports(module_names: tuple[str, ...]) -> list[str]:
         except Exception:
             missing.append(module_name)
     return missing
+
+
+def _interpreter_status(
+    *,
+    python_exe: str | os.PathLike[str] | None = None,
+    venv_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    selected_text = str(python_exe).strip() if python_exe else sys.executable
+    selected = Path(selected_text).expanduser()
+    recorded_venv = Path(str(venv_dir)).expanduser().resolve() if venv_dir else None
+    matches_recorded_venv = True
+    if recorded_venv is not None:
+        try:
+            selected.resolve().relative_to(recorded_venv)
+        except ValueError:
+            matches_recorded_venv = False
+    return {
+        'python_exe': selected_text,
+        'runtime_python': sys.executable,
+        'venv_dir': str(recorded_venv) if recorded_venv else None,
+        'matches_recorded_venv': matches_recorded_venv,
+    }
+
+
+def _interpreter_blockers(
+    *,
+    python_exe: str | os.PathLike[str] | None = None,
+    venv_dir: str | os.PathLike[str] | None = None,
+) -> list[str]:
+    status = _interpreter_status(python_exe=python_exe, venv_dir=venv_dir)
+    if status.get('venv_dir') and status.get('matches_recorded_venv') is False:
+        return [f"interpreter:venv-mismatch:{status['python_exe']}:not-under:{status['venv_dir']}"]
+    return []
 
 
 def _with_checkout_on_path(checkout: Path, callback):
@@ -182,6 +234,8 @@ def _with_real_readiness(
     checkpoint: str | os.PathLike[str] | None,
     runtime_config_path: str | os.PathLike[str] | None,
     upstream_config_path: str | os.PathLike[str] | None,
+    python_exe: str | os.PathLike[str] | None = None,
+    venv_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
     checkout = Path(str(checkout_description['checkout_path']))
     runtime_config = Path(runtime_config_path).expanduser().resolve() if runtime_config_path else None
@@ -190,12 +244,15 @@ def _with_real_readiness(
     missing_deps = _missing_imports(REAL_REQUIRED_IMPORTS)
     blockers = list(checkout_description.get('blockers', []))
     blockers.extend(f'dependency:{name}' for name in missing_deps)
+    if 'torch' not in missing_deps and not _torch_cuda_available():
+        blockers.append('cuda:unavailable')
     if runtime_config is not None and not runtime_config.is_file():
         blockers.append(f'runtime_config:{runtime_config}')
     if not upstream_config.is_file():
         blockers.append(f'upstream_config:{upstream_config}')
     if checkpoint_path is None or not checkpoint_path.is_file():
         blockers.append(f'checkpoint:{checkpoint_path or "missing"}')
+    blockers.extend(_interpreter_blockers(python_exe=python_exe, venv_dir=venv_dir))
     blockers.extend(_entrypoint_blockers(checkout))
 
     return {
@@ -204,6 +261,7 @@ def _with_real_readiness(
         'source': 'checkout' if not blockers else checkout_description.get('source'),
         'blockers': blockers,
         'dependencies': _dependency_status(missing_deps),
+        'interpreter': _interpreter_status(python_exe=python_exe, venv_dir=venv_dir),
         'runtime_config': {'available': runtime_config is not None and runtime_config.is_file(), 'path': str(runtime_config) if runtime_config else None},
         'upstream_config': {'available': upstream_config.is_file(), 'path': str(upstream_config)},
         'config': {'available': upstream_config.is_file(), 'path': str(upstream_config)},
@@ -287,7 +345,10 @@ def run_real_refine_pipeline(
     guidance_scale: float,
     seed: int | None,
     preserve_scale: bool,
+    checkout_path: str | None = None,
     upstream_config_path: str | None = None,
+    python_exe: str | None = None,
+    venv_dir: str | None = None,
 ) -> dict[str, object]:
     del ext_dir
     if backend != 'local':
@@ -296,9 +357,12 @@ def run_real_refine_pipeline(
         raise RealModeUnavailableError('UltraShape real runner is glb-only in this MVP.')
 
     checkout_description = describe_real_readiness(
+        checkout_path=checkout_path,
         checkpoint=checkpoint,
         runtime_config_path=config_path,
         upstream_config_path=upstream_config_path,
+        python_exe=python_exe,
+        venv_dir=venv_dir,
     )
     if not checkout_description.get('available'):
         blockers = ', '.join(str(blocker) for blocker in checkout_description.get('blockers', []))

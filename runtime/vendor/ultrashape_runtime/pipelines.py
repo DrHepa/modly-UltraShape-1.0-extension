@@ -39,17 +39,29 @@ def build_refine_pipeline() -> dict[str, str]:
     }
 
 
-def _requested_runtime_mode() -> str:
-    candidate = os.environ.get('ULTRASHAPE_RUNTIME_MODE', 'auto').strip().lower()
+def _requested_runtime_mode(runtime_mode: str | None = None) -> str:
+    candidate = str(runtime_mode or os.environ.get('ULTRASHAPE_RUNTIME_MODE', 'auto')).strip().lower()
     return candidate if candidate in {'auto', 'real', 'portable'} else 'auto'
 
 
-def resolve_runtime_mode(*, checkpoint: str | None = None, config_path: str | None = None, upstream_config_path: str | None = None) -> dict[str, object]:
-    requested = _requested_runtime_mode()
+def resolve_runtime_mode(
+    *,
+    checkpoint: str | None = None,
+    config_path: str | None = None,
+    upstream_config_path: str | None = None,
+    runtime_mode: str | None = None,
+    upstream_checkout_path: str | None = None,
+    python_exe: str | None = None,
+    venv_dir: str | None = None,
+) -> dict[str, object]:
+    requested = _requested_runtime_mode(runtime_mode)
     real = describe_real_readiness(
+        checkout_path=upstream_checkout_path,
         checkpoint=checkpoint,
         runtime_config_path=config_path,
         upstream_config_path=upstream_config_path,
+        python_exe=python_exe,
+        venv_dir=venv_dir,
     ) if requested in {'auto', 'real'} else {
         'available': False,
         'adapter': REAL_MODE_ADAPTER,
@@ -759,12 +771,24 @@ def run_refine_pipeline(
     guidance_scale: float,
     seed: int | None,
     preserve_scale: bool,
+    runtime_mode: str | None = None,
+    upstream_checkout_path: str | None = None,
     upstream_config_path: str | None = None,
+    python_exe: str | None = None,
+    venv_dir: str | None = None,
 ) -> dict[str, object]:
     config = load_runtime_config(config_path)
     require_imports(config)
     _, extraction = validate_mvp_scope(config, backend, output_format)
-    runtime_mode = resolve_runtime_mode(checkpoint=checkpoint, config_path=config_path, upstream_config_path=upstream_config_path)
+    runtime_mode = resolve_runtime_mode(
+        checkpoint=checkpoint,
+        config_path=config_path,
+        runtime_mode=runtime_mode,
+        upstream_checkout_path=upstream_checkout_path,
+        upstream_config_path=upstream_config_path,
+        python_exe=python_exe,
+        venv_dir=venv_dir,
+    )
 
     if runtime_mode.get('active') == 'real':
         return run_real_refine_pipeline(
@@ -774,7 +798,10 @@ def run_refine_pipeline(
             output_format=output_format,
             checkpoint=checkpoint,
             config_path=config_path,
+            checkout_path=upstream_checkout_path,
             upstream_config_path=upstream_config_path,
+            python_exe=python_exe,
+            venv_dir=venv_dir,
             ext_dir=ext_dir,
             backend=backend,
             steps=steps,
@@ -790,7 +817,10 @@ def run_refine_pipeline(
             output_format=output_format,
             checkpoint=checkpoint,
             config_path=config_path,
+            checkout_path=upstream_checkout_path,
             upstream_config_path=upstream_config_path,
+            python_exe=python_exe,
+            venv_dir=venv_dir,
             ext_dir=ext_dir,
             backend=backend,
             steps=steps,

@@ -268,6 +268,21 @@ function createFakeUpstreamCheckout(
 function writeRealDependencyStubs(root: string) {
   mkdirSync(path.join(root, 'flash_attn'), { recursive: true });
   writeFileSync(path.join(root, 'flash_attn', '__init__.py'), '__version__ = "0.0-test"\n', 'utf8');
+  const torchPath = path.join(root, 'torch.py');
+  const currentTorch = existsSync(torchPath) ? readFileSync(torchPath, 'utf8') : '';
+  writeFileSync(
+    torchPath,
+    [currentTorch, `class cuda:`, `    @staticmethod`, `    def is_available():`, `        return True`].join('\n'),
+    'utf8',
+  );
+}
+
+function writeTorchCudaStub(root: string, cudaAvailable: boolean) {
+  writeFileSync(
+    path.join(root, 'torch.py'),
+    [`class cuda:`, `    @staticmethod`, `    def is_available():`, `        return ${cudaAvailable ? 'True' : 'False'}`].join('\n'),
+    'utf8',
+  );
 }
 
 function runPythonSnippet(source: string, args: string[] = []) {
@@ -323,6 +338,7 @@ describe('private runtime flow behind the model shell', () => {
       config_path: configPath,
       ext_dir: '/tmp/ext',
       backend: 'local',
+      runtime_mode: 'auto',
       steps: 4,
       guidance_scale: 6,
       seed: 7,
@@ -1353,6 +1369,155 @@ describe('private runtime flow behind the model shell', () => {
         },
       });
       expect(readFileSync(path.join(outputDir, 'refined.glb')).subarray(0, 4).toString('ascii')).toBe('glTF');
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('treats missing flash_attn as a hard real-mode blocker, not a degradable real dependency', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox);
+    mkdirSync(path.join(fixture.stubRoot, 'cubvh'), { recursive: true });
+    writeFileSync(path.join(fixture.stubRoot, 'cubvh', '__init__.py'), '\n', 'utf8');
+    mkdirSync(path.join(fixture.stubRoot, 'omegaconf'), { recursive: true });
+    writeFileSync(path.join(fixture.stubRoot, 'omegaconf', '__init__.py'), '\n', 'utf8');
+    writeTorchCudaStub(fixture.stubRoot, true);
+
+    try {
+      const result = spawnSync(
+        'python3',
+        [
+          '-c',
+          [
+            'import json, sys',
+            'from ultrashape_runtime.real_mode import describe_real_readiness',
+            'print(json.dumps(describe_real_readiness(checkout_path=sys.argv[1], checkpoint=sys.argv[2], runtime_config_path=sys.argv[3])))',
+          ].join('\n'),
+          checkout,
+          fixture.checkpoint,
+          configPath,
+        ],
+        {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PYTHONPATH: [fixture.stubRoot, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+          },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      const readiness = JSON.parse(result.stdout);
+      expect(readiness.available).toBe(false);
+      expect(readiness.blockers).toContain('dependency:flash_attn');
+      expect(readiness.dependencies.flash_attn).toMatchObject({
+        available: false,
+        required: true,
+        degradable_for_portable: false,
+      });
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('reports torch, CUDA, cubvh, omegaconf, and upstream import blockers explicitly', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox);
+    writeRealDependencyStubs(fixture.stubRoot);
+    writeTorchCudaStub(fixture.stubRoot, false);
+    rmSync(path.join(fixture.stubRoot, 'cubvh.py'), { force: true });
+    rmSync(path.join(fixture.stubRoot, 'omegaconf.py'), { force: true });
+    writeFileSync(
+      path.join(checkout, 'scripts', 'infer_dit_refine.py'),
+      'import definitely_missing_ultrashape_dependency\ndef run_inference(args):\n    return None\n',
+      'utf8',
+    );
+
+    try {
+      const result = spawnSync(
+        'python3',
+        [
+          '-c',
+          [
+            'import json, sys',
+            'from ultrashape_runtime.real_mode import describe_real_readiness',
+            'print(json.dumps(describe_real_readiness(checkout_path=sys.argv[1], checkpoint=sys.argv[2], runtime_config_path=sys.argv[3])))',
+          ].join('\n'),
+          checkout,
+          fixture.checkpoint,
+          configPath,
+        ],
+        {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PYTHONPATH: [fixture.stubRoot, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+          },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      const readiness = JSON.parse(result.stdout);
+      expect(readiness.available).toBe(false);
+      expect(readiness.blockers).toEqual(
+        expect.arrayContaining(['dependency:cubvh', 'dependency:omegaconf', 'cuda:unavailable']),
+      );
+      expect(readiness.blockers.some((blocker: string) => blocker.startsWith('entrypoint:scripts.infer_dit_refine.run_inference:'))).toBe(true);
+      expect(readiness.dependencies.torch.cuda_available).toBe(false);
+      expect(readiness.dependencies.cubvh.available).toBe(false);
+      expect(readiness.dependencies.omegaconf.available).toBe(false);
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('diagnoses recorded venv visibility when the runner interpreter cannot see setup-installed dependencies', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox);
+    const recordedVenv = path.join(fixture.sandbox, 'recorded-venv');
+    writeRealDependencyStubs(fixture.stubRoot);
+    writeTorchCudaStub(fixture.stubRoot, true);
+    mkdirSync(path.join(fixture.stubRoot, 'cubvh'), { recursive: true });
+    writeFileSync(path.join(fixture.stubRoot, 'cubvh', '__init__.py'), '\n', 'utf8');
+    mkdirSync(path.join(fixture.stubRoot, 'omegaconf'), { recursive: true });
+    writeFileSync(path.join(fixture.stubRoot, 'omegaconf', '__init__.py'), '\n', 'utf8');
+
+    try {
+      const result = spawnSync(
+        'python3',
+        [
+          '-c',
+          [
+            'import json, sys',
+            'from ultrashape_runtime.real_mode import describe_real_readiness',
+            'print(json.dumps(describe_real_readiness(checkout_path=sys.argv[1], checkpoint=sys.argv[2], runtime_config_path=sys.argv[3], python_exe="/usr/bin/python3", venv_dir=sys.argv[4])))',
+          ].join('\n'),
+          checkout,
+          fixture.checkpoint,
+          configPath,
+          recordedVenv,
+        ],
+        {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PYTHONPATH: [fixture.stubRoot, runtimeVendorPath, process.env.PYTHONPATH].filter(Boolean).join(':'),
+          },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      const readiness = JSON.parse(result.stdout);
+      expect(readiness.available).toBe(false);
+      expect(readiness.blockers).toContain(`interpreter:venv-mismatch:/usr/bin/python3:not-under:${recordedVenv}`);
+      expect(readiness.interpreter).toMatchObject({
+        python_exe: '/usr/bin/python3',
+        venv_dir: recordedVenv,
+        matches_recorded_venv: false,
+      });
     } finally {
       rmSync(fixture.sandbox, { recursive: true, force: true });
     }

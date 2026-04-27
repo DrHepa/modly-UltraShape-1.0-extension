@@ -138,6 +138,10 @@ def run_refine_job(
     seed: int | None,
     preserve_scale: bool,
     upstream_config_path: str | None = None,
+    runtime_mode: str | None = None,
+    upstream_checkout_path: str | None = None,
+    python_exe: str | None = None,
+    venv_dir: str | None = None,
 ) -> dict[str, object]:
     if backend != 'local':
         raise invalid_input('UltraShape local runner is local-only in this MVP.')
@@ -167,7 +171,11 @@ def run_refine_job(
             output_format=output_format,
             checkpoint=checkpoint,
             config_path=config_path,
+            runtime_mode=runtime_mode,
+            upstream_checkout_path=upstream_checkout_path,
             upstream_config_path=upstream_config_path,
+            python_exe=python_exe,
+            venv_dir=venv_dir,
             ext_dir=ext_dir,
             backend=backend,
             steps=steps,

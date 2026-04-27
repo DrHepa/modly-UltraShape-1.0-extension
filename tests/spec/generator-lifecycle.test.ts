@@ -30,7 +30,371 @@ function runSetup(cwd: string, extDir: string, env: NodeJS.ProcessEnv = {}) {
   });
 }
 
+function writeForwardingReadiness(
+  checkout: string,
+  fields: {
+    upstreamCheckout: string;
+    upstreamConfig: string;
+    checkpoint: string;
+    pythonExe: string;
+    venvDir: string;
+  },
+  options: { stageAssets?: boolean } = {},
+) {
+  if (options.stageAssets !== false) {
+    mkdirSync(path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime'), { recursive: true });
+    mkdirSync(path.join(checkout, 'runtime', 'configs'), { recursive: true });
+    mkdirSync(path.dirname(fields.checkpoint), { recursive: true });
+    writeFileSync(path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'), 'runtime: {}\n', 'utf8');
+    writeFileSync(fields.checkpoint, 'weights', 'utf8');
+  }
+  writeFileSync(
+    path.join(checkout, '.runtime-readiness.json'),
+    JSON.stringify({
+      status: 'ready',
+      required_imports_ok: true,
+      weights_ready: true,
+      config_path: path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'),
+      checkpoint: fields.checkpoint,
+      python_exe: fields.pythonExe,
+      venv_dir: fields.venvDir,
+      runtime_modes: {
+        requested: 'auto',
+        active: 'real',
+        real: {
+          available: true,
+          checkout_path: fields.upstreamCheckout,
+          upstream_config: { available: true, path: fields.upstreamConfig },
+          config: { available: true, path: fields.upstreamConfig },
+          checkpoint: { available: true, path: fields.checkpoint },
+        },
+        portable: { available: true },
+      },
+    }),
+    'utf8',
+  );
+}
+
+function runGeneratorDiagnosticProbe(checkout: string, source: string) {
+  return spawnSync('python3', ['-S', '-c', source], {
+    cwd: checkout,
+    encoding: 'utf8',
+    env: process.env,
+  });
+}
+
+function runRunnerJobProbe(checkout: string, env: NodeJS.ProcessEnv = {}) {
+  const script = [
+    'import json, os, sys',
+    'from pathlib import Path',
+    'from generator import UltraShapeGenerator',
+    'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "outputs")',
+    'readiness = generator._require_runtime_ready()',
+    'job = generator._build_runner_job(readiness=readiness, reference_image=Path.cwd() / "reference.png", coarse_mesh=Path.cwd() / "coarse.glb", output_dir=Path.cwd() / "outputs", params={"steps": 7, "guidance_scale": 2.5, "seed": 123, "preserve_scale": True})',
+    'print(json.dumps(job, sort_keys=True))',
+  ].join('\n');
+
+  return spawnSync('python3', ['-S', '-c', script], {
+    cwd: checkout,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...env,
+    },
+  });
+}
+
 describe('generator lifecycle shell', () => {
+  it('diagnoses stale installed roots when readiness is missing or staged assets disappeared', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-stale-missing-'));
+    const checkout = path.join(sandbox, 'repo');
+    copyInstallSurface(checkout);
+
+    try {
+      const missingReadiness = runGeneratorDiagnosticProbe(
+        checkout,
+        [
+          'import json',
+          'from pathlib import Path',
+          'from generator import PublicRuntimeError, UltraShapeGenerator',
+          'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "outputs")',
+          'try:',
+          '    generator.load()',
+          'except PublicRuntimeError as error:',
+          '    print(json.dumps({"code": error.code, "message": str(error)}))',
+        ].join('\n'),
+      );
+      expect(missingReadiness.status).toBe(0);
+      expect(JSON.parse(missingReadiness.stdout)).toEqual({
+        code: 'LOCAL_RUNTIME_UNAVAILABLE',
+        message: expect.stringContaining('installed extension root is stale or incomplete'),
+      });
+      expect(JSON.parse(missingReadiness.stdout).message).toContain('.runtime-readiness.json missing');
+
+      writeForwardingReadiness(checkout, {
+        upstreamCheckout: path.join(sandbox, 'upstream'),
+        upstreamConfig: path.join(sandbox, 'upstream', 'configs', 'infer_dit_refine.yaml'),
+        checkpoint: path.join(checkout, 'models', 'ultrashape', 'missing-real.pt'),
+        pythonExe: path.join(checkout, 'venv', 'bin', 'python'),
+        venvDir: path.join(checkout, 'venv'),
+      }, { stageAssets: false });
+      rmSync(path.join(checkout, 'runtime', 'vendor'), { recursive: true, force: true });
+      rmSync(path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'), { force: true });
+      const missingAssets = runGeneratorDiagnosticProbe(
+        checkout,
+        [
+          'import json',
+          'from pathlib import Path',
+          'from generator import PublicRuntimeError, UltraShapeGenerator',
+          'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "outputs")',
+          'try:',
+          '    generator.load()',
+          'except PublicRuntimeError as error:',
+          '    print(json.dumps({"code": error.code, "message": str(error)}))',
+        ].join('\n'),
+      );
+
+      expect(missingAssets.status).toBe(0);
+      const assetMessage = JSON.parse(missingAssets.stdout).message as string;
+      expect(assetMessage).toContain('staged vendor path missing');
+      expect(assetMessage).toContain('runtime config path missing');
+      expect(assetMessage).toContain('checkpoint path missing');
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('diagnoses readiness recorded for a different or suspicious installed extension root', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-stale-paths-'));
+    const checkout = path.join(sandbox, 'repo');
+    const otherInstallRoot = path.join(sandbox, 'other-install');
+    const suspiciousRoot = path.join(sandbox, 'source-repo');
+    copyInstallSurface(checkout);
+    mkdirSync(path.join(checkout, 'runtime', 'vendor', 'ultrashape_runtime'), { recursive: true });
+    mkdirSync(path.join(checkout, 'runtime', 'configs'), { recursive: true });
+    mkdirSync(path.join(checkout, 'models', 'ultrashape'), { recursive: true });
+    writeFileSync(path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'), 'runtime: {}\n', 'utf8');
+    writeFileSync(path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'), 'weights', 'utf8');
+
+    try {
+      writeFileSync(
+        path.join(checkout, '.runtime-readiness.json'),
+        JSON.stringify({
+          status: 'ready',
+          required_imports_ok: true,
+          weights_ready: true,
+          ext_dir: otherInstallRoot,
+          vendor_path: path.join(suspiciousRoot, 'runtime', 'vendor', 'ultrashape_runtime'),
+          config_path: path.join(checkout, 'runtime', 'configs', 'infer_dit_refine.yaml'),
+          checkpoint: path.join(checkout, 'models', 'ultrashape', 'ultrashape_v1.pt'),
+        }),
+        'utf8',
+      );
+
+      const result = runGeneratorDiagnosticProbe(
+        checkout,
+        [
+          'import json',
+          'from pathlib import Path',
+          'from generator import PublicRuntimeError, UltraShapeGenerator',
+          'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "outputs")',
+          'try:',
+          '    generator.load()',
+          'except PublicRuntimeError as error:',
+          '    print(json.dumps({"code": error.code, "message": str(error)}))',
+        ].join('\n'),
+      );
+
+      expect(result.status).toBe(0);
+      const message = JSON.parse(result.stdout).message as string;
+      expect(message).toContain('readiness ext_dir mismatch');
+      expect(message).toContain(otherInstallRoot);
+      expect(message).toContain('vendor_path points outside installed extension root');
+      expect(message).toContain(suspiciousRoot);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards setup-recorded real readiness fields into the runner job', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-readiness-forward-'));
+    const checkout = path.join(sandbox, 'repo');
+    const upstreamCheckout = path.join(sandbox, 'upstream-a');
+    const upstreamConfig = path.join(upstreamCheckout, 'configs', 'infer_dit_refine.yaml');
+    const checkpoint = path.join(checkout, 'models', 'ultrashape', 'real.pt');
+    const venvDir = path.join(checkout, 'venv');
+    copyInstallSurface(checkout);
+
+    try {
+      writeForwardingReadiness(checkout, {
+        upstreamCheckout,
+        upstreamConfig,
+        checkpoint,
+        pythonExe: path.join(venvDir, 'bin', 'python'),
+        venvDir,
+      });
+
+      const result = runRunnerJobProbe(checkout);
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        runtime_mode: 'auto',
+        upstream_checkout_path: upstreamCheckout,
+        upstream_config_path: upstreamConfig,
+        checkpoint,
+        python_exe: path.join(venvDir, 'bin', 'python'),
+        venv_dir: venvDir,
+      });
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('uses runtime readiness as authority while setup summary contributes diagnostics only', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-summary-diagnostics-'));
+    const checkout = path.join(sandbox, 'repo');
+    const readinessCheckout = path.join(sandbox, 'readiness-upstream');
+    const readinessConfig = path.join(readinessCheckout, 'configs', 'infer_dit_refine.yaml');
+    const summaryCheckout = path.join(sandbox, 'summary-upstream');
+    const summaryConfig = path.join(summaryCheckout, 'configs', 'infer_dit_refine.yaml');
+    const readinessCheckpoint = path.join(checkout, 'models', 'ultrashape', 'readiness.pt');
+    const readinessVenv = path.join(checkout, 'venv-readiness');
+    copyInstallSurface(checkout);
+
+    try {
+      writeForwardingReadiness(checkout, {
+        upstreamCheckout: readinessCheckout,
+        upstreamConfig: readinessConfig,
+        checkpoint: readinessCheckpoint,
+        pythonExe: path.join(readinessVenv, 'bin', 'python'),
+        venvDir: readinessVenv,
+      });
+      writeFileSync(
+        path.join(checkout, '.setup-summary.json'),
+        JSON.stringify({
+          diagnostics: ['summary-only diagnostic'],
+          runtime_modes: {
+            real: {
+              checkout_path: summaryCheckout,
+              upstream_config: { path: summaryConfig },
+            },
+          },
+        }),
+        'utf8',
+      );
+
+      const result = runRunnerJobProbe(checkout);
+
+      expect(result.status).toBe(0);
+      const job = JSON.parse(result.stdout);
+      expect(job.upstream_checkout_path).toBe(readinessCheckout);
+      expect(job.upstream_config_path).toBe(readinessConfig);
+      expect(JSON.stringify(job)).not.toContain(summaryCheckout);
+      expect(JSON.stringify(job)).not.toContain(summaryConfig);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('applies override precedence: explicit env beats readiness and readiness beats defaults', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-precedence-'));
+    const checkout = path.join(sandbox, 'repo');
+    const readinessCheckout = path.join(sandbox, 'readiness-upstream');
+    const readinessConfig = path.join(readinessCheckout, 'configs', 'infer_dit_refine.yaml');
+    const envCheckout = path.join(sandbox, 'env-upstream');
+    const envConfig = path.join(envCheckout, 'configs', 'env.yaml');
+    const readinessVenv = path.join(checkout, 'venv-readiness');
+    copyInstallSurface(checkout);
+
+    try {
+      writeForwardingReadiness(checkout, {
+        upstreamCheckout: readinessCheckout,
+        upstreamConfig: readinessConfig,
+        checkpoint: path.join(checkout, 'models', 'ultrashape', 'readiness.pt'),
+        pythonExe: path.join(readinessVenv, 'bin', 'python'),
+        venvDir: readinessVenv,
+      });
+
+      const readinessResult = runRunnerJobProbe(checkout);
+      expect(readinessResult.status).toBe(0);
+      const readinessJob = JSON.parse(readinessResult.stdout);
+      expect(readinessJob.upstream_checkout_path).toBe(readinessCheckout);
+      expect(readinessJob.upstream_config_path).toBe(readinessConfig);
+      expect(readinessJob.upstream_checkout_path).not.toBe(path.join(checkout, 'runtime', 'vendor', 'UltraShape-1.0'));
+
+      const envResult = runRunnerJobProbe(checkout, {
+        ULTRASHAPE_RUNTIME_MODE: 'real',
+        ULTRASHAPE_UPSTREAM_CHECKOUT: envCheckout,
+        ULTRASHAPE_UPSTREAM_CONFIG: envConfig,
+      });
+      expect(envResult.status).toBe(0);
+      expect(JSON.parse(envResult.stdout)).toMatchObject({
+        runtime_mode: 'real',
+        upstream_checkout_path: envCheckout,
+        upstream_config_path: envConfig,
+      });
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('uses setup-recorded venv Python and forwards legacy runner environment variables', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-runner-env-'));
+    const checkout = path.join(sandbox, 'repo');
+    const upstreamCheckout = path.join(sandbox, 'upstream-env');
+    const upstreamConfig = path.join(upstreamCheckout, 'configs', 'infer_dit_refine.yaml');
+    const venvDir = path.join(checkout, 'venv');
+    const pythonExe = path.join(venvDir, 'bin', 'python');
+    copyInstallSurface(checkout);
+    mkdirSync(path.dirname(pythonExe), { recursive: true });
+    writeFileSync(pythonExe, '', 'utf8');
+
+    try {
+      writeForwardingReadiness(checkout, {
+        upstreamCheckout,
+        upstreamConfig,
+        checkpoint: path.join(checkout, 'models', 'ultrashape', 'readiness.pt'),
+        pythonExe,
+        venvDir,
+      });
+      const script = [
+        'import json',
+        'from pathlib import Path',
+        'import generator as generator_module',
+        'from generator import UltraShapeGenerator',
+        'class Completed:',
+        '    returncode = 0',
+        '    stderr = ""',
+        '    stdout = json.dumps({"ok": True, "result": {"file_path": "out.glb", "format": "glb", "backend": "local", "metrics": {}, "fallbacks": [], "subtrees_loaded": []}})',
+        'captured = {}',
+        'def fake_run(command, **kwargs):',
+        '    captured["command"] = command',
+        '    captured["env"] = kwargs.get("env")',
+        '    return Completed()',
+        'generator_module.subprocess.run = fake_run',
+        'generator = UltraShapeGenerator(Path.cwd() / "models", Path.cwd() / "outputs")',
+        'readiness = generator._require_runtime_ready()',
+        'job = generator._build_runner_job(readiness=readiness, reference_image=Path.cwd() / "reference.png", coarse_mesh=Path.cwd() / "coarse.glb", output_dir=Path.cwd() / "outputs", params={"steps": 7, "guidance_scale": 2.5, "seed": 123, "preserve_scale": True})',
+        'generator._run_local_runner(job)',
+        'print(json.dumps({"command": captured["command"], "env": {key: captured["env"].get(key) for key in ["ULTRASHAPE_RUNTIME_MODE", "ULTRASHAPE_UPSTREAM_CHECKOUT", "ULTRASHAPE_UPSTREAM_CONFIG"]}}))',
+      ].join('\n');
+
+      const result = spawnSync('python3', ['-S', '-c', script], { cwd: checkout, encoding: 'utf8', env: process.env });
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        command: [pythonExe, '-m', 'ultrashape_runtime.local_runner'],
+        env: {
+          ULTRASHAPE_RUNTIME_MODE: 'auto',
+          ULTRASHAPE_UPSTREAM_CHECKOUT: upstreamCheckout,
+          ULTRASHAPE_UPSTREAM_CONFIG: upstreamConfig,
+        },
+      });
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
   it('exposes the exact public generate signature required by the model shell contract', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-signature-'));
     const checkout = path.join(sandbox, 'repo');

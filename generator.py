@@ -46,6 +46,40 @@ def _runtime_string_path(value: Any, default: Path) -> str:
     return str(default)
 
 
+def _runtime_optional_string(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _runtime_nested_path(payload: dict[str, Any], *keys: str) -> str | None:
+    current: Any = payload
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return _runtime_optional_string(current)
+
+
+def _runtime_env_string(name: str) -> str | None:
+    return _runtime_optional_string(os.environ.get(name))
+
+
+def _runtime_mode_from_env_or_readiness(readiness: dict[str, Any]) -> str:
+    env_mode = _runtime_env_string("ULTRASHAPE_RUNTIME_MODE")
+    if env_mode is not None:
+        normalized = env_mode.lower()
+        return normalized if normalized in {"auto", "real", "portable"} else "auto"
+
+    runtime_modes = readiness.get("runtime_modes")
+    if isinstance(runtime_modes, dict):
+        requested = _runtime_optional_string(runtime_modes.get("requested"))
+        if requested is not None:
+            normalized = requested.lower()
+            return normalized if normalized in {"auto", "real", "portable"} else "auto"
+    return "auto"
+
+
 class PublicRuntimeError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         normalized = code if code in PUBLIC_RUNTIME_ERROR_CODES else "LOCAL_RUNTIME_UNAVAILABLE"
@@ -118,6 +152,11 @@ class UltraShapeGenerator(BaseGenerator):
             "output_format": runner_job["output_format"],
             "config_path": runner_job["config_path"],
             "checkpoint": runner_job["checkpoint"],
+            "runtime_mode": runner_job.get("runtime_mode"),
+            "upstream_checkout_path": runner_job.get("upstream_checkout_path"),
+            "upstream_config_path": runner_job.get("upstream_config_path"),
+            "python_exe": runner_job.get("python_exe"),
+            "venv_dir": runner_job.get("venv_dir"),
         }
         self._last_result = runner_result
         return str(runner_result["file_path"])
@@ -253,6 +292,13 @@ class UltraShapeGenerator(BaseGenerator):
             )
             raise PublicRuntimeError("WEIGHTS_MISSING", message)
 
+        stale_diagnostics = self._installed_root_diagnostics(readiness)
+        if stale_diagnostics:
+            raise PublicRuntimeError(
+                "LOCAL_RUNTIME_UNAVAILABLE",
+                "installed extension root is stale or incomplete.\n" + "\n".join(stale_diagnostics),
+            )
+
         if readiness.get("status") not in {"ready", "degraded"}:
             raise PublicRuntimeError(
                 "LOCAL_RUNTIME_UNAVAILABLE",
@@ -268,7 +314,7 @@ class UltraShapeGenerator(BaseGenerator):
                 return None
             raise PublicRuntimeError(
                 "LOCAL_RUNTIME_UNAVAILABLE",
-                "Runtime readiness file is missing; run setup.py before using the generator.",
+                "installed extension root is stale or incomplete.\n.runtime-readiness.json missing; run setup.py in the installed extension root before using the generator.",
             )
 
         try:
@@ -286,6 +332,50 @@ class UltraShapeGenerator(BaseGenerator):
             )
         return payload
 
+    def _installed_root_diagnostics(self, readiness: dict[str, Any]) -> list[str]:
+        diagnostics: list[str] = []
+        root = self._repo_root().resolve()
+
+        def resolve_recorded_path(value: Any, fallback: Path | None = None) -> Path | None:
+            path_value = _runtime_optional_string(value)
+            if path_value is None:
+                return fallback.resolve() if fallback is not None else None
+            return Path(path_value).expanduser().resolve()
+
+        def is_relative_to_root(candidate: Path) -> bool:
+            try:
+                candidate.relative_to(root)
+                return True
+            except ValueError:
+                return False
+
+        ext_dir = resolve_recorded_path(readiness.get("ext_dir"), root)
+        if ext_dir is not None and ext_dir != root:
+            diagnostics.append(f"readiness ext_dir mismatch: recorded={ext_dir} installed={root}")
+
+        vendor = resolve_recorded_path(readiness.get("vendor_path"), self._vendor_path())
+        if vendor is None or not vendor.is_dir():
+            diagnostics.append(f"staged vendor path missing: {vendor or self._vendor_path()}")
+        if vendor is not None and not is_relative_to_root(vendor):
+            diagnostics.append(f"vendor_path points outside installed extension root: {vendor}")
+
+        config = resolve_recorded_path(readiness.get("config_path"), self._config_path())
+        if config is None or not config.is_file():
+            diagnostics.append(f"runtime config path missing: {config or self._config_path()}")
+        if config is not None and not is_relative_to_root(config):
+            diagnostics.append(f"config_path points outside installed extension root: {config}")
+
+        runtime_modes = readiness.get("runtime_modes") if isinstance(readiness.get("runtime_modes"), dict) else {}
+        real_mode = runtime_modes.get("real") if isinstance(runtime_modes, dict) and isinstance(runtime_modes.get("real"), dict) else {}
+        checkpoint_value = readiness.get("checkpoint") or _runtime_nested_path(real_mode, "checkpoint", "path")
+        checkpoint = resolve_recorded_path(checkpoint_value, self._checkpoint_path())
+        if checkpoint is None or not checkpoint.is_file():
+            diagnostics.append(f"checkpoint path missing: {checkpoint or self._checkpoint_path()}")
+        if checkpoint is not None and not is_relative_to_root(checkpoint):
+            diagnostics.append(f"checkpoint path points outside installed extension root: {checkpoint}")
+
+        return diagnostics
+
     def _build_runner_job(
         self,
         *,
@@ -298,21 +388,46 @@ class UltraShapeGenerator(BaseGenerator):
         checkpoint = readiness.get("checkpoint")
         config_path = readiness.get("config_path")
         ext_dir = readiness.get("ext_dir")
+        runtime_modes = readiness.get("runtime_modes") if isinstance(readiness.get("runtime_modes"), dict) else {}
+        real_mode = runtime_modes.get("real") if isinstance(runtime_modes, dict) and isinstance(runtime_modes.get("real"), dict) else {}
 
-        return {
+        upstream_checkout_path = (
+            _runtime_env_string("ULTRASHAPE_UPSTREAM_CHECKOUT")
+            or _runtime_nested_path(real_mode, "checkout_path")
+        )
+        upstream_config_path = (
+            _runtime_env_string("ULTRASHAPE_UPSTREAM_CONFIG")
+            or _runtime_nested_path(real_mode, "upstream_config", "path")
+            or _runtime_nested_path(real_mode, "config", "path")
+        )
+        real_checkpoint = _runtime_nested_path(real_mode, "checkpoint", "path")
+        python_exe = _runtime_optional_string(readiness.get("python_exe"))
+        venv_dir = _runtime_optional_string(readiness.get("venv_dir"))
+
+        job = {
             "reference_image": str(reference_image),
             "coarse_mesh": str(coarse_mesh),
             "output_dir": str(output_dir),
             "output_format": "glb",
-            "checkpoint": _runtime_string_path(checkpoint, self._checkpoint_path()),
+            "checkpoint": _runtime_optional_string(checkpoint) or real_checkpoint or str(self._checkpoint_path()),
             "config_path": _runtime_string_path(config_path, self._config_path()),
             "ext_dir": _runtime_string_path(ext_dir, self._repo_root()),
             "backend": "local",
+            "runtime_mode": _runtime_mode_from_env_or_readiness(readiness),
             "steps": params["steps"],
             "guidance_scale": params["guidance_scale"],
             "seed": params["seed"],
             "preserve_scale": params["preserve_scale"],
         }
+        if upstream_checkout_path is not None:
+            job["upstream_checkout_path"] = upstream_checkout_path
+        if upstream_config_path is not None:
+            job["upstream_config_path"] = upstream_config_path
+        if python_exe is not None:
+            job["python_exe"] = python_exe
+        if venv_dir is not None:
+            job["venv_dir"] = venv_dir
+        return job
 
     def _run_local_runner(self, job: dict[str, Any]) -> dict[str, Any]:
         python_path_entries = [self._runtime_vendor_parent()]
@@ -320,18 +435,28 @@ class UltraShapeGenerator(BaseGenerator):
         if existing_pythonpath:
             python_path_entries.append(existing_pythonpath)
         self._last_pythonpath = os.pathsep.join(python_path_entries)
+        runner_python = self._select_runner_python(job)
+        runner_env = {
+            **os.environ,
+            "PYTHONPATH": self._last_pythonpath,
+        }
+        for job_key, env_key in {
+            "runtime_mode": "ULTRASHAPE_RUNTIME_MODE",
+            "upstream_checkout_path": "ULTRASHAPE_UPSTREAM_CHECKOUT",
+            "upstream_config_path": "ULTRASHAPE_UPSTREAM_CONFIG",
+        }.items():
+            value = _runtime_optional_string(job.get(job_key))
+            if value is not None:
+                runner_env[env_key] = value
 
         try:
             completed = subprocess.run(
-                [sys.executable, "-m", "ultrashape_runtime.local_runner"],
+                [runner_python, "-m", "ultrashape_runtime.local_runner"],
                 cwd=str(self._repo_root()),
                 input=json.dumps(job),
                 text=True,
                 capture_output=True,
-                env={
-                    **os.environ,
-                    "PYTHONPATH": self._last_pythonpath,
-                },
+                env=runner_env,
                 check=False,
             )
         except OSError as exc:
@@ -376,3 +501,20 @@ class UltraShapeGenerator(BaseGenerator):
                 candidate = Path(vendor_path)
                 return str(candidate.parent if candidate.name == 'ultrashape_runtime' else candidate)
         return str(self._vendor_path().parent)
+
+    def _select_runner_python(self, job: dict[str, Any]) -> str:
+        explicit = _runtime_env_string("ULTRASHAPE_RUNNER_PYTHON")
+        if explicit is not None:
+            return explicit
+
+        venv_dir = _runtime_optional_string(job.get("venv_dir"))
+        if venv_dir is not None:
+            venv_python = Path(venv_dir) / "bin" / "python"
+            if venv_python.is_file():
+                return str(venv_python)
+
+        python_exe = _runtime_optional_string(job.get("python_exe"))
+        if python_exe is not None and Path(python_exe).is_file():
+            return python_exe
+
+        return sys.executable
