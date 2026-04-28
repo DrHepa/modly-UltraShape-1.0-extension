@@ -65,6 +65,25 @@ def _runtime_env_string(name: str) -> str | None:
     return _runtime_optional_string(os.environ.get(name))
 
 
+def _flash_policy_from_status(status: str | None) -> dict[str, Any] | None:
+    if status is None:
+        return None
+    normalized = status.strip().lower()
+    if normalized == "sdpa_real_allowed":
+        return {"status": "sdpa_real_allowed", "required": False, "available": False, "degraded": True, "sdpa_allowed": True}
+    if normalized == "required":
+        return {"status": "required", "required": True, "available": None, "degraded": False, "sdpa_allowed": False}
+    return {"status": normalized, "required": True, "available": None, "degraded": False, "sdpa_allowed": False}
+
+
+def _runtime_flash_attn_policy(real_mode: dict[str, Any]) -> dict[str, Any] | None:
+    env_policy = _flash_policy_from_status(_runtime_env_string("ULTRASHAPE_FLASH_ATTN_POLICY"))
+    if env_policy is not None:
+        return env_policy
+    readiness_policy = real_mode.get("flash_attn_policy")
+    return dict(readiness_policy) if isinstance(readiness_policy, dict) else None
+
+
 def _runtime_mode_from_env_or_readiness(readiness: dict[str, Any]) -> str:
     env_mode = _runtime_env_string("ULTRASHAPE_RUNTIME_MODE")
     if env_mode is not None:
@@ -155,6 +174,8 @@ class UltraShapeGenerator(BaseGenerator):
             "runtime_mode": runner_job.get("runtime_mode"),
             "upstream_checkout_path": runner_job.get("upstream_checkout_path"),
             "upstream_config_path": runner_job.get("upstream_config_path"),
+            "attention_backend": runner_job.get("attention_backend"),
+            "flash_attn_policy": runner_job.get("flash_attn_policy"),
             "python_exe": runner_job.get("python_exe"),
             "venv_dir": runner_job.get("venv_dir"),
         }
@@ -400,6 +421,8 @@ class UltraShapeGenerator(BaseGenerator):
             or _runtime_nested_path(real_mode, "upstream_config", "path")
             or _runtime_nested_path(real_mode, "config", "path")
         )
+        attention_backend = _runtime_env_string("ULTRASHAPE_ATTENTION_BACKEND") or _runtime_optional_string(real_mode.get("attention_backend"))
+        flash_attn_policy = _runtime_flash_attn_policy(real_mode)
         real_checkpoint = _runtime_nested_path(real_mode, "checkpoint", "path")
         python_exe = _runtime_optional_string(readiness.get("python_exe"))
         venv_dir = _runtime_optional_string(readiness.get("venv_dir"))
@@ -423,6 +446,10 @@ class UltraShapeGenerator(BaseGenerator):
             job["upstream_checkout_path"] = upstream_checkout_path
         if upstream_config_path is not None:
             job["upstream_config_path"] = upstream_config_path
+        if attention_backend is not None:
+            job["attention_backend"] = attention_backend
+        if flash_attn_policy is not None:
+            job["flash_attn_policy"] = flash_attn_policy
         if python_exe is not None:
             job["python_exe"] = python_exe
         if venv_dir is not None:
@@ -444,10 +471,16 @@ class UltraShapeGenerator(BaseGenerator):
             "runtime_mode": "ULTRASHAPE_RUNTIME_MODE",
             "upstream_checkout_path": "ULTRASHAPE_UPSTREAM_CHECKOUT",
             "upstream_config_path": "ULTRASHAPE_UPSTREAM_CONFIG",
+            "attention_backend": "ULTRASHAPE_ATTENTION_BACKEND",
         }.items():
             value = _runtime_optional_string(job.get(job_key))
             if value is not None:
                 runner_env[env_key] = value
+        policy = job.get("flash_attn_policy")
+        if isinstance(policy, dict):
+            policy_status = _runtime_optional_string(policy.get("status"))
+            if policy_status is not None:
+                runner_env["ULTRASHAPE_FLASH_ATTN_POLICY"] = policy_status
 
         try:
             completed = subprocess.run(

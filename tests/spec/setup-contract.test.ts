@@ -28,6 +28,33 @@ type Readiness = {
   weights_ready: boolean;
 };
 
+type RuntimeModes = {
+  real?: {
+    available?: boolean;
+    authoritative_upstream?: boolean;
+    attention_backend?: 'flash_attn' | 'sdpa' | null;
+    flash_attn_policy?: {
+      status?: string;
+      required?: boolean;
+      available?: boolean;
+      degraded?: boolean;
+      degradation_reason?: string;
+      sdpa_allowed?: boolean;
+      blocker?: string | null;
+    };
+    blockers?: string[];
+    degradations?: string[];
+    checkout_path?: string;
+    upstream_config?: { available?: boolean; path?: string; source?: string };
+    revision?: string;
+    entrypoint?: string;
+  };
+};
+
+function runtimeModes(readiness: Readiness) {
+  return (readiness.runtime_modes ?? {}) as RuntimeModes;
+}
+
 function runSetup(
   cwd: string,
   options: {
@@ -331,6 +358,109 @@ describe('setup.py install truth', () => {
       expect(readiness.missing_optional).toEqual([]);
       expect(summary.runtime_modes).toMatchObject(readiness.runtime_modes ?? {});
       expect(JSON.stringify(summary.runtime_modes ?? {})).toContain('torch_cuda_profile');
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('reports GB10 SDPA real availability for an explicit checkout when flash_attn is missing under explicit policy', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-real-sdpa-gb10-'));
+    const checkout = path.join(sandbox, 'repo');
+    const upstreamCheckout = createFakeUpstreamCheckout(sandbox);
+    const upstreamConfig = path.join(upstreamCheckout, 'configs', 'infer_dit_refine.yaml');
+    copyInstallSurface(checkout);
+
+    try {
+      const result = runSetup(checkout, {
+        extDir: checkout,
+        pythonExe: '/opt/modly/python/bin/python3',
+        payload: {
+          ultrashape_checkout_path: upstreamCheckout,
+          flash_attn_policy: 'sdpa_real_allowed',
+          gpu_sm: '12.1',
+        },
+        env: {
+          ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+          ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+          ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+          ULTRASHAPE_SETUP_TEST_HOST_GPU_SM: '12.1',
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'stub-weight',
+        },
+      });
+
+      expect(result.status).toBe(0);
+      const real = runtimeModes(readReadiness(checkout)).real;
+      expect(real).toMatchObject({
+        available: true,
+        authoritative_upstream: true,
+        attention_backend: 'sdpa',
+        checkout_path: upstreamCheckout,
+        upstream_config: { available: true, path: upstreamConfig, source: 'derived-from-explicit-checkout' },
+        entrypoint: 'scripts.infer_dit_refine.run_inference',
+        blockers: [],
+        degradations: expect.arrayContaining(['dependency:flash_attn']),
+        flash_attn_policy: {
+          status: 'sdpa_real_allowed',
+          required: false,
+          available: false,
+          degraded: true,
+          degradation_reason: 'import:flash_attn',
+          sdpa_allowed: true,
+          blocker: null,
+        },
+      });
+      expect(real?.revision).toEqual(expect.any(String));
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps invalid explicit checkout/config blocked without guessing paths and names the blocker sources', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-setup-real-invalid-closure-'));
+    const checkout = path.join(sandbox, 'repo');
+    const invalidCheckout = path.join(sandbox, 'not-a-checkout');
+    const invalidConfig = path.join(invalidCheckout, 'configs', 'missing.yaml');
+    mkdirSync(invalidCheckout, { recursive: true });
+    copyInstallSurface(checkout);
+
+    try {
+      const result = runSetup(checkout, {
+        extDir: checkout,
+        pythonExe: '/opt/modly/python/bin/python3',
+        payload: {
+          ultrashape_checkout_path: invalidCheckout,
+          ultrashape_upstream_config_path: invalidConfig,
+          flash_attn_policy: 'sdpa_real_allowed',
+          gpu_sm: '12.1',
+        },
+        env: {
+          ULTRASHAPE_SETUP_TEST_STUB_DEPS: '1',
+          ULTRASHAPE_SETUP_TEST_HOST_PLATFORM: 'linux',
+          ULTRASHAPE_SETUP_TEST_HOST_MACHINE: 'aarch64',
+          ULTRASHAPE_SETUP_TEST_HOST_GPU_SM: '12.1',
+          ULTRASHAPE_SETUP_TEST_HF_HUB_DOWNLOAD_FILE: 'stub-weight',
+        },
+      });
+
+      expect(result.status).toBe(0);
+      const real = runtimeModes(readReadiness(checkout)).real;
+      expect(real?.available).toBe(false);
+      expect(real?.checkout_path).toBe(invalidCheckout);
+      expect(real?.upstream_config).toMatchObject({
+        available: false,
+        path: invalidConfig,
+        source: 'payload:ultrashape_upstream_config_path',
+      });
+      expect(real?.blockers).toEqual(expect.arrayContaining([
+        `checkout-marker:scripts/infer_dit_refine.py`,
+        `checkout-marker:configs/infer_dit_refine.yaml`,
+        `upstream_config:${invalidConfig}`,
+      ]));
+      expect(JSON.stringify(real)).not.toContain(path.join(checkout, 'runtime', 'vendor', 'UltraShape-1.0'));
+      expect(real).toHaveProperty('authoritative_upstream', false);
+      expect(real).toHaveProperty('attention_backend', null);
+      expect(real).toHaveProperty('flash_attn_policy');
+      expect(real).toHaveProperty('degradations');
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }

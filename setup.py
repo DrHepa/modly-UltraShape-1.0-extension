@@ -835,12 +835,32 @@ def configured_upstream_checkout(payload: dict[str, Any]) -> Path | None:
     return None
 
 
+def configured_upstream_checkout_source(payload: dict[str, Any]) -> str | None:
+    raw = payload.get('ultrashape_checkout_path')
+    if isinstance(raw, str) and raw.strip():
+        return 'payload:ultrashape_checkout_path'
+    if os.environ.get('ULTRASHAPE_UPSTREAM_CHECKOUT'):
+        return 'env:ULTRASHAPE_UPSTREAM_CHECKOUT'
+    return None
+
+
 def configured_upstream_config(payload: dict[str, Any], checkout: Path | None) -> Path | None:
     raw = payload.get('ultrashape_upstream_config_path') or os.environ.get(UPSTREAM_CONFIG_ENV)
     if isinstance(raw, str) and raw.strip():
         return Path(raw.strip()).expanduser().resolve()
     if checkout is not None:
         return checkout / 'configs' / 'infer_dit_refine.yaml'
+    return None
+
+
+def configured_upstream_config_source(payload: dict[str, Any], checkout: Path | None) -> str | None:
+    raw = payload.get('ultrashape_upstream_config_path')
+    if isinstance(raw, str) and raw.strip():
+        return 'payload:ultrashape_upstream_config_path'
+    if os.environ.get(UPSTREAM_CONFIG_ENV):
+        return f'env:{UPSTREAM_CONFIG_ENV}'
+    if checkout is not None:
+        return 'derived-from-explicit-checkout'
     return None
 
 
@@ -875,6 +895,53 @@ def checkout_revision(checkout: Path | None) -> str:
     return raw_head or 'unknown'
 
 
+def is_gb10_host(host_facts: dict[str, Any], payload: dict[str, Any]) -> bool:
+    platform_name = str(host_facts.get('platform') or '')
+    machine = str(host_facts.get('machine') or '').lower()
+    gpu_sm = normalize_optional_scalar(payload.get('gpu_sm'), host_facts.get('gpu_sm'))
+    normalized_sm = str(gpu_sm or '').replace('.', '').strip()
+    return platform_name.startswith('linux') and machine in {'arm64', 'aarch64'} and normalized_sm == '121'
+
+
+def requested_flash_attn_policy(payload: dict[str, Any]) -> str:
+    raw = payload.get('flash_attn_policy') or os.environ.get('ULTRASHAPE_FLASH_ATTN_POLICY')
+    return str(raw).strip().lower() if isinstance(raw, str) and raw.strip() else 'required'
+
+
+def build_flash_attn_policy(
+    *,
+    payload: dict[str, Any],
+    host_facts: dict[str, Any],
+    missing_degradable: list[str],
+    native_install: dict[str, Any],
+    non_attention_blockers: list[str],
+) -> tuple[dict[str, Any], str | None, list[str], list[str]]:
+    flash_missing = 'import:flash_attn' in missing_degradable
+    flash_state = native_install.get('flash_attn') if isinstance(native_install.get('flash_attn'), dict) else {}
+    requested = requested_flash_attn_policy(payload)
+    explicit_sdpa = requested == 'sdpa_real_allowed'
+    sdpa_allowed = bool(explicit_sdpa and flash_missing and is_gb10_host(host_facts, payload) and not non_attention_blockers)
+    attention_backend = 'sdpa' if sdpa_allowed else ('flash_attn' if not flash_missing else None)
+    degradations = ['dependency:flash_attn'] if flash_missing else []
+    blocker = None
+    if flash_missing and not sdpa_allowed:
+        blocker = 'attention:sdpa-policy-not-proven' if explicit_sdpa else 'dependency:flash_attn'
+
+    policy = {
+        'status': 'sdpa_real_allowed' if explicit_sdpa else 'required',
+        'required': not sdpa_allowed,
+        'available': not flash_missing,
+        'degraded': flash_missing,
+        'degradation_reason': 'import:flash_attn' if flash_missing else None,
+        'sdpa_allowed': sdpa_allowed,
+        'blocker': blocker,
+        'native_status': flash_state.get('status'),
+        'failure_message': flash_state.get('failure_message'),
+    }
+    attention_blockers = [blocker] if blocker else []
+    return policy, attention_backend, attention_blockers, degradations
+
+
 def build_real_runtime_mode(
     *,
     payload: dict[str, Any],
@@ -885,12 +952,13 @@ def build_real_runtime_mode(
     runtime_closure_ready: bool,
     missing_degradable: list[str],
     native_install: dict[str, Any],
+    host_facts: dict[str, Any],
 ) -> dict[str, Any]:
     checkout = configured_upstream_checkout(payload)
+    checkout_source = configured_upstream_checkout_source(payload)
     upstream_config = configured_upstream_config(payload, checkout)
+    upstream_config_source = configured_upstream_config_source(payload, checkout)
     blockers = checkout_marker_blockers(checkout)
-    if 'import:flash_attn' in missing_degradable:
-        blockers.append('dependency:flash_attn')
     if not config_ready:
         blockers.append(f'runtime_config:{CONFIG_RELATIVE.as_posix()}')
     if upstream_config is None or not upstream_config.is_file():
@@ -900,29 +968,41 @@ def build_real_runtime_mode(
     if not runtime_closure_ready:
         blockers.append('runtime-import:ultrashape_runtime.local_runner')
 
-    flash_state = native_install.get('flash_attn') if isinstance(native_install.get('flash_attn'), dict) else {}
+    flash_policy, attention_backend, attention_blockers, degradations = build_flash_attn_policy(
+        payload=payload,
+        host_facts=host_facts,
+        missing_degradable=missing_degradable,
+        native_install=native_install,
+        non_attention_blockers=blockers,
+    )
+    blockers.extend(attention_blockers)
     available = not blockers
     return {
         'available': available,
+        'authoritative_upstream': available,
+        'attention_backend': attention_backend,
+        'flash_attn_policy': flash_policy,
         'adapter': REAL_MODE_ADAPTER,
         'source': 'checkout' if checkout and not checkout_marker_blockers(checkout) else None,
+        'checkout_source': checkout_source,
         'checkout_path': str(checkout) if checkout else None,
         'revision': checkout_revision(checkout),
         'entrypoint': REAL_MODE_ENTRYPOINT,
         'reason': None if available else REAL_MODE_REASON,
         'blockers': blockers,
+        'degradations': degradations,
         'runtime_config': {'available': config_ready, 'path': str(runtime_config_path)},
-        'upstream_config': {'available': upstream_config is not None and upstream_config.is_file(), 'path': str(upstream_config) if upstream_config else None},
+        'upstream_config': {'available': upstream_config is not None and upstream_config.is_file(), 'path': str(upstream_config) if upstream_config else None, 'source': upstream_config_source},
         'config': {'available': upstream_config is not None and upstream_config.is_file(), 'path': str(upstream_config) if upstream_config else None},
         'checkpoint': {'available': weights_ready, 'path': str(checkpoint_path)},
         'dependencies': {
             'torch': {'available': True, 'required': True, 'torch_cuda_profile': detect_torch_cuda_profile()},
             'flash_attn': {
-                'available': 'dependency:flash_attn' not in blockers,
-                'required': True,
+                'available': flash_policy['available'],
+                'required': flash_policy['required'],
                 'degradable_for_portable': True,
-                'status': flash_state.get('status'),
-                'failure_message': flash_state.get('failure_message'),
+                'status': flash_policy['native_status'],
+                'failure_message': flash_policy['failure_message'],
             },
         },
         'torch_cuda_profile': detect_torch_cuda_profile(),
@@ -1142,6 +1222,7 @@ def build_summary_and_readiness(
             runtime_closure_ready=runtime_closure_ready,
             missing_degradable=missing_degradable,
             native_install=native_install,
+            host_facts=host_facts,
         ),
     )
 
@@ -1255,10 +1336,16 @@ def main() -> int:
 
     config_ready, vendor_ready = stage_runtime_assets(ext_dir)
     venv_dir = ensure_venv(ext_dir)
-    runtime_import_smoke = run_runtime_import_smoke(venv_dir, ext_dir)
 
     cubvh_prerequisites = detect_cubvh_prerequisites(host_facts)
     if not cubvh_prerequisites['ok']:
+        runtime_import_smoke = {
+            'target': 'ultrashape_runtime.local_runner',
+            'ok': vendor_ready,
+            'status': 'ready' if vendor_ready else 'blocked',
+            'error_class': None,
+            'failure_message': None if vendor_ready else 'Vendored runtime is not staged.',
+        }
         blocked_reason = 'Skipped because cubvh prerequisites are already blocked.'
         cubvh_blocked_schema = blocked_cubvh_diagnostics_schema(cubvh_prerequisites)
         pip_bootstrap = skipped_stage('pip_bootstrap', blocked_reason)
@@ -1302,7 +1389,13 @@ def main() -> int:
                 'weight_source_filename': WEIGHT_FILENAME,
             },
             runtime_import_smoke=runtime_import_smoke,
-            checkpoint_smoke=run_checkpoint_smoke(venv_dir, ext_dir, ext_dir / CHECKPOINT_RELATIVE),
+            checkpoint_smoke={
+                'ok': False,
+                'status': 'blocked',
+                'required_subtrees': ['vae', 'dit', 'conditioner'],
+                'missing_required': [f'weight:{CHECKPOINT_RELATIVE.as_posix()}'],
+                'failure_message': 'Checkpoint smoke skipped because cubvh prerequisites are blocked.',
+            },
             required_import_failures=['cubvh'],
             conditional_import_failures=[],
             degradable_import_failures=[],
@@ -1313,6 +1406,7 @@ def main() -> int:
         sys.stdout.write('\n')
         return 1
 
+    runtime_import_smoke = run_runtime_import_smoke(venv_dir, ext_dir)
     pip_bootstrap = bootstrap_packaging_tools(venv_dir)
     dependency_install = install_core_dependencies(venv_dir)
     cubvh_stage, cubvh_missing = install_cubvh_stage(venv_dir, ext_dir)

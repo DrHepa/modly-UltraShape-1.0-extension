@@ -53,6 +53,8 @@ def resolve_runtime_mode(
     upstream_checkout_path: str | None = None,
     python_exe: str | None = None,
     venv_dir: str | None = None,
+    attention_backend: str | None = None,
+    flash_attn_policy: object = None,
 ) -> dict[str, object]:
     requested = _requested_runtime_mode(runtime_mode)
     real = describe_real_readiness(
@@ -62,6 +64,8 @@ def resolve_runtime_mode(
         upstream_config_path=upstream_config_path,
         python_exe=python_exe,
         venv_dir=venv_dir,
+        attention_backend=attention_backend,
+        flash_attn_policy=flash_attn_policy,
     ) if requested in {'auto', 'real'} else {
         'available': False,
         'adapter': REAL_MODE_ADAPTER,
@@ -774,6 +778,8 @@ def run_refine_pipeline(
     runtime_mode: str | None = None,
     upstream_checkout_path: str | None = None,
     upstream_config_path: str | None = None,
+    attention_backend: str | None = None,
+    flash_attn_policy: object = None,
     python_exe: str | None = None,
     venv_dir: str | None = None,
 ) -> dict[str, object]:
@@ -786,6 +792,8 @@ def run_refine_pipeline(
         runtime_mode=runtime_mode,
         upstream_checkout_path=upstream_checkout_path,
         upstream_config_path=upstream_config_path,
+        attention_backend=attention_backend,
+        flash_attn_policy=flash_attn_policy,
         python_exe=python_exe,
         venv_dir=venv_dir,
     )
@@ -800,6 +808,8 @@ def run_refine_pipeline(
             config_path=config_path,
             checkout_path=upstream_checkout_path,
             upstream_config_path=upstream_config_path,
+            attention_backend=attention_backend,
+            flash_attn_policy=flash_attn_policy,
             python_exe=python_exe,
             venv_dir=venv_dir,
             ext_dir=ext_dir,
@@ -819,6 +829,8 @@ def run_refine_pipeline(
             config_path=config_path,
             checkout_path=upstream_checkout_path,
             upstream_config_path=upstream_config_path,
+            attention_backend=attention_backend,
+            flash_attn_policy=flash_attn_policy,
             python_exe=python_exe,
             venv_dir=venv_dir,
             ext_dir=ext_dir,

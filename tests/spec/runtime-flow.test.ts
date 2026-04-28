@@ -1258,15 +1258,107 @@ describe('private runtime flow behind the model shell', () => {
               active: 'real',
               real: {
                 available: true,
+                authoritative_upstream: true,
+                attention_backend: 'flash_attn',
                 source: 'checkout',
                 checkout_path: checkout,
                 entrypoint: 'scripts.infer_dit_refine.run_inference',
+                entrypoint_invoked: true,
+                flash_attn_policy: {
+                  status: 'required',
+                  required: true,
+                  available: true,
+                  degraded: false,
+                  sdpa_allowed: false,
+                },
                 runtime_config: { path: configPath, available: true },
                 upstream_config: { path: upstreamConfigPath, available: true },
               },
             },
             upstream: {
               output_name: 'reference_refined.glb',
+              authoritative_upstream: true,
+              attention_backend: 'flash_attn',
+              trace: expect.arrayContaining(['upstream-run_inference']),
+            },
+          },
+          subtrees_loaded: ['upstream-real'],
+        },
+      });
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('invokes the fake upstream run_inference under explicit GB10 SDPA policy and records proof metadata', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox);
+    const upstreamConfigPath = path.join(checkout, 'configs', 'infer_dit_refine.yaml');
+    writeTorchCudaStub(fixture.stubRoot, true);
+    const outputDir = path.join(fixture.sandbox, 'output-real-sdpa-success');
+
+    try {
+      const result = runLocalRunner(
+        {
+          ...defaultLocalRunnerJob(fixture, outputDir),
+          upstream_checkout_path: checkout,
+          upstream_config_path: upstreamConfigPath,
+          attention_backend: 'sdpa',
+          flash_attn_policy: {
+            status: 'sdpa_real_allowed',
+            required: false,
+            available: false,
+            degraded: true,
+            degradation_reason: 'import:flash_attn',
+            sdpa_allowed: true,
+          },
+        },
+        fixture.stubRoot,
+        {
+          ULTRASHAPE_RUNTIME_MODE: 'real',
+          ULTRASHAPE_UPSTREAM_CHECKOUT: checkout,
+          ULTRASHAPE_UPSTREAM_CONFIG: upstreamConfigPath,
+          ULTRASHAPE_ATTENTION_BACKEND: 'sdpa',
+          ULTRASHAPE_FLASH_ATTN_POLICY: 'sdpa_real_allowed',
+          ULTRASHAPE_TEST_HOST_PLATFORM: 'linux',
+          ULTRASHAPE_TEST_HOST_MACHINE: 'aarch64',
+          ULTRASHAPE_TEST_HOST_GPU_SM: '12.1',
+        },
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(readFileSync(path.join(outputDir, 'entrypoint-called.json'), 'utf8'))).toMatchObject({
+        config: upstreamConfigPath,
+        ckpt: fixture.checkpoint,
+        checkout_marker: 'default',
+      });
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: true,
+        result: {
+          metrics: {
+            runtime_mode: {
+              selection: 'real-available',
+              requested: 'real',
+              active: 'real',
+              real: {
+                available: true,
+                authoritative_upstream: true,
+                attention_backend: 'sdpa',
+                entrypoint_invoked: true,
+                flash_attn_policy: {
+                  status: 'sdpa_real_allowed',
+                  required: false,
+                  available: false,
+                  degraded: true,
+                  sdpa_allowed: true,
+                },
+                upstream_config: { path: upstreamConfigPath, available: true },
+              },
+            },
+            upstream: {
+              authoritative_upstream: true,
+              attention_backend: 'sdpa',
+              trace: expect.arrayContaining(['upstream-run_inference']),
             },
           },
           subtrees_loaded: ['upstream-real'],
@@ -1392,6 +1484,54 @@ describe('private runtime flow behind the model shell', () => {
         error_message: 'Upstream real mode did not produce expected refined output: reference_refined.glb.',
       });
       expect(existsSync(path.join(fixture.sandbox, 'output-real-missing', 'refined.glb'))).toBe(false);
+    } finally {
+      rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks forced SDPA real when upstream proof is absent and never silently falls back to portable', () => {
+    const fixture = createRuntimeFixture();
+    const checkout = createFakeUpstreamCheckout(fixture.sandbox, { writesOutput: false });
+    const upstreamConfigPath = path.join(checkout, 'configs', 'infer_dit_refine.yaml');
+    writeTorchCudaStub(fixture.stubRoot, true);
+    const outputDir = path.join(fixture.sandbox, 'output-real-sdpa-proof-absent');
+
+    try {
+      const result = runLocalRunner(
+        {
+          ...defaultLocalRunnerJob(fixture, outputDir),
+          upstream_checkout_path: checkout,
+          upstream_config_path: upstreamConfigPath,
+          attention_backend: 'sdpa',
+          flash_attn_policy: {
+            status: 'sdpa_real_allowed',
+            required: false,
+            available: false,
+            degraded: true,
+            degradation_reason: 'import:flash_attn',
+            sdpa_allowed: true,
+          },
+        },
+        fixture.stubRoot,
+        {
+          ULTRASHAPE_RUNTIME_MODE: 'real',
+          ULTRASHAPE_UPSTREAM_CHECKOUT: checkout,
+          ULTRASHAPE_UPSTREAM_CONFIG: upstreamConfigPath,
+          ULTRASHAPE_ATTENTION_BACKEND: 'sdpa',
+          ULTRASHAPE_FLASH_ATTN_POLICY: 'sdpa_real_allowed',
+        },
+      );
+
+      expect(result.status).toBe(1);
+      const payload = JSON.parse(result.stdout);
+      expect(payload).toMatchObject({
+        ok: false,
+        error_code: 'LOCAL_RUNTIME_UNAVAILABLE',
+      });
+      expect(payload.error_message).toContain('attention:sdpa-policy-not-proven');
+      expect(payload.error_message).toContain('entrypoint:scripts.infer_dit_refine.run_inference');
+      expect(payload.error_message).not.toContain('portable');
+      expect(existsSync(path.join(outputDir, 'refined.glb'))).toBe(false);
     } finally {
       rmSync(fixture.sandbox, { recursive: true, force: true });
     }

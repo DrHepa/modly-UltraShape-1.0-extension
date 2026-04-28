@@ -140,6 +140,8 @@ def run_refine_job(
     upstream_config_path: str | None = None,
     runtime_mode: str | None = None,
     upstream_checkout_path: str | None = None,
+    attention_backend: str | None = None,
+    flash_attn_policy: object = None,
     python_exe: str | None = None,
     venv_dir: str | None = None,
 ) -> dict[str, object]:
@@ -174,6 +176,8 @@ def run_refine_job(
             runtime_mode=runtime_mode,
             upstream_checkout_path=upstream_checkout_path,
             upstream_config_path=upstream_config_path,
+            attention_backend=attention_backend,
+            flash_attn_policy=flash_attn_policy,
             python_exe=python_exe,
             venv_dir=venv_dir,
             ext_dir=ext_dir,

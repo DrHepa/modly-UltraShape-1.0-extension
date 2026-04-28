@@ -38,6 +38,7 @@ function writeForwardingReadiness(
     checkpoint: string;
     pythonExe: string;
     venvDir: string;
+    flashAttnPolicy?: Record<string, unknown>;
   },
   options: { stageAssets?: boolean } = {},
 ) {
@@ -67,6 +68,8 @@ function writeForwardingReadiness(
           upstream_config: { available: true, path: fields.upstreamConfig },
           config: { available: true, path: fields.upstreamConfig },
           checkpoint: { available: true, path: fields.checkpoint },
+          attention_backend: fields.flashAttnPolicy ? 'sdpa' : undefined,
+          flash_attn_policy: fields.flashAttnPolicy,
         },
         portable: { available: true },
       },
@@ -338,6 +341,71 @@ describe('generator lifecycle shell', () => {
     }
   });
 
+  it('applies override precedence for runtime mode, upstream paths, and SDPA policy fields without overriding explicit env', () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-policy-precedence-'));
+    const checkout = path.join(sandbox, 'repo');
+    const readinessCheckout = path.join(sandbox, 'readiness-upstream');
+    const readinessConfig = path.join(readinessCheckout, 'configs', 'infer_dit_refine.yaml');
+    const envCheckout = path.join(sandbox, 'env-upstream');
+    const envConfig = path.join(envCheckout, 'configs', 'env.yaml');
+    const readinessVenv = path.join(checkout, 'venv-readiness');
+    copyInstallSurface(checkout);
+
+    try {
+      writeForwardingReadiness(checkout, {
+        upstreamCheckout: readinessCheckout,
+        upstreamConfig: readinessConfig,
+        checkpoint: path.join(checkout, 'models', 'ultrashape', 'readiness.pt'),
+        pythonExe: path.join(readinessVenv, 'bin', 'python'),
+        venvDir: readinessVenv,
+        flashAttnPolicy: {
+          status: 'sdpa_real_allowed',
+          required: false,
+          available: false,
+          degraded: true,
+          degradation_reason: 'import:flash_attn',
+          sdpa_allowed: true,
+        },
+      });
+
+      const readinessResult = runRunnerJobProbe(checkout);
+      expect(readinessResult.status).toBe(0);
+      expect(JSON.parse(readinessResult.stdout)).toMatchObject({
+        runtime_mode: 'auto',
+        upstream_checkout_path: readinessCheckout,
+        upstream_config_path: readinessConfig,
+        attention_backend: 'sdpa',
+        flash_attn_policy: {
+          status: 'sdpa_real_allowed',
+          sdpa_allowed: true,
+          degraded: true,
+        },
+      });
+
+      const envResult = runRunnerJobProbe(checkout, {
+        ULTRASHAPE_RUNTIME_MODE: 'real',
+        ULTRASHAPE_UPSTREAM_CHECKOUT: envCheckout,
+        ULTRASHAPE_UPSTREAM_CONFIG: envConfig,
+        ULTRASHAPE_ATTENTION_BACKEND: 'flash_attn',
+        ULTRASHAPE_FLASH_ATTN_POLICY: 'required',
+      });
+      expect(envResult.status).toBe(0);
+      expect(JSON.parse(envResult.stdout)).toMatchObject({
+        runtime_mode: 'real',
+        upstream_checkout_path: envCheckout,
+        upstream_config_path: envConfig,
+        attention_backend: 'flash_attn',
+        flash_attn_policy: {
+          status: 'required',
+          required: true,
+          sdpa_allowed: false,
+        },
+      });
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
   it('uses setup-recorded venv Python and forwards legacy runner environment variables', () => {
     const sandbox = mkdtempSync(path.join(tmpdir(), 'ultrashape-generator-runner-env-'));
     const checkout = path.join(sandbox, 'repo');
@@ -376,7 +444,7 @@ describe('generator lifecycle shell', () => {
         'readiness = generator._require_runtime_ready()',
         'job = generator._build_runner_job(readiness=readiness, reference_image=Path.cwd() / "reference.png", coarse_mesh=Path.cwd() / "coarse.glb", output_dir=Path.cwd() / "outputs", params={"steps": 7, "guidance_scale": 2.5, "seed": 123, "preserve_scale": True})',
         'generator._run_local_runner(job)',
-        'print(json.dumps({"command": captured["command"], "env": {key: captured["env"].get(key) for key in ["ULTRASHAPE_RUNTIME_MODE", "ULTRASHAPE_UPSTREAM_CHECKOUT", "ULTRASHAPE_UPSTREAM_CONFIG"]}}))',
+        'print(json.dumps({"command": captured["command"], "env": {key: captured["env"].get(key) for key in ["ULTRASHAPE_RUNTIME_MODE", "ULTRASHAPE_UPSTREAM_CHECKOUT", "ULTRASHAPE_UPSTREAM_CONFIG", "ULTRASHAPE_ATTENTION_BACKEND", "ULTRASHAPE_FLASH_ATTN_POLICY"]}}))',
       ].join('\n');
 
       const result = spawnSync('python3', ['-S', '-c', script], { cwd: checkout, encoding: 'utf8', env: process.env });
@@ -388,6 +456,8 @@ describe('generator lifecycle shell', () => {
           ULTRASHAPE_RUNTIME_MODE: 'auto',
           ULTRASHAPE_UPSTREAM_CHECKOUT: upstreamCheckout,
           ULTRASHAPE_UPSTREAM_CONFIG: upstreamConfig,
+          ULTRASHAPE_ATTENTION_BACKEND: null,
+          ULTRASHAPE_FLASH_ATTN_POLICY: null,
         },
       });
     } finally {

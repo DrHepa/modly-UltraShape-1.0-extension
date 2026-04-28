@@ -21,7 +21,8 @@ REQUIRED_CHECKOUT_MARKERS = (
     ('ultrashape', 'dir'),
 )
 LICENSE_MARKERS = ('LICENSE', 'LICENSE.txt', 'NOTICE', 'Notice.txt')
-REAL_REQUIRED_IMPORTS = ('torch', 'flash_attn', 'cubvh', 'omegaconf')
+REAL_REQUIRED_IMPORTS = ('torch', 'cubvh', 'omegaconf')
+ATTENTION_IMPORT = 'flash_attn'
 
 
 class RealModeUnavailableError(Exception):
@@ -106,6 +107,8 @@ def describe_real_readiness(
     upstream_config_path: str | os.PathLike[str] | None = None,
     python_exe: str | os.PathLike[str] | None = None,
     venv_dir: str | os.PathLike[str] | None = None,
+    attention_backend: str | None = None,
+    flash_attn_policy: object = None,
 ) -> dict[str, object]:
     description = validate_upstream_checkout(checkout_path)
     if description.get('available'):
@@ -116,6 +119,8 @@ def describe_real_readiness(
             upstream_config_path=upstream_config_path,
             python_exe=python_exe,
             venv_dir=venv_dir,
+            attention_backend=attention_backend,
+            flash_attn_policy=flash_attn_policy,
         )
     return {
         **description,
@@ -124,6 +129,10 @@ def describe_real_readiness(
         'config': {'available': False, 'path': None},
         'checkpoint': {'available': False, 'path': str(checkpoint) if checkpoint else None},
         'dependencies': _dependency_status([]),
+        'authoritative_upstream': False,
+        'attention_backend': None,
+        'flash_attn_policy': _normalize_flash_attn_policy(flash_attn_policy),
+        'degradations': [],
         'interpreter': _interpreter_status(python_exe=python_exe, venv_dir=venv_dir),
         'reason': 'Authoritative real mode requires an explicit validated upstream UltraShape checkout.',
     }
@@ -142,6 +151,41 @@ def _dependency_status(missing: list[str]) -> dict[str, object]:
     if isinstance(torch_status, dict) and torch_status.get('available') is True:
         torch_status['cuda_available'] = _torch_cuda_available()
     return status
+
+
+def _normalize_attention_backend(attention_backend: str | None = None) -> str | None:
+    candidate = str(attention_backend or os.environ.get('ULTRASHAPE_ATTENTION_BACKEND', '')).strip().lower()
+    return candidate if candidate in {'flash_attn', 'sdpa'} else None
+
+
+def _normalize_flash_attn_policy(flash_attn_policy: object = None) -> dict[str, object]:
+    if isinstance(flash_attn_policy, dict):
+        status = str(flash_attn_policy.get('status') or '').strip().lower()
+        if status == 'sdpa_real_allowed':
+            return {**flash_attn_policy, 'status': 'sdpa_real_allowed', 'required': False, 'sdpa_allowed': bool(flash_attn_policy.get('sdpa_allowed', True))}
+        if status == 'required':
+            return {**flash_attn_policy, 'status': 'required', 'required': True, 'sdpa_allowed': False}
+    env_status = str(os.environ.get('ULTRASHAPE_FLASH_ATTN_POLICY', '')).strip().lower()
+    if env_status == 'sdpa_real_allowed':
+        return {'status': 'sdpa_real_allowed', 'required': False, 'available': False, 'degraded': True, 'sdpa_allowed': True}
+    return {'status': 'required', 'required': True, 'available': None, 'degraded': False, 'sdpa_allowed': False}
+
+
+def _attention_readiness(*, attention_backend: str | None = None, flash_attn_policy: object = None) -> tuple[str | None, dict[str, object], list[str], list[str]]:
+    missing_flash = bool(_missing_imports((ATTENTION_IMPORT,)))
+    policy = _normalize_flash_attn_policy(flash_attn_policy)
+    requested_backend = _normalize_attention_backend(attention_backend)
+    if requested_backend == 'sdpa' and policy.get('status') == 'sdpa_real_allowed' and policy.get('sdpa_allowed') is True:
+        policy.update({'required': False, 'available': False, 'degraded': missing_flash, 'sdpa_allowed': True, 'blocker': None})
+        if missing_flash:
+            policy.setdefault('degradation_reason', 'import:flash_attn')
+        return 'sdpa', policy, [], ['dependency:flash_attn'] if missing_flash else []
+    if not missing_flash:
+        policy.update({'status': 'required', 'required': True, 'available': True, 'degraded': False, 'sdpa_allowed': False, 'blocker': None})
+        return 'flash_attn', policy, [], []
+    blocker = 'attention:sdpa-policy-not-proven' if requested_backend == 'sdpa' else 'dependency:flash_attn'
+    policy.update({'required': True, 'available': False, 'degraded': True, 'degradation_reason': 'import:flash_attn', 'sdpa_allowed': False, 'blocker': blocker})
+    return None, policy, [blocker], ['dependency:flash_attn']
 
 
 def _torch_cuda_available() -> bool:
@@ -236,14 +280,21 @@ def _with_real_readiness(
     upstream_config_path: str | os.PathLike[str] | None,
     python_exe: str | os.PathLike[str] | None = None,
     venv_dir: str | os.PathLike[str] | None = None,
+    attention_backend: str | None = None,
+    flash_attn_policy: object = None,
 ) -> dict[str, object]:
     checkout = Path(str(checkout_description['checkout_path']))
     runtime_config = Path(runtime_config_path).expanduser().resolve() if runtime_config_path else None
     upstream_config = _resolve_upstream_config(checkout, upstream_config_path)
     checkpoint_path = Path(checkpoint).expanduser().resolve() if checkpoint else None
     missing_deps = _missing_imports(REAL_REQUIRED_IMPORTS)
+    resolved_attention, policy, attention_blockers, degradations = _attention_readiness(
+        attention_backend=attention_backend,
+        flash_attn_policy=flash_attn_policy,
+    )
     blockers = list(checkout_description.get('blockers', []))
     blockers.extend(f'dependency:{name}' for name in missing_deps)
+    blockers.extend(attention_blockers)
     if 'torch' not in missing_deps and not _torch_cuda_available():
         blockers.append('cuda:unavailable')
     if runtime_config is not None and not runtime_config.is_file():
@@ -258,9 +309,21 @@ def _with_real_readiness(
     return {
         **checkout_description,
         'available': not blockers,
+        'authoritative_upstream': not blockers,
+        'attention_backend': resolved_attention,
+        'flash_attn_policy': policy,
+        'degradations': degradations,
+        'entrypoint_invoked': False,
         'source': 'checkout' if not blockers else checkout_description.get('source'),
         'blockers': blockers,
-        'dependencies': _dependency_status(missing_deps),
+        'dependencies': {
+            **_dependency_status(missing_deps),
+            ATTENTION_IMPORT: {
+                'available': bool(policy.get('available')),
+                'required': bool(policy.get('required')),
+                'degradable_for_portable': bool(policy.get('required')) is False,
+            },
+        },
         'interpreter': _interpreter_status(python_exe=python_exe, venv_dir=venv_dir),
         'runtime_config': {'available': runtime_config is not None and runtime_config.is_file(), 'path': str(runtime_config) if runtime_config else None},
         'upstream_config': {'available': upstream_config.is_file(), 'path': str(upstream_config)},
@@ -349,6 +412,8 @@ def run_real_refine_pipeline(
     upstream_config_path: str | None = None,
     python_exe: str | None = None,
     venv_dir: str | None = None,
+    attention_backend: str | None = None,
+    flash_attn_policy: object = None,
 ) -> dict[str, object]:
     del ext_dir
     if backend != 'local':
@@ -363,6 +428,8 @@ def run_real_refine_pipeline(
         upstream_config_path=upstream_config_path,
         python_exe=python_exe,
         venv_dir=venv_dir,
+        attention_backend=attention_backend,
+        flash_attn_policy=flash_attn_policy,
     )
     if not checkout_description.get('available'):
         blockers = ', '.join(str(blocker) for blocker in checkout_description.get('blockers', []))
@@ -373,6 +440,8 @@ def run_real_refine_pipeline(
     output_path.mkdir(parents=True, exist_ok=True)
     expected_name = f'{Path(reference_image).stem}_refined.glb'
     final_output = output_path / 'refined.glb'
+    proof = {'entrypoint_invoked': False}
+    resolved_attention = checkout_description.get('attention_backend')
     def execute_upstream() -> None:
         run_inference = _import_upstream_run_inference(checkout)
         with tempfile.TemporaryDirectory(prefix='ultrashape-upstream-real-') as upstream_output:
@@ -390,13 +459,26 @@ def run_real_refine_pipeline(
             )
             args.output_dir = upstream_output
             run_inference(args)
+            proof['entrypoint_invoked'] = True
 
             upstream_refined = Path(upstream_output) / expected_name
             if not upstream_refined.is_file():
+                if resolved_attention == 'sdpa':
+                    raise RealModeUnavailableError(
+                        f'attention:sdpa-policy-not-proven; entrypoint:{REAL_MODE_ENTRYPOINT}; upstream real mode did not produce expected refined output: {expected_name}.'
+                    )
                 raise RealModeUnavailableError(f'Upstream real mode did not produce expected refined output: {expected_name}.')
+            upstream_record = Path(upstream_output) / 'entrypoint-called.json'
+            if upstream_record.is_file():
+                shutil.copyfile(upstream_record, output_path / 'entrypoint-called.json')
             shutil.copyfile(upstream_refined, final_output)
 
     _with_checkout_on_path(checkout, execute_upstream)
+    if not proof['entrypoint_invoked'] or not final_output.is_file():
+        raise RealModeUnavailableError(f'attention:sdpa-policy-not-proven; entrypoint:{REAL_MODE_ENTRYPOINT}; upstream proof absent.')
+
+    proven_real = {**checkout_description, 'authoritative_upstream': True, 'entrypoint_invoked': True}
+    trace = ['upstream-import', 'upstream-run_inference', 'normalize-output']
 
     return {
         'file_path': str(final_output),
@@ -404,7 +486,7 @@ def run_real_refine_pipeline(
         'backend': 'local',
         'warnings': [],
         'metrics': {
-            'execution_trace': ['upstream-import', 'upstream-run_inference', 'normalize-output'],
+            'execution_trace': trace,
             'pipeline': {
                 'entrypoint': REAL_MODE_ENTRYPOINT,
                 'class': 'upstream UltraShape-1.0',
@@ -414,7 +496,7 @@ def run_real_refine_pipeline(
                 'selection': 'real-available',
                 'requested': os.environ.get('ULTRASHAPE_RUNTIME_MODE', 'auto').strip().lower() or 'auto',
                 'active': 'real',
-                'real': checkout_description,
+                'real': proven_real,
                 'portable': {
                     'available': True,
                     'authoritative': False,
@@ -427,6 +509,9 @@ def run_real_refine_pipeline(
                 'revision': checkout_description.get('revision'),
                 'entrypoint': REAL_MODE_ENTRYPOINT,
                 'output_name': expected_name,
+                'authoritative_upstream': True,
+                'attention_backend': resolved_attention,
+                'trace': trace,
             },
         },
         'fallbacks': [],
